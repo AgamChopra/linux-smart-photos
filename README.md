@@ -141,14 +141,6 @@ Smart Photos includes download links for these models:
 - Pet personas: [AvitoTech DINOv2-Small Animal Identification](https://huggingface.co/AvitoTech/DINO-v2-small-for-animal-identification)
 - Pet face detector: [LostPetInitiative `yolov7-pet-face.pt`](https://zenodo.org/records/7607110)
 
-Cat priority:
-
-- cats are treated as the higher-priority pet class
-- the dedicated pet-face model is used when it is installed
-- cat detections use a lower detector threshold than dogs
-- a cat-face fallback detector is used when the dedicated detector misses a cat
-- pet personas use learned embeddings
-
 ## Search Examples
 
 - `cat`
