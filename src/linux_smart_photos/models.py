@@ -138,6 +138,7 @@ class Persona:
     avatar_item_id: str = ""
     reference_encodings: list[list[float]] = field(default_factory=list)
     reference_signatures: list[str] = field(default_factory=list)
+    reference_images: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -149,6 +150,7 @@ class Persona:
             "avatar_item_id": self.avatar_item_id,
             "reference_encodings": self.reference_encodings,
             "reference_signatures": self.reference_signatures,
+            "reference_images": self.reference_images,
         }
 
     @classmethod
@@ -165,6 +167,18 @@ class Persona:
                 for encoding in data.get("reference_encodings", [])
             ],
             reference_signatures=list(data.get("reference_signatures", [])),
+            reference_images=[
+                {
+                    "path": str(entry.get("path", "")),
+                    "source_item_id": str(entry.get("source_item_id", "")),
+                    "source_region_id": str(entry.get("source_region_id", "")),
+                    "label": str(entry.get("label", "")),
+                    "kind": str(entry.get("kind", "")),
+                    "created_at": str(entry.get("created_at", utc_now())),
+                }
+                for entry in data.get("reference_images", [])
+                if isinstance(entry, dict)
+            ],
         )
 
 

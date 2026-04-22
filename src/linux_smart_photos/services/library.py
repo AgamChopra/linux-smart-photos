@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import difflib
 from itertools import combinations
@@ -47,6 +47,15 @@ PERSONA_COLORS = [
     "#5E6472",
 ]
 
+REFERENCE_EMBEDDING_SIMILARITY_THRESHOLD = 0.985
+REFERENCE_SIGNATURE_DISTANCE_THRESHOLD = 8.0
+UNKNOWN_PERSON_CLUSTER_SIMILARITY_FLOOR = 0.68
+UNKNOWN_PERSON_CLUSTER_SIMILARITY_BOOST = 0.12
+UNKNOWN_PERSON_CLUSTER_SIMILARITY_CAP = 0.82
+UNKNOWN_PET_CLUSTER_SIMILARITY_FLOOR = 0.78
+UNKNOWN_PET_CLUSTER_SIMILARITY_BOOST = 0.08
+UNKNOWN_PET_CLUSTER_SIMILARITY_CAP = 0.90
+
 
 @dataclass(slots=True)
 class SyncSummary:
@@ -76,6 +85,43 @@ class PreparedSyncItem:
     video_metadata: dict[str, object]
 
 
+@dataclass(slots=True)
+class UnknownClusterMember:
+    item_id: str
+    region_id: str
+    label: str
+    confidence: float
+    captured_at: str
+
+
+@dataclass(slots=True)
+class UnknownPersonaCluster:
+    id: str
+    kind: str
+    label: str
+    member_count: int
+    item_count: int
+    member_ids: list[tuple[str, str]]
+    item_ids: list[str]
+    preview_path: str
+    latest_captured_at: str
+    average_confidence: float
+
+
+@dataclass(slots=True)
+class _UnknownClusterState:
+    kind: str
+    members: list[UnknownClusterMember] = field(default_factory=list)
+    item_ids: set[str] = field(default_factory=set)
+    labels: Counter[str] = field(default_factory=Counter)
+    embeddings: list[list[float]] = field(default_factory=list)
+    signatures: list[str] = field(default_factory=list)
+    representative_item_id: str = ""
+    representative_region_id: str = ""
+    representative_confidence: float = -1.0
+    latest_captured_at: str = ""
+
+
 class LibraryService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -84,6 +130,8 @@ class LibraryService:
         self.model_manager = ModelManager(config)
         self._vision: VisionAnalyzer | None = None
         config.cache_path.mkdir(parents=True, exist_ok=True)
+        if self._cleanup_collections():
+            self.save()
 
     @property
     def vision(self) -> VisionAnalyzer:
@@ -95,6 +143,8 @@ class LibraryService:
         self.state = self.store.load()
         self.model_manager = ModelManager(self.config)
         self._vision = None
+        if self._cleanup_collections():
+            self.save()
 
     def sync(
         self,
@@ -410,6 +460,49 @@ class LibraryService:
                 personas.append(persona)
         return sorted(personas, key=lambda persona: persona.name.lower())
 
+    def persona_reference_images(self, persona_id: str) -> list[dict[str, str]]:
+        persona = self.state.personas.get(persona_id)
+        if not persona:
+            return []
+        references = [
+            entry
+            for entry in persona.reference_images
+            if entry.get("path") and Path(entry["path"]).exists()
+        ]
+        references.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
+        return references
+
+    def list_unknown_persona_clusters(self, kind: str = "person") -> list[UnknownPersonaCluster]:
+        requested_kinds = (
+            ["person", "pet"]
+            if kind == "all"
+            else [kind]
+        )
+        clusters: list[UnknownPersonaCluster] = []
+        for requested_kind in requested_kinds:
+            if requested_kind not in {"person", "pet"}:
+                continue
+            clusters.extend(self._build_unknown_clusters(requested_kind))
+        return sorted(
+            clusters,
+            key=lambda cluster: (cluster.member_count, cluster.item_count, cluster.latest_captured_at),
+            reverse=True,
+        )
+
+    def items_for_unknown_clusters(
+        self,
+        clusters: Iterable[UnknownPersonaCluster],
+    ) -> list[MediaItem]:
+        item_ids: set[str] = set()
+        for cluster in clusters:
+            item_ids.update(cluster.item_ids)
+        items = [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
+        return sorted(
+            items,
+            key=lambda item: (self._item_datetime(item), item.modified_ts),
+            reverse=True,
+        )
+
     def build_item_details(self, item: MediaItem) -> str:
         personas = ", ".join(persona.name for persona in self.personas_for_item(item)) or "None"
         tags = ", ".join(item.tags[:24]) or "None"
@@ -466,10 +559,7 @@ class LibraryService:
             if detection.id != region_id:
                 continue
             detection.persona_id = persona.id
-            if detection.encoding:
-                self._remember_embedding(persona, detection.encoding)
-            if detection.signature:
-                self._remember_signature(persona, detection.signature)
+            self._remember_detection_reference(persona, item, detection)
             if not persona.avatar_item_id:
                 persona.avatar_item_id = item.id
             break
@@ -498,15 +588,12 @@ class LibraryService:
         if persona.id not in item.manual_persona_ids:
             item.manual_persona_ids.append(persona.id)
         if persona.kind == "person":
-            face_detections = [entry for entry in item.detections if entry.kind == "face" and entry.encoding]
+            face_detections = [entry for entry in item.detections if entry.kind == "face"]
             if len(face_detections) == 1:
-                self._remember_embedding(persona, face_detections[0].encoding)
+                self._remember_detection_reference(persona, item, face_detections[0])
         if persona.kind == "pet":
             for detection in item.detections:
-                if self._is_pet_detection(detection) and detection.encoding:
-                    self._remember_embedding(persona, detection.encoding)
-                if detection.signature and self._is_pet_detection(detection):
-                    self._remember_signature(persona, detection.signature)
+                self._remember_detection_reference(persona, item, detection)
         if not persona.avatar_item_id:
             persona.avatar_item_id = item.id
         self.regenerate_memories()
@@ -518,6 +605,54 @@ class LibraryService:
         item.manual_persona_ids = []
         self.regenerate_memories()
         self.save()
+
+    def assign_unknown_clusters_to_persona(
+        self,
+        clusters: Iterable[UnknownPersonaCluster],
+        persona_id: str = "",
+        new_name: str = "",
+        kind: str = "person",
+    ) -> Persona:
+        cluster_list = list(clusters)
+        if not cluster_list:
+            raise ValueError("Select at least one cluster.")
+
+        cluster_kinds = {cluster.kind for cluster in cluster_list}
+        if len(cluster_kinds) > 1:
+            raise ValueError("Select clusters of a single kind at a time.")
+        resolved_kind = next(iter(cluster_kinds))
+        if kind and kind != resolved_kind:
+            raise ValueError("Selected clusters do not match the chosen persona kind.")
+
+        persona = self._resolve_persona(persona_id, new_name, resolved_kind)
+        touched = False
+        seen_regions: set[tuple[str, str]] = set()
+        for cluster in cluster_list:
+            for item_id, region_id in cluster.member_ids:
+                if (item_id, region_id) in seen_regions:
+                    continue
+                seen_regions.add((item_id, region_id))
+                item = self.state.items.get(item_id)
+                if item is None:
+                    continue
+                detection = next((entry for entry in item.detections if entry.id == region_id), None)
+                if detection is None:
+                    continue
+                if detection.persona_id and detection.persona_id != persona.id:
+                    continue
+                detection.persona_id = persona.id
+                self._remember_detection_reference(persona, item, detection)
+                if not persona.avatar_item_id:
+                    persona.avatar_item_id = item.id
+                touched = True
+
+        if not touched:
+            raise ValueError("The selected clusters no longer contain assignable detections.")
+
+        self._cleanup_collections()
+        self.regenerate_memories()
+        self.save()
+        return persona
 
     def create_album(self, name: str, item_ids: Iterable[str] = ()) -> Album:
         normalized = name.strip()
@@ -1060,15 +1195,238 @@ class LibraryService:
             return best_persona_id
         return None
 
-    def _cleanup_collections(self) -> None:
+    def _build_unknown_clusters(self, kind: str) -> list[UnknownPersonaCluster]:
+        cluster_states: list[_UnknownClusterState] = []
+        for item in self.list_items():
+            for detection in item.detections:
+                if detection.persona_id or not self._is_unknown_cluster_candidate(kind, detection):
+                    continue
+                self._add_detection_to_unknown_clusters(cluster_states, kind, item, detection)
+
+        return [
+            self._finalize_unknown_cluster(cluster_state)
+            for cluster_state in cluster_states
+            if cluster_state.members
+        ]
+
+    def _is_unknown_cluster_candidate(self, kind: str, detection: DetectionRegion) -> bool:
+        if kind == "person":
+            return detection.kind == "face" and bool(detection.encoding or detection.signature)
+        if kind == "pet":
+            return self._is_pet_detection(detection) and bool(detection.encoding or detection.signature)
+        return False
+
+    def _add_detection_to_unknown_clusters(
+        self,
+        clusters: list[_UnknownClusterState],
+        kind: str,
+        item: MediaItem,
+        detection: DetectionRegion,
+    ) -> None:
+        matched_cluster = self._best_unknown_cluster_match(clusters, kind, detection)
+        if matched_cluster is None:
+            matched_cluster = _UnknownClusterState(kind=kind)
+            clusters.append(matched_cluster)
+        self._append_unknown_cluster_member(matched_cluster, item, detection)
+
+    def _best_unknown_cluster_match(
+        self,
+        clusters: list[_UnknownClusterState],
+        kind: str,
+        detection: DetectionRegion,
+    ) -> _UnknownClusterState | None:
+        if not clusters:
+            return None
+
+        embedding_match: _UnknownClusterState | None = None
+        best_similarity = -1.0
+        signature_match: _UnknownClusterState | None = None
+        best_distance = math.inf
+        embedding_threshold = self._unknown_cluster_similarity_threshold(kind)
+        signature_threshold = self._unknown_cluster_signature_threshold(kind)
+
+        for cluster in clusters:
+            if detection.encoding and cluster.embeddings:
+                similarity = max(
+                    self._cosine_similarity(detection.encoding, candidate)
+                    for candidate in cluster.embeddings
+                )
+                if similarity >= embedding_threshold and similarity > best_similarity:
+                    best_similarity = similarity
+                    embedding_match = cluster
+            if detection.signature and cluster.signatures:
+                distance = min(
+                    self._signature_distance(detection.signature, candidate)
+                    for candidate in cluster.signatures
+                )
+                if distance <= signature_threshold and distance < best_distance:
+                    best_distance = distance
+                    signature_match = cluster
+
+        return embedding_match or signature_match
+
+    def _append_unknown_cluster_member(
+        self,
+        cluster: _UnknownClusterState,
+        item: MediaItem,
+        detection: DetectionRegion,
+    ) -> None:
+        cluster.members.append(
+            UnknownClusterMember(
+                item_id=item.id,
+                region_id=detection.id,
+                label=detection.label,
+                confidence=detection.confidence,
+                captured_at=item.captured_at,
+            )
+        )
+        cluster.item_ids.add(item.id)
+        cluster.labels[detection.label.lower()] += 1
+        if detection.encoding:
+            self._remember_cluster_embedding(cluster, detection.encoding)
+        if detection.signature:
+            self._remember_cluster_signature(cluster, detection.signature)
+        if (
+            detection.confidence > cluster.representative_confidence
+            or not cluster.representative_item_id
+        ):
+            cluster.representative_item_id = item.id
+            cluster.representative_region_id = detection.id
+            cluster.representative_confidence = detection.confidence
+        if item.captured_at > cluster.latest_captured_at:
+            cluster.latest_captured_at = item.captured_at
+
+    def _remember_cluster_embedding(
+        self,
+        cluster: _UnknownClusterState,
+        encoding: list[float],
+    ) -> None:
+        if not cluster.embeddings:
+            cluster.embeddings.append(encoding)
+            return
+        closest = max(
+            self._cosine_similarity(encoding, candidate)
+            for candidate in cluster.embeddings
+        )
+        if closest < REFERENCE_EMBEDDING_SIMILARITY_THRESHOLD:
+            cluster.embeddings.append(encoding)
+
+    def _remember_cluster_signature(
+        self,
+        cluster: _UnknownClusterState,
+        signature: str,
+    ) -> None:
+        if not cluster.signatures:
+            cluster.signatures.append(signature)
+            return
+        closest = min(
+            self._signature_distance(signature, candidate)
+            for candidate in cluster.signatures
+        )
+        if closest > REFERENCE_SIGNATURE_DISTANCE_THRESHOLD:
+            cluster.signatures.append(signature)
+
+    def _finalize_unknown_cluster(self, cluster: _UnknownClusterState) -> UnknownPersonaCluster:
+        member_ids = sorted(
+            {(member.item_id, member.region_id) for member in cluster.members},
+            key=lambda entry: entry[0] + entry[1],
+        )
+        representative_item = self.state.items.get(cluster.representative_item_id)
+        representative_detection = None
+        if representative_item is not None:
+            representative_detection = next(
+                (entry for entry in representative_item.detections if entry.id == cluster.representative_region_id),
+                None,
+            )
+
+        preview_path = ""
+        if representative_item is not None and representative_detection is not None:
+            preview_path = self._ensure_cluster_preview(representative_item, representative_detection)
+
+        average_confidence = sum(member.confidence for member in cluster.members) / max(1, len(cluster.members))
+        label = cluster.labels.most_common(1)[0][0] if cluster.labels else ("face" if cluster.kind == "person" else "pet")
+        cluster_key = "|".join(f"{item_id}:{region_id}" for item_id, region_id in member_ids)
+        return UnknownPersonaCluster(
+            id=stable_id(f"unknown-cluster:{cluster.kind}:{cluster_key}"),
+            kind=cluster.kind,
+            label=label,
+            member_count=len(member_ids),
+            item_count=len(cluster.item_ids),
+            member_ids=member_ids,
+            item_ids=sorted(cluster.item_ids),
+            preview_path=preview_path,
+            latest_captured_at=cluster.latest_captured_at,
+            average_confidence=average_confidence,
+        )
+
+    def _unknown_cluster_similarity_threshold(self, kind: str) -> float:
+        if kind == "pet":
+            return min(
+                UNKNOWN_PET_CLUSTER_SIMILARITY_CAP,
+                max(
+                    UNKNOWN_PET_CLUSTER_SIMILARITY_FLOOR,
+                    self.config.pet_embedding_similarity_threshold + UNKNOWN_PET_CLUSTER_SIMILARITY_BOOST,
+                ),
+            )
+        return min(
+            UNKNOWN_PERSON_CLUSTER_SIMILARITY_CAP,
+            max(
+                UNKNOWN_PERSON_CLUSTER_SIMILARITY_FLOOR,
+                self.config.face_embedding_similarity_threshold + UNKNOWN_PERSON_CLUSTER_SIMILARITY_BOOST,
+            ),
+        )
+
+    def _unknown_cluster_signature_threshold(self, kind: str) -> float:
+        if kind == "pet":
+            return min(float(self.config.pet_hash_distance_threshold), REFERENCE_SIGNATURE_DISTANCE_THRESHOLD)
+        return REFERENCE_SIGNATURE_DISTANCE_THRESHOLD
+
+    def _ensure_cluster_preview(
+        self,
+        item: MediaItem,
+        detection: DetectionRegion,
+    ) -> str:
+        preview_root = self._cluster_previews_root()
+        preview_root.mkdir(parents=True, exist_ok=True)
+        preview_path = preview_root / f"{stable_id(f'{item.id}:{detection.id}')}.jpg"
+        if not preview_path.exists():
+            crop = self._extract_reference_crop(item, detection)
+            if crop is None:
+                return item.thumbnail_path
+            image = crop.convert("RGB")
+            image.thumbnail((256, 256))
+            image.save(preview_path, format="JPEG", quality=90)
+        return str(preview_path)
+
+    def _cleanup_collections(self) -> bool:
+        changed = False
         live_item_ids = set(self.state.items)
         for album in self.state.albums.values():
-            album.item_ids = [item_id for item_id in album.item_ids if item_id in live_item_ids]
+            item_ids = [item_id for item_id in album.item_ids if item_id in live_item_ids]
+            if item_ids != album.item_ids:
+                album.item_ids = item_ids
+                changed = True
         for memory in self.state.memories.values():
-            memory.item_ids = [item_id for item_id in memory.item_ids if item_id in live_item_ids]
+            item_ids = [item_id for item_id in memory.item_ids if item_id in live_item_ids]
+            if item_ids != memory.item_ids:
+                memory.item_ids = item_ids
+                changed = True
         for persona in self.state.personas.values():
             if persona.avatar_item_id and persona.avatar_item_id not in live_item_ids:
                 persona.avatar_item_id = ""
+                changed = True
+            existing_references = [
+                reference
+                for reference in persona.reference_images
+                if reference.get("path") and Path(reference["path"]).exists()
+            ]
+            if existing_references != persona.reference_images:
+                changed = True
+            deduped_references = self._dedupe_reference_images(persona, existing_references)
+            if deduped_references != existing_references:
+                changed = True
+            persona.reference_images = deduped_references
+        return changed
 
     def _resolve_persona(self, persona_id: str, new_name: str, kind: str) -> Persona:
         if persona_id:
@@ -1078,20 +1436,269 @@ class LibraryService:
             return persona
         return self.create_persona(new_name, kind)
 
-    def _remember_embedding(self, persona: Persona, encoding: list[float]) -> None:
+    def _remember_embedding(self, persona: Persona, encoding: list[float]) -> bool:
         if not persona.reference_encodings:
             persona.reference_encodings.append(encoding)
-            return
+            return True
         closest = max(
             self._cosine_similarity(encoding, candidate)
             for candidate in persona.reference_encodings
         )
-        if closest < 0.985:
+        if closest < REFERENCE_EMBEDDING_SIMILARITY_THRESHOLD:
             persona.reference_encodings.append(encoding)
+            return True
+        return False
 
-    def _remember_signature(self, persona: Persona, signature: str) -> None:
+    def _remember_signature(self, persona: Persona, signature: str) -> bool:
         if signature not in persona.reference_signatures:
             persona.reference_signatures.append(signature)
+            return True
+        return False
+
+    def _remember_detection_reference(
+        self,
+        persona: Persona,
+        item: MediaItem,
+        detection: DetectionRegion,
+    ) -> None:
+        if not self._can_learn_from_detection(persona, detection):
+            return
+        if detection.encoding:
+            self._remember_embedding(persona, detection.encoding)
+        if detection.signature:
+            self._remember_signature(persona, detection.signature)
+        if not self._should_store_reference_image(persona, detection):
+            return
+        reference_image = self._extract_reference_crop(item, detection)
+        if reference_image is None:
+            return
+        self._remember_reference_image(persona, item, detection, reference_image)
+
+    def _can_learn_from_detection(self, persona: Persona, detection: DetectionRegion) -> bool:
+        if persona.kind == "person":
+            return detection.kind == "face"
+        if persona.kind == "pet":
+            return self._is_pet_detection(detection)
+        return False
+
+    def _should_store_reference_image(
+        self,
+        persona: Persona,
+        detection: DetectionRegion,
+    ) -> bool:
+        if not persona.reference_images:
+            return True
+        reference_detections = self._reference_source_detections(persona.reference_images)
+        if not reference_detections:
+            return True
+        return self._is_distinct_reference_detection(detection, reference_detections)
+
+    def _remember_reference_image(
+        self,
+        persona: Persona,
+        item: MediaItem,
+        detection: DetectionRegion,
+        crop: Image.Image,
+    ) -> None:
+        references_root = self._reference_images_root() / persona.id
+        references_root.mkdir(parents=True, exist_ok=True)
+        filename = f"{stable_id(f'{persona.id}:{item.id}:{detection.id}:{detection.signature or detection.label}')}.jpg"
+        reference_path = references_root / filename
+
+        if not reference_path.exists():
+            image = crop.convert("RGB")
+            image.thumbnail((384, 384))
+            image.save(reference_path, format="JPEG", quality=90)
+
+        reference_entry = {
+            "path": str(reference_path),
+            "source_item_id": item.id,
+            "source_region_id": detection.id,
+            "label": detection.label,
+            "kind": detection.kind,
+            "created_at": utc_now(),
+        }
+        existing_index = next(
+            (
+                index
+                for index, entry in enumerate(persona.reference_images)
+                if entry.get("path") == str(reference_path)
+            ),
+            None,
+        )
+        if existing_index is None:
+            persona.reference_images.append(reference_entry)
+        else:
+            persona.reference_images[existing_index] = reference_entry
+
+    def _dedupe_reference_images(
+        self,
+        persona: Persona,
+        references: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        if len(references) <= 1:
+            return list(references)
+
+        kept_references: list[dict[str, str]] = []
+        kept_detections: list[DetectionRegion] = []
+        seen_paths: set[str] = set()
+        for reference in sorted(references, key=self._reference_image_sort_key):
+            path = reference.get("path", "")
+            if not path or path in seen_paths:
+                continue
+            detection = self._reference_source_detection(reference)
+            if detection and not self._is_distinct_reference_detection(detection, kept_detections):
+                self._remove_reference_image_file(persona, Path(path), protected_paths=seen_paths)
+                continue
+            kept_references.append(reference)
+            seen_paths.add(path)
+            if detection is not None:
+                kept_detections.append(detection)
+        return kept_references
+
+    def _reference_image_sort_key(self, reference: dict[str, str]) -> tuple[str, str]:
+        return (reference.get("created_at", ""), reference.get("path", ""))
+
+    def _reference_source_detection(self, reference: dict[str, str]) -> DetectionRegion | None:
+        item_id = reference.get("source_item_id", "")
+        region_id = reference.get("source_region_id", "")
+        if not item_id or not region_id:
+            return None
+        item = self.state.items.get(item_id)
+        if item is None:
+            return None
+        for detection in item.detections:
+            if detection.id == region_id:
+                return detection
+        return None
+
+    def _reference_source_detections(
+        self,
+        references: Iterable[dict[str, str]],
+    ) -> list[DetectionRegion]:
+        detections: list[DetectionRegion] = []
+        for reference in references:
+            detection = self._reference_source_detection(reference)
+            if detection is not None:
+                detections.append(detection)
+        return detections
+
+    def _is_distinct_reference_detection(
+        self,
+        detection: DetectionRegion,
+        existing: Iterable[DetectionRegion],
+    ) -> bool:
+        existing_detections = list(existing)
+        if not existing_detections:
+            return True
+
+        if detection.encoding:
+            similarities = [
+                self._cosine_similarity(detection.encoding, candidate.encoding)
+                for candidate in existing_detections
+                if candidate.encoding
+            ]
+            if similarities:
+                return max(similarities) < REFERENCE_EMBEDDING_SIMILARITY_THRESHOLD
+
+        if detection.signature:
+            distances = [
+                self._signature_distance(detection.signature, candidate.signature)
+                for candidate in existing_detections
+                if candidate.signature
+            ]
+            if distances:
+                return min(distances) > REFERENCE_SIGNATURE_DISTANCE_THRESHOLD
+
+        return True
+
+    def _remove_reference_image_file(
+        self,
+        persona: Persona,
+        path: Path,
+        protected_paths: set[str] | None = None,
+    ) -> None:
+        if protected_paths and str(path) in protected_paths:
+            return
+        reference_root = self._reference_images_root() / persona.id
+        try:
+            resolved_root = reference_root.resolve()
+            resolved_path = path.resolve()
+            resolved_path.relative_to(resolved_root)
+        except (OSError, ValueError):
+            return
+        try:
+            resolved_path.unlink(missing_ok=True)
+        except OSError:
+            return
+
+    def _extract_reference_crop(
+        self,
+        item: MediaItem,
+        detection: DetectionRegion,
+    ) -> Image.Image | None:
+        source_image = self._load_reference_source_image(item, detection)
+        if source_image is None:
+            return None
+        return self.vision.crop_region(source_image, detection.bbox)
+
+    def _load_reference_source_image(
+        self,
+        item: MediaItem,
+        detection: DetectionRegion,
+    ) -> Image.Image | None:
+        if detection.id.startswith("video-"):
+            return self._load_video_reference_frame(item, detection.id)
+        return self.vision.load_preview_image(self._spec_from_item(item))
+
+    def _load_video_reference_frame(self, item: MediaItem, detection_id: str) -> Image.Image | None:
+        if cv2 is None:
+            return None
+        match = re.match(r"^video-\d+-([0-9]+\.[0-9]+)-", detection_id)
+        if not match:
+            return None
+        try:
+            timestamp_seconds = float(match.group(1))
+        except ValueError:
+            return None
+
+        video_path = self.vision.primary_video_path(self._spec_from_item(item))
+        if not video_path:
+            return None
+
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            capture.release()
+            return None
+        try:
+            capture.set(cv2.CAP_PROP_POS_MSEC, timestamp_seconds * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                return None
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb_frame)
+        finally:
+            capture.release()
+
+    def _reference_images_root(self) -> Path:
+        return self.config.cache_path.parent / "persona-references"
+
+    def _cluster_previews_root(self) -> Path:
+        return self.config.cache_path.parent / "cluster-previews"
+
+    def _spec_from_item(self, item: MediaItem) -> MediaAssetSpec:
+        return MediaAssetSpec(
+            id=item.id,
+            relative_key=item.relative_key,
+            title=item.title,
+            media_kind=item.media_kind,
+            extension=item.extension,
+            display_path=item.path,
+            component_paths=list(item.component_paths),
+            file_signature=item.file_signature,
+            size_bytes=item.size_bytes,
+            modified_ts=item.modified_ts,
+        )
 
     def _is_pet_detection(self, detection: DetectionRegion) -> bool:
         return detection.kind.startswith("pet") or detection.label.lower() in PET_LABELS

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QObject, QThread, QTimer, QSize, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QIcon
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QListView,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -24,8 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import AppConfig
-from ..services.library import LibraryService, ProgressUpdate
-from .dialogs import AlbumDialog, CorrectionsDialog
+from ..services.library import LibraryService, ProgressUpdate, UnknownPersonaCluster
+from .dialogs import AlbumDialog, AssignPersonaDialog, CorrectionsDialog
 from .widgets import MediaGridWidget
 
 
@@ -255,9 +257,22 @@ class PeoplePage(QWidget):
         self.grid = MediaGridWidget(service)
         self.correct_button = QPushButton("Correct Current Selection")
         self.correct_button.clicked.connect(self._open_corrections)
+        self.reference_summary = QLabel("Reference crops will appear here.")
+        self.reference_list = QListWidget()
+        self.reference_list.setViewMode(QListView.IconMode)
+        self.reference_list.setFlow(QListView.LeftToRight)
+        self.reference_list.setWrapping(False)
+        self.reference_list.setResizeMode(QListView.Adjust)
+        self.reference_list.setMovement(QListView.Static)
+        self.reference_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.reference_list.setIconSize(QSize(88, 88))
+        self.reference_list.setMinimumHeight(132)
+        self.reference_list.setMaximumHeight(148)
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(self.correct_button)
+        right_layout.addWidget(self.reference_summary)
+        right_layout.addWidget(self.reference_list)
         right_layout.addWidget(self.grid)
 
         right_panel = QWidget()
@@ -284,7 +299,33 @@ class PeoplePage(QWidget):
 
     def _show_persona_items(self, *_args) -> None:
         persona_id = self._current_persona_id()
+        self._show_reference_images(persona_id)
         self.grid.set_items(self.service.items_for_persona(persona_id) if persona_id else [])
+
+    def _show_reference_images(self, persona_id: str) -> None:
+        references = self.service.persona_reference_images(persona_id) if persona_id else []
+        self.reference_list.clear()
+        if not references:
+            self.reference_summary.setText("Reference crops: none yet.")
+            return
+
+        self.reference_summary.setText(f"Reference crops: {len(references)}")
+        for reference in references:
+            icon = QIcon(reference["path"]) if reference.get("path") else QIcon()
+            item = QListWidgetItem(icon, reference.get("label", "reference"))
+            tooltip = "\n".join(
+                filter(
+                    None,
+                    [
+                        reference.get("kind", ""),
+                        reference.get("label", ""),
+                        reference.get("path", ""),
+                    ],
+                )
+            )
+            if tooltip:
+                item.setToolTip(tooltip)
+            self.reference_list.addItem(item)
 
     def _create_persona(self, *_args) -> None:
         kind = str(self.kind_filter.currentData())
@@ -313,6 +354,188 @@ class PeoplePage(QWidget):
     def set_busy(self, busy: bool) -> None:
         self.new_persona_button.setEnabled(not busy)
         self.correct_button.setEnabled(not busy)
+
+
+class UnknownClustersPage(QWidget):
+    def __init__(self, service: LibraryService, owner: "MainWindow") -> None:
+        super().__init__()
+        self.service = service
+        self.owner = owner
+        self._clusters_by_id: dict[str, UnknownPersonaCluster] = {}
+
+        self.kind_filter = QComboBox()
+        self.kind_filter.addItem("People", "person")
+        self.kind_filter.addItem("Pets", "pet")
+        self.kind_filter.addItem("All Unknown", "all")
+        self.kind_filter.currentIndexChanged.connect(self.refresh)
+
+        self.cluster_list = QListWidget()
+        self.cluster_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.cluster_list.setIconSize(QSize(72, 72))
+        self.cluster_list.itemSelectionChanged.connect(self._show_selected_clusters)
+
+        self.refresh_button = QPushButton("Refresh Clusters")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.assign_button = QPushButton("Assign Selected Clusters")
+        self.assign_button.clicked.connect(self._assign_selected_clusters)
+        self.review_button = QPushButton("Review Current Item")
+        self.review_button.clicked.connect(self._open_corrections)
+
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(self.kind_filter)
+        left_layout.addWidget(self.cluster_list)
+        left_layout.addWidget(self.refresh_button)
+        left_layout.addWidget(self.assign_button)
+        left_layout.addWidget(self.review_button)
+
+        left_panel = QWidget()
+        left_panel.setLayout(left_layout)
+        left_panel.setMaximumWidth(380)
+
+        self.summary = QLabel("Select one or more unknown clusters to review or assign.")
+        self.summary.setWordWrap(True)
+        self.grid = MediaGridWidget(service)
+
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(self.summary)
+        right_layout.addWidget(self.grid)
+
+        right_panel = QWidget()
+        right_panel.setLayout(right_layout)
+
+        outer_layout = QHBoxLayout(self)
+        outer_layout.addWidget(left_panel)
+        outer_layout.addWidget(right_panel, 1)
+
+    def refresh(self, *_args) -> None:
+        selected_ids = {str(item.data(Qt.UserRole)) for item in self.cluster_list.selectedItems()}
+        clusters = self.service.list_unknown_persona_clusters(kind=str(self.kind_filter.currentData()))
+        self._clusters_by_id = {cluster.id: cluster for cluster in clusters}
+
+        self.cluster_list.blockSignals(True)
+        self.cluster_list.clear()
+        for index, cluster in enumerate(clusters, start=1):
+            title = self._cluster_title(cluster, index)
+            icon = QIcon(cluster.preview_path) if cluster.preview_path else QIcon()
+            item = QListWidgetItem(icon, title)
+            item.setData(Qt.UserRole, cluster.id)
+            item.setToolTip(self._cluster_tooltip(cluster))
+            self.cluster_list.addItem(item)
+            if cluster.id in selected_ids:
+                item.setSelected(True)
+        self.cluster_list.blockSignals(False)
+
+        if not self.cluster_list.selectedItems() and self.cluster_list.count():
+            self.cluster_list.item(0).setSelected(True)
+            self.cluster_list.setCurrentRow(0)
+        self._show_selected_clusters()
+
+    def _show_selected_clusters(self, *_args) -> None:
+        clusters = self._selected_clusters()
+        if not self._clusters_by_id:
+            self.summary.setText("No unknown people or pet clusters are waiting for assignment.")
+            self.grid.set_items([])
+            return
+        if not clusters:
+            self.summary.setText("Select one or more unknown clusters to review or assign.")
+            self.grid.set_items([])
+            return
+
+        items = self.service.items_for_unknown_clusters(clusters)
+        total_members = sum(cluster.member_count for cluster in clusters)
+        total_items = len({item.id for item in items})
+        cluster_names = ", ".join(self._cluster_kind_name(cluster) for cluster in clusters[:4])
+        if len(clusters) > 4:
+            cluster_names = f"{cluster_names}, ..."
+        self.summary.setText(
+            f"Selected clusters: {len(clusters)}\n"
+            f"Detections: {total_members}\n"
+            f"Items: {total_items}\n"
+            f"Types: {cluster_names or 'unknown'}"
+        )
+        self.grid.set_items(items)
+
+    def _assign_selected_clusters(self, *_args) -> None:
+        clusters = self._selected_clusters()
+        if not clusters:
+            QMessageBox.warning(self, "No Clusters Selected", "Select one or more clusters first.")
+            return
+
+        kinds = {cluster.kind for cluster in clusters}
+        if len(kinds) > 1:
+            QMessageBox.warning(
+                self,
+                "Mixed Cluster Types",
+                "Select only people clusters or only pet clusters for one assignment action.",
+            )
+            return
+
+        dialog = AssignPersonaDialog(
+            self.service.list_personas(),
+            suggested_kind=clusters[0].kind,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        choice = dialog.selection()
+        try:
+            self.service.assign_unknown_clusters_to_persona(
+                clusters,
+                persona_id=choice["persona_id"],
+                new_name=choice["new_name"],
+                kind=choice["kind"],
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Assignment Failed", str(exc))
+            return
+        self.owner.refresh_views()
+
+    def _open_corrections(self, *_args) -> None:
+        item_id = self.grid.current_item_id()
+        if not item_id:
+            QMessageBox.warning(self, "No Item Selected", "Choose an item from the selected clusters first.")
+            return
+        dialog = CorrectionsDialog(self.service, item_id, self)
+        dialog.exec()
+        self.owner.refresh_views()
+
+    def _selected_clusters(self) -> list[UnknownPersonaCluster]:
+        clusters: list[UnknownPersonaCluster] = []
+        for item in self.cluster_list.selectedItems():
+            cluster_id = str(item.data(Qt.UserRole))
+            cluster = self._clusters_by_id.get(cluster_id)
+            if cluster is not None:
+                clusters.append(cluster)
+        return clusters
+
+    def _cluster_title(self, cluster: UnknownPersonaCluster, index: int) -> str:
+        if cluster.kind == "person":
+            base = f"Unknown person {index}"
+        else:
+            base = f"Unknown {cluster.label or 'pet'} {index}"
+        return f"{base}  •  {cluster.member_count} detections / {cluster.item_count} items"
+
+    def _cluster_tooltip(self, cluster: UnknownPersonaCluster) -> str:
+        return "\n".join(
+            [
+                f"Kind: {cluster.kind}",
+                f"Label: {cluster.label}",
+                f"Detections: {cluster.member_count}",
+                f"Items: {cluster.item_count}",
+                f"Average confidence: {cluster.average_confidence:.2f}",
+            ]
+        )
+
+    def _cluster_kind_name(self, cluster: UnknownPersonaCluster) -> str:
+        if cluster.kind == "person":
+            return "person"
+        return cluster.label or "pet"
+
+    def set_busy(self, busy: bool) -> None:
+        self.kind_filter.setEnabled(not busy)
+        self.refresh_button.setEnabled(not busy)
+        self.assign_button.setEnabled(not busy)
+        self.review_button.setEnabled(not busy)
 
 
 class AlbumsPage(QWidget):
@@ -578,12 +801,14 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.library_page = LibraryPage(service, self)
         self.people_page = PeoplePage(service, self)
+        self.unknown_clusters_page = UnknownClustersPage(service, self)
         self.albums_page = AlbumsPage(service, self)
         self.memories_page = MemoriesPage(service, self)
         self.models_page = ModelsPage(service, self)
 
         self.tabs.addTab(self.library_page, "Library")
         self.tabs.addTab(self.people_page, "People & Pets")
+        self.tabs.addTab(self.unknown_clusters_page, "Unknown Clusters")
         self.tabs.addTab(self.albums_page, "Albums")
         self.tabs.addTab(self.memories_page, "Memories")
         self.tabs.addTab(self.models_page, "AI Models")
@@ -604,6 +829,7 @@ class MainWindow(QMainWindow):
         self.library_page._refresh_persona_filter()
         self.library_page.refresh()
         self.people_page.refresh()
+        self.unknown_clusters_page.refresh()
         self.albums_page.refresh()
         self.memories_page.refresh()
         self.models_page.refresh()
@@ -689,6 +915,7 @@ class MainWindow(QMainWindow):
         for page in (
             self.library_page,
             self.people_page,
+            self.unknown_clusters_page,
             self.albums_page,
             self.memories_page,
             self.models_page,
