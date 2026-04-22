@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 
 
@@ -62,10 +63,16 @@ def media_kind_for_path(path: Path) -> str | None:
     return None
 
 
-def build_signature(paths: list[Path], root: Path) -> str:
+def build_signature(
+    paths: list[Path],
+    root: Path,
+    stat_cache: dict[Path, os.stat_result] | None = None,
+) -> str:
     digest = hashlib.sha1()
     for path in sorted(paths):
-        stat = path.stat()
+        stat = stat_cache.get(path) if stat_cache is not None else None
+        if stat is None:
+            stat = path.stat()
         digest.update(str(path.relative_to(root)).encode("utf-8"))
         digest.update(str(stat.st_size).encode("utf-8"))
         digest.update(str(stat.st_mtime_ns).encode("utf-8"))
@@ -77,7 +84,20 @@ def build_asset_specs(root: Path) -> dict[str, MediaAssetSpec]:
     if not root.exists():
         return {}
 
-    files = sorted(path for path in root.rglob("*") if path.is_file() and is_supported(path))
+    files: list[Path] = []
+    stat_cache: dict[Path, os.stat_result] = {}
+    for dirpath, _, filenames in os.walk(root):
+        directory = Path(dirpath)
+        for filename in filenames:
+            path = directory / filename
+            if not is_supported(path):
+                continue
+            try:
+                stat_cache[path] = path.stat()
+            except OSError:
+                continue
+            files.append(path)
+    files.sort()
     grouped: dict[tuple[Path, str], list[Path]] = {}
     for path in files:
         grouped.setdefault((path.parent, path.stem), []).append(path)
@@ -99,8 +119,8 @@ def build_asset_specs(root: Path) -> dict[str, MediaAssetSpec]:
         rel_key = str(preview.relative_to(root).with_suffix(""))
         item_id = stable_id(rel_key)
         component_paths = sorted(candidates)
-        size_bytes = sum(path.stat().st_size for path in component_paths)
-        modified_ts = max(path.stat().st_mtime for path in component_paths)
+        size_bytes = sum(stat_cache[path].st_size for path in component_paths)
+        modified_ts = max(stat_cache[path].st_mtime for path in component_paths)
         assets[item_id] = MediaAssetSpec(
             id=item_id,
             relative_key=rel_key,
@@ -109,7 +129,7 @@ def build_asset_specs(root: Path) -> dict[str, MediaAssetSpec]:
             extension=preview.suffix.lower(),
             display_path=str(preview),
             component_paths=[str(path) for path in component_paths],
-            file_signature=build_signature(component_paths, root),
+            file_signature=build_signature(component_paths, root, stat_cache=stat_cache),
             size_bytes=size_bytes,
             modified_ts=modified_ts,
         )
@@ -131,9 +151,9 @@ def build_asset_specs(root: Path) -> dict[str, MediaAssetSpec]:
             extension=path.suffix.lower(),
             display_path=str(path),
             component_paths=[str(path)],
-            file_signature=build_signature([path], root),
-            size_bytes=path.stat().st_size,
-            modified_ts=path.stat().st_mtime,
+            file_signature=build_signature([path], root, stat_cache=stat_cache),
+            size_bytes=stat_cache[path].st_size,
+            modified_ts=stat_cache[path].st_mtime,
         )
 
     return assets

@@ -35,7 +35,7 @@ from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaAssetSpec, build_as
 from ..models import Album, DetectionRegion, MediaItem, Memory, Persona, utc_now
 from ..store import JsonLibraryStore
 from .model_manager import ModelManager, ModelStatus
-from .vision import AnalysisResult, CAT_LABELS, PET_LABELS, PreparedAssetInput, VideoFrameSample, VisionAnalyzer
+from .vision import AnalysisResult, CAT_LABELS, DOG_LABELS, PET_LABELS, PreparedAssetInput, VideoFrameSample, VisionAnalyzer
 
 
 PERSONA_COLORS = [
@@ -56,6 +56,10 @@ UNKNOWN_PERSON_CLUSTER_SIMILARITY_CAP = 0.82
 UNKNOWN_PET_CLUSTER_SIMILARITY_FLOOR = 0.78
 UNKNOWN_PET_CLUSTER_SIMILARITY_BOOST = 0.08
 UNKNOWN_PET_CLUSTER_SIMILARITY_CAP = 0.90
+UNKNOWN_PERSON_CLUSTER_MERGE_MARGIN = 0.05
+UNKNOWN_PET_CLUSTER_MERGE_MARGIN = 0.04
+UNKNOWN_CLUSTER_SIGNATURE_MERGE_SLACK = 2.0
+SCAN_PROGRESS_EMIT_INTERVAL = 48
 
 
 @dataclass(slots=True)
@@ -180,31 +184,33 @@ class LibraryService:
         for item_id in sorted(removed_ids):
             self.state.items.pop(item_id, None)
             completed += 1
-            self._emit_progress(
-                progress_callback,
-                ProgressUpdate(
-                    phase="sync",
-                    message="Removing missing items",
-                    current=completed,
-                    total=total_work,
-                    detail=item_id,
-                ),
-            )
+            if self._should_emit_scan_progress(completed, total_work):
+                self._emit_progress(
+                    progress_callback,
+                    ProgressUpdate(
+                        phase="sync",
+                        message="Removing missing items",
+                        current=completed,
+                        total=total_work,
+                        detail=item_id,
+                    ),
+                )
 
         for item_id, spec in sorted_assets:
             existing = self.state.items.get(item_id)
             if existing and existing.file_signature == spec.file_signature:
                 completed += 1
-                self._emit_progress(
-                    progress_callback,
-                    ProgressUpdate(
-                        phase="sync",
-                        message="Scanning library",
-                        current=completed,
-                        total=total_work,
-                        detail=spec.relative_key,
-                    ),
-                )
+                if self._should_emit_scan_progress(completed, total_work):
+                    self._emit_progress(
+                        progress_callback,
+                        ProgressUpdate(
+                            phase="sync",
+                            message="Scanning library",
+                            current=completed,
+                            total=total_work,
+                            detail=spec.relative_key,
+                        ),
+                    )
                 continue
 
             changed_entries.append((item_id, spec, existing))
@@ -263,18 +269,18 @@ class LibraryService:
                             added += 1
                         else:
                             updated += 1
-                        completed += 1
+                    completed += len(built_items)
+                    if built_items:
                         self._emit_progress(
                             progress_callback,
                             ProgressUpdate(
                                 phase="sync",
-                                message="Indexed media",
+                                message=f"Indexed batch {batch_index}/{total_batches}",
                                 current=completed,
                                 total=total_work,
-                                detail=item.relative_key,
+                                detail=self._batch_detail(batch_entries),
                             ),
                         )
-                    if built_items:
                         self.save()
                         self._emit_progress(
                             progress_callback,
@@ -535,6 +541,7 @@ class LibraryService:
 
     def build_item_details(self, item: MediaItem) -> str:
         personas = ", ".join(persona.name for persona in self.personas_for_item(item)) or "None"
+        detected_subjects = self._detected_subject_summary(item)
         tags = ", ".join(item.tags[:24]) or "None"
         lines = [
             f"Title: {item.title}",
@@ -544,7 +551,8 @@ class LibraryService:
             f"Size: {item.width} x {item.height}",
             f"Duration: {item.duration_seconds:.1f}s" if item.duration_seconds else "Duration: n/a",
             f"Favorite: {'yes' if item.favorite else 'no'}",
-            f"People/Pets: {personas}",
+            f"Assigned People/Pets: {personas}",
+            f"Detected Subjects: {detected_subjects}",
             f"Tags: {tags}",
         ]
         video_ai_frames = item.metadata.get("video_ai_frames_analyzed")
@@ -565,6 +573,29 @@ class LibraryService:
         if item.component_paths and len(item.component_paths) > 1:
             lines.append(f"Components: {len(item.component_paths)}")
         return "\n".join(lines)
+
+    def _detected_subject_summary(self, item: MediaItem) -> str:
+        labels: list[str] = []
+        for detection in item.detections:
+            if detection.kind == "face":
+                labels.append("human face")
+                continue
+            if self._is_pet_detection(detection):
+                normalized = detection.label.lower()
+                labels.append("pet" if normalized == "pet" else normalized)
+        if not labels:
+            return "None"
+
+        counts = Counter(labels)
+        ordered = sorted(
+            counts.items(),
+            key=lambda entry: (entry[1], entry[0]),
+            reverse=True,
+        )
+        return ", ".join(
+            f"{label} x{count}" if count > 1 else label
+            for label, count in ordered
+        )
 
     def create_persona(self, name: str, kind: str) -> Persona:
         normalized = name.strip()
@@ -1005,7 +1036,7 @@ class LibraryService:
         video_metadata: dict[str, object] = {}
 
         if spec.media_kind in {"image", "gif", "live_photo"}:
-            still_image = self.vision.load_preview_image(spec)
+            still_image = self.vision.load_analysis_image(spec)
         if spec.media_kind in {"video", "live_photo"}:
             sampled_frames, sampled_metadata = self.vision.load_video_analysis_frames(spec)
             video_frames = sampled_frames
@@ -1244,6 +1275,7 @@ class LibraryService:
                 if detection.persona_id or not self._is_unknown_cluster_candidate(kind, detection):
                     continue
                 self._add_detection_to_unknown_clusters(cluster_states, kind, item, detection)
+        cluster_states = self._merge_unknown_cluster_states(cluster_states, kind)
 
         return [
             self._finalize_unknown_cluster(cluster_state)
@@ -1338,6 +1370,96 @@ class LibraryService:
         if item.captured_at > cluster.latest_captured_at:
             cluster.latest_captured_at = item.captured_at
 
+    def _merge_unknown_cluster_states(
+        self,
+        clusters: list[_UnknownClusterState],
+        kind: str,
+    ) -> list[_UnknownClusterState]:
+        if len(clusters) < 2:
+            return clusters
+
+        merged = True
+        while merged:
+            merged = False
+            for left_index, left in enumerate(clusters):
+                for right_index in range(left_index + 1, len(clusters)):
+                    right = clusters[right_index]
+                    if not self._should_merge_unknown_clusters(kind, left, right):
+                        continue
+                    self._merge_unknown_cluster_state(left, right)
+                    clusters.pop(right_index)
+                    merged = True
+                    break
+                if merged:
+                    break
+        return clusters
+
+    def _should_merge_unknown_clusters(
+        self,
+        kind: str,
+        left: _UnknownClusterState,
+        right: _UnknownClusterState,
+    ) -> bool:
+        if kind == "pet" and not self._pet_cluster_labels_compatible(left, right):
+            return False
+
+        similarity_threshold = self._unknown_cluster_merge_similarity_threshold(kind)
+        signature_threshold = self._unknown_cluster_merge_signature_threshold(kind)
+
+        if left.embeddings and right.embeddings:
+            best_similarity = max(
+                self._cosine_similarity(left_encoding, right_encoding)
+                for left_encoding in left.embeddings
+                for right_encoding in right.embeddings
+            )
+            if best_similarity >= similarity_threshold:
+                return True
+
+        if left.signatures and right.signatures:
+            best_distance = min(
+                self._signature_distance(left_signature, right_signature)
+                for left_signature in left.signatures
+                for right_signature in right.signatures
+            )
+            if best_distance <= signature_threshold:
+                return True
+
+        return False
+
+    def _merge_unknown_cluster_state(
+        self,
+        target: _UnknownClusterState,
+        source: _UnknownClusterState,
+    ) -> None:
+        target.members.extend(source.members)
+        target.item_ids.update(source.item_ids)
+        target.labels.update(source.labels)
+        for encoding in source.embeddings:
+            self._remember_cluster_embedding(target, encoding)
+        for signature in source.signatures:
+            self._remember_cluster_signature(target, signature)
+        if source.representative_confidence > target.representative_confidence:
+            target.representative_item_id = source.representative_item_id
+            target.representative_region_id = source.representative_region_id
+            target.representative_confidence = source.representative_confidence
+        if source.latest_captured_at > target.latest_captured_at:
+            target.latest_captured_at = source.latest_captured_at
+
+    def _pet_cluster_labels_compatible(
+        self,
+        left: _UnknownClusterState,
+        right: _UnknownClusterState,
+    ) -> bool:
+        left_labels = set(left.labels)
+        right_labels = set(right.labels)
+        if "pet" in left_labels or "pet" in right_labels:
+            return True
+        if left_labels & CAT_LABELS and right_labels & CAT_LABELS:
+            return True
+        if left_labels & DOG_LABELS and right_labels & DOG_LABELS:
+            return True
+        return bool(left_labels & right_labels)
+
     def _remember_cluster_embedding(
         self,
         cluster: _UnknownClusterState,
@@ -1418,10 +1540,25 @@ class LibraryService:
             ),
         )
 
+    def _unknown_cluster_merge_similarity_threshold(self, kind: str) -> float:
+        if kind == "pet":
+            return max(
+                UNKNOWN_PET_CLUSTER_SIMILARITY_FLOOR - 0.02,
+                self._unknown_cluster_similarity_threshold(kind) - UNKNOWN_PET_CLUSTER_MERGE_MARGIN,
+            )
+        return max(
+            UNKNOWN_PERSON_CLUSTER_SIMILARITY_FLOOR - 0.04,
+            self._unknown_cluster_similarity_threshold(kind) - UNKNOWN_PERSON_CLUSTER_MERGE_MARGIN,
+        )
+
     def _unknown_cluster_signature_threshold(self, kind: str) -> float:
         if kind == "pet":
             return min(float(self.config.pet_hash_distance_threshold), REFERENCE_SIGNATURE_DISTANCE_THRESHOLD)
         return REFERENCE_SIGNATURE_DISTANCE_THRESHOLD
+
+    def _unknown_cluster_merge_signature_threshold(self, kind: str) -> float:
+        base = self._unknown_cluster_signature_threshold(kind)
+        return base + UNKNOWN_CLUSTER_SIGNATURE_MERGE_SLACK
 
     def _ensure_cluster_preview(
         self,
@@ -1914,6 +2051,11 @@ class LibraryService:
         if first == last:
             return first
         return f"{first} -> {last}"
+
+    def _should_emit_scan_progress(self, completed: int, total: int) -> bool:
+        if completed <= 1 or completed >= total:
+            return True
+        return completed % SCAN_PROGRESS_EMIT_INTERVAL == 0
 
     def _emit_progress(
         self,

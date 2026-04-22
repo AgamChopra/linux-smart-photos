@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
+import io
+import logging
 from pathlib import Path
 from typing import Any
+import warnings
 
 try:
     import cv2
@@ -44,6 +48,8 @@ try:
 except Exception:
     YOLO = None
 
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+
 try:
     import torch
     from transformers import AutoImageProcessor, AutoModel
@@ -56,6 +62,8 @@ except Exception:
 CAT_LABELS = {"cat", "kitten"}
 DOG_LABELS = {"dog", "puppy"}
 PET_LABELS = CAT_LABELS | DOG_LABELS | {"bird", "horse", "rabbit", "hamster", "guinea pig", "ferret"}
+ANALYSIS_IMAGE_MAX_DIMENSION = 1600
+VIDEO_ANALYSIS_FRAME_MAX_DIMENSION = 1280
 
 
 @dataclass(slots=True)
@@ -351,12 +359,16 @@ class VisionAnalyzer:
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 timestamp_seconds = frame_index / fps if fps > 0 else float(sample_number)
+                frame_image = self._resize_for_analysis(
+                    Image.fromarray(rgb_frame),
+                    VIDEO_ANALYSIS_FRAME_MAX_DIMENSION,
+                )
                 samples.append(
                     VideoFrameSample(
                         sample_number=sample_number,
                         frame_index=frame_index,
                         timestamp_seconds=round(timestamp_seconds, 2),
-                        image=Image.fromarray(rgb_frame),
+                        image=frame_image,
                     )
                 )
                 sampled_timestamps.append(round(timestamp_seconds, 2))
@@ -596,18 +608,30 @@ class VisionAnalyzer:
         return xor.bit_count()
 
     def load_preview_image(self, spec: MediaAssetSpec) -> Image.Image | None:
+        return self._load_image(spec)
+
+    def load_analysis_image(self, spec: MediaAssetSpec) -> Image.Image | None:
+        return self._load_image(spec, max_dimension=ANALYSIS_IMAGE_MAX_DIMENSION)
+
+    def _load_image(
+        self,
+        spec: MediaAssetSpec,
+        max_dimension: int | None = None,
+    ) -> Image.Image | None:
         try:
             if spec.media_kind in {"image", "live_photo"}:
                 image_path = self.primary_image_path(spec)
                 if image_path:
                     with Image.open(image_path) as image:
-                        return ImageOps.exif_transpose(image).convert("RGB")
+                        loaded = ImageOps.exif_transpose(image).convert("RGB")
+                        return self._resize_for_analysis(loaded, max_dimension)
                 return None
 
             if spec.media_kind == "gif":
                 with Image.open(spec.display_path) as image:
                     frame = next(ImageSequence.Iterator(image))
-                    return ImageOps.exif_transpose(frame).convert("RGB")
+                    loaded = ImageOps.exif_transpose(frame).convert("RGB")
+                    return self._resize_for_analysis(loaded, max_dimension)
 
             video_path = self.primary_video_path(spec)
             if not video_path or cv2 is None:
@@ -619,11 +643,33 @@ class VisionAnalyzer:
                 if not ok or frame is None:
                     return None
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                return Image.fromarray(rgb_frame)
+                loaded = Image.fromarray(rgb_frame)
+                return self._resize_for_analysis(loaded, max_dimension)
             finally:
                 capture.release()
         except (FileNotFoundError, UnidentifiedImageError, OSError):
             return None
+
+    def _resize_for_analysis(
+        self,
+        image: Image.Image,
+        max_dimension: int | None,
+    ) -> Image.Image:
+        if not max_dimension or max_dimension <= 0:
+            return image
+        width, height = image.size
+        largest = max(width, height)
+        if largest <= max_dimension:
+            return image
+        scale = max_dimension / float(largest)
+        resized = image.resize(
+            (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+        return resized
 
     def primary_image_path(self, spec: MediaAssetSpec) -> Path | None:
         for component in spec.component_paths:
@@ -743,7 +789,8 @@ class VisionAnalyzer:
         return f"cuda:{self.yolo_device}" if isinstance(self.yolo_device, int) else str(self.yolo_device)
 
     def _analysis_batch_size(self) -> int:
-        return max(1, int(self.config.analysis_batch_size))
+        configured = max(1, int(self.config.analysis_batch_size))
+        return min(configured, 12)
 
     def _pet_embedding_batch_size(self) -> int:
         return max(1, int(self.config.pet_embedding_batch_size))
@@ -769,13 +816,14 @@ class VisionAnalyzer:
 
         try:
             providers = self._preferred_onnx_providers()
-            app = FaceAnalysis(
-                name=pack_name,
-                root=str(pack_root),
-                providers=providers,
-            )
-            requested_gpu = "CUDAExecutionProvider" in providers
-            app.prepare(ctx_id=0 if requested_gpu else -1, det_size=(640, 640))
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                app = FaceAnalysis(
+                    name=pack_name,
+                    root=str(pack_root),
+                    providers=providers,
+                )
+                requested_gpu = "CUDAExecutionProvider" in providers
+                app.prepare(ctx_id=0 if requested_gpu else -1, det_size=(640, 640))
             actual_providers = self._face_session_providers(app)
             self.human_face_providers = actual_providers or providers
             self.human_face_uses_gpu = "CUDAExecutionProvider" in self.human_face_providers
@@ -852,7 +900,13 @@ class VisionAnalyzer:
 
         bgr = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
         try:
-            faces = self.human_face_app.get(bgr)
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="`estimate` is deprecated",
+                    category=FutureWarning,
+                )
+                faces = self.human_face_app.get(bgr)
         except Exception:
             return []
 

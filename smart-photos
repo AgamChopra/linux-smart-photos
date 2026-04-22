@@ -133,4 +133,10 @@ if [[ "$mode" == "cli" ]]; then
   exec "$VENV_DIR/bin/smart-photos-cli" "${passthrough[@]}"
 fi
 
+if [[ -n "${QT_LOGGING_RULES:-}" ]]; then
+  export QT_LOGGING_RULES="${QT_LOGGING_RULES};qt.qpa.services.warning=false"
+else
+  export QT_LOGGING_RULES="qt.qpa.services.warning=false"
+fi
+
 exec "$VENV_DIR/bin/smart-photos-gui" "${passthrough[@]}"

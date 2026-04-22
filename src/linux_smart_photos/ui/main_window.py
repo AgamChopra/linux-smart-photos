@@ -364,9 +364,9 @@ class UnknownClustersPage(QWidget):
         self._clusters_by_id: dict[str, UnknownPersonaCluster] = {}
 
         self.kind_filter = QComboBox()
+        self.kind_filter.addItem("All Unknown", "all")
         self.kind_filter.addItem("People", "person")
         self.kind_filter.addItem("Pets", "pet")
-        self.kind_filter.addItem("All Unknown", "all")
         self.kind_filter.currentIndexChanged.connect(self.refresh)
 
         self.cluster_list = QListWidget()
