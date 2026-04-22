@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.codex
+.venv/
+.venv-packaging/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+packaging/tools/
+yolov8n.pt

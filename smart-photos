@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETUP_SCRIPT="$ROOT_DIR/setup-smart-photos"
+VENV_DIR="$ROOT_DIR/.venv"
+
+mode="gui"
+skip_setup="0"
+force_setup="0"
+setup_only="0"
+passthrough=()
+
+print_usage() {
+  cat <<'EOF'
+Usage: ./smart-photos [--gui] [--cli] [--setup] [--setup-only] [--help] [-- ...]
+
+Modes:
+  --gui          Launch the desktop app (default)
+  --cli          Launch the command-line interface
+
+Setup:
+  --setup        Force the bootstrap script to run before launching
+  --setup-only   Run bootstrap and exit
+
+Examples:
+  ./smart-photos
+  ./smart-photos --cli status
+  ./smart-photos --cli search cat --limit 10
+  ./smart-photos --setup-only
+EOF
+}
+
+spawn_setup_terminal() {
+  local launcher_cmd
+  printf -v launcher_cmd '%q --force && %q --no-setup --gui' "$SETUP_SCRIPT" "$ROOT_DIR/smart-photos"
+
+  if command -v x-terminal-emulator >/dev/null 2>&1; then
+    exec x-terminal-emulator -e bash -lc "$launcher_cmd"
+  fi
+  if command -v gnome-terminal >/dev/null 2>&1; then
+    exec gnome-terminal -- bash -lc "$launcher_cmd"
+  fi
+  if command -v konsole >/dev/null 2>&1; then
+    exec konsole -e bash -lc "$launcher_cmd"
+  fi
+  if command -v xfce4-terminal >/dev/null 2>&1; then
+    exec xfce4-terminal --command="bash -lc \"$launcher_cmd\""
+  fi
+  if command -v kitty >/dev/null 2>&1; then
+    exec kitty bash -lc "$launcher_cmd"
+  fi
+  if command -v alacritty >/dev/null 2>&1; then
+    exec alacritty -e bash -lc "$launcher_cmd"
+  fi
+  if command -v xterm >/dev/null 2>&1; then
+    exec xterm -e bash -lc "$launcher_cmd"
+  fi
+  return 1
+}
+
+while (($#)); do
+  case "$1" in
+    --gui|gui)
+      mode="gui"
+      shift
+      ;;
+    --cli|cli)
+      mode="cli"
+      shift
+      ;;
+    --setup)
+      force_setup="1"
+      shift
+      ;;
+    --setup-only)
+      force_setup="1"
+      setup_only="1"
+      shift
+      ;;
+    --no-setup)
+      skip_setup="1"
+      shift
+      ;;
+    --help|-h)
+      print_usage
+      exit 0
+      ;;
+    --)
+      shift
+      passthrough+=("$@")
+      break
+      ;;
+    *)
+      passthrough+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "$skip_setup" != "1" ]]; then
+  set +e
+  "$SETUP_SCRIPT" --check >/dev/null 2>&1
+  setup_status=$?
+  set -e
+
+  if [[ "$setup_status" -eq 10 && ! -t 1 && "$mode" == "gui" ]]; then
+    if spawn_setup_terminal; then
+      exit 0
+    fi
+  fi
+
+  if [[ "$force_setup" == "1" ]]; then
+    "$SETUP_SCRIPT" --force
+  else
+    "$SETUP_SCRIPT"
+  fi
+fi
+
+if [[ "$setup_only" == "1" ]]; then
+  exit 0
+fi
+
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  echo "The Smart Photos virtual environment is missing. Run ./setup-smart-photos first." >&2
+  exit 1
+fi
+
+if [[ "$mode" == "cli" ]]; then
+  if [[ ${#passthrough[@]} -eq 0 ]]; then
+    passthrough=("status")
+  fi
+  exec "$VENV_DIR/bin/smart-photos-cli" "${passthrough[@]}"
+fi
+
+exec "$VENV_DIR/bin/smart-photos-gui" "${passthrough[@]}"

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title>Smart Photos</title>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f6eee1" />
+      <stop offset="100%" stop-color="#d8e6f3" />
+    </linearGradient>
+    <linearGradient id="petal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffb55a" />
+      <stop offset="100%" stop-color="#ef6f4d" />
+    </linearGradient>
+  </defs>
+  <rect x="20" y="20" width="216" height="216" rx="52" fill="url(#bg)" />
+  <circle cx="128" cy="128" r="26" fill="#fff8ee" />
+  <circle cx="128" cy="128" r="12" fill="#0d3b66" />
+  <path d="M128 48c18 0 32 17 32 38s-14 37-32 37-32-16-32-37 14-38 32-38Z" fill="url(#petal)" />
+  <path d="M128 133c18 0 32 16 32 37s-14 38-32 38-32-17-32-38 14-37 32-37Z" fill="url(#petal)" />
+  <path d="M48 128c0-18 17-32 38-32s37 14 37 32-16 32-37 32-38-14-38-32Z" fill="url(#petal)" />
+  <path d="M133 128c0-18 16-32 37-32s38 14 38 32-17 32-38 32-37-14-37-32Z" fill="url(#petal)" />
+  <path d="M76 76c13-13 35-12 50 3s16 37 3 50-35 12-50-3-16-37-3-50Z" fill="url(#petal)" opacity=".94" />
+  <path d="M127 127c13-13 35-12 50 3s16 37 3 50-35 12-50-3-16-37-3-50Z" fill="url(#petal)" opacity=".94" />
+  <path d="M76 180c-13-13-12-35 3-50s37-16 50-3 12 35-3 50-37 16-50 3Z" fill="url(#petal)" opacity=".94" />
+  <path d="M127 129c-13-13-12-35 3-50s37-16 50-3 12 35-3 50-37 16-50 3Z" fill="url(#petal)" opacity=".94" />
+</svg>

@@ -1,0 +1,37 @@
+name: Build AppImage
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libfuse2 patchelf
+
+      - name: Make build script executable
+        run: chmod +x packaging/build-appimage.sh
+
+      - name: Build AppImage
+        run: ./packaging/build-appimage.sh --with-ai
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smart-photos-appimage
+          path: dist/*.AppImage

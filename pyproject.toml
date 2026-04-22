@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linux-smart-photos"
+version = "0.1.0"
+description = "A Python desktop photo library for Linux with incremental indexing, albums, people/pets, search, and memories."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6>=6.7",
+  "Pillow>=10.3",
+  "numpy>=1.26",
+  "opencv-python>=4.9",
+  "imageio>=2.34",
+  "imagehash>=4.3",
+  "rapidfuzz>=3.9",
+  "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+ai = [
+  "huggingface-hub>=0.26",
+  "insightface>=0.7.3",
+  "onnxruntime>=1.20",
+  "safetensors>=0.4",
+  "torch>=2.4",
+  "transformers>=4.46",
+  "ultralytics>=8.3",
+  "pillow-heif>=0.16",
+]
+packaging = [
+  "pyinstaller>=6.19",
+]
+
+[project.scripts]
+linux-smart-photos = "linux_smart_photos.app:main"
+smart-photos = "linux_smart_photos.launcher:main"
+smart-photos-gui = "linux_smart_photos.app:main"
+smart-photos-cli = "linux_smart_photos.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
