@@ -51,6 +51,32 @@ class SQLiteLibraryStore:
     def has_state(self) -> bool:
         return self._has_state()
 
+    def count_items(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM items").fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def count_personas(self, kind: str = "all") -> int:
+        with self._connect() as conn:
+            if kind == "all":
+                row = conn.execute("SELECT COUNT(*) AS count FROM personas").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM personas WHERE kind = ?",
+                    (kind,),
+                ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def count_albums(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM albums").fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def count_memories(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM memories").fetchone()
+        return int(row["count"]) if row is not None else 0
+
     def legacy_json_candidates(self) -> list[Path]:
         return [candidate for candidate in self._legacy_json_paths_for(self.requested_path) if candidate.exists()]
 

@@ -2,6 +2,8 @@
 
 Smart Photos is a Linux photo library app for browsing, searching, and organizing personal media collections.
 
+The default desktop UI now uses Electron. The older Qt interface is still included as a fallback.
+
 It supports:
 
 - Photos, videos, GIFs, and paired live photos
@@ -37,6 +39,7 @@ The easiest way to start is with the wrapper launcher. On first run it will:
 
 - create `.venv`
 - install the app and AI dependencies
+- install the Electron desktop UI dependencies when `npm` is available
 - migrate older JSON libraries to SQLite if they are present
 - update `config.json` to the SQLite library path
 - download the recommended AI models
@@ -58,6 +61,7 @@ If you want to bootstrap without launching the GUI:
 ```
 
 The first run can take a while because it installs Python packages and model files.
+If `npm` is not available, the launcher falls back to the Qt desktop UI.
 
 ## Manual Install
 
@@ -85,6 +89,8 @@ Or:
 
 ```bash
 ./smart-photos --gui
+./smart-photos --electron
+./smart-photos --qt
 ```
 
 CLI mode:
@@ -96,6 +102,8 @@ CLI mode:
 ./smart-photos --cli models status
 ./smart-photos --cli migrate
 ```
+
+The primary Electron UI needs `npm` during setup. The Qt fallback does not.
 
 ## Files
 

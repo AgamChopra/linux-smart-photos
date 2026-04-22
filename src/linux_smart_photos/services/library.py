@@ -465,6 +465,7 @@ class LibraryService:
         persona_kind: str = "all",
         persona_id: str = "",
         favorites_only: bool = False,
+        limit: int | None = None,
     ) -> list[MediaItem]:
         if not self._state_loaded:
             return self._search_items_from_store(
@@ -473,6 +474,7 @@ class LibraryService:
                 persona_kind=persona_kind,
                 persona_id=persona_id,
                 favorites_only=favorites_only,
+                limit=limit,
             )
         items = [item for item in self.list_items() if not item.hidden]
 
@@ -496,7 +498,7 @@ class LibraryService:
         field_filters, free_text = self._parse_query(query)
         items = self._apply_field_filters(items, field_filters)
         if not free_text:
-            return items
+            return items if limit is None else items[:limit]
 
         scored_items: list[tuple[int, MediaItem]] = []
         for item in items:
@@ -507,7 +509,8 @@ class LibraryService:
             key=lambda entry: (entry[0], self._item_datetime(entry[1]), entry[1].modified_ts),
             reverse=True,
         )
-        return [item for _, item in scored_items]
+        ranked_items = [item for _, item in scored_items]
+        return ranked_items if limit is None else ranked_items[:limit]
 
     def items_for_persona(self, persona_id: str) -> list[MediaItem]:
         if not self._state_loaded:
@@ -2033,6 +2036,7 @@ class LibraryService:
         persona_kind: str,
         persona_id: str,
         favorites_only: bool,
+        limit: int | None,
     ) -> list[MediaItem]:
         field_filters, free_text = self._parse_query(query)
         resolved_media_kind = field_filters.get("type", media_kind)
@@ -2070,7 +2074,7 @@ class LibraryService:
             year=resolved_year,
             tag=resolved_tag,
             search_text=free_text,
-            limit=SEARCH_CANDIDATE_LIMIT if free_text else None,
+            limit=SEARCH_CANDIDATE_LIMIT if free_text else limit,
         )
         if not free_text:
             return candidate_items
@@ -2084,7 +2088,8 @@ class LibraryService:
             key=lambda entry: (entry[0], self._item_datetime(entry[1]), entry[1].modified_ts),
             reverse=True,
         )
-        return [item for _, item in scored_items]
+        ranked_items = [item for _, item in scored_items]
+        return ranked_items if limit is None else ranked_items[:limit]
 
     def _apply_field_filters(
         self,

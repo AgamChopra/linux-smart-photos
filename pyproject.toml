@@ -41,6 +41,8 @@ smart-photos = "linux_smart_photos.launcher:main"
 smart-photos-gui = "linux_smart_photos.app:main"
 smart-photos-cli = "linux_smart_photos.cli:main"
 smart-photos-migrate = "linux_smart_photos.migration:main"
+smart-photos-qt = "linux_smart_photos.app:main"
+smart-photos-web-api = "linux_smart_photos.web_api:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

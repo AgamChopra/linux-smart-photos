@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Smart Photos</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <div class="brand-mark">SP</div>
+          <div>
+            <div class="brand-title">Smart Photos</div>
+            <div class="brand-subtitle">Local photo intelligence</div>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-button active" data-view="library">Library</button>
+          <button class="nav-button" data-view="personas">People & Pets</button>
+          <button class="nav-button" data-view="unknown">Unknown Clusters</button>
+          <button class="nav-button" data-view="albums">Albums</button>
+          <button class="nav-button" data-view="memories">Memories</button>
+          <button class="nav-button" data-view="models">AI Models</button>
+        </nav>
+
+        <div class="sidebar-summary" id="sidebar-summary">
+          <div class="summary-row"><span>Items</span><strong id="count-items">0</strong></div>
+          <div class="summary-row"><span>Personas</span><strong id="count-personas">0</strong></div>
+          <div class="summary-row"><span>Albums</span><strong id="count-albums">0</strong></div>
+          <div class="summary-row"><span>Memories</span><strong id="count-memories">0</strong></div>
+        </div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <div>
+            <h1 id="view-title">Library</h1>
+            <p id="view-subtitle">Browse and correct your indexed media.</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="secondary-button" id="sync-button">Sync Library</button>
+            <button class="primary-button" id="open-folder-button">Show Media Root</button>
+          </div>
+        </header>
+
+        <section class="status-panel">
+          <div class="status-copy">
+            <div class="status-pill" id="status-pill">Idle</div>
+            <div class="status-text" id="status-text">Ready.</div>
+          </div>
+          <div class="progress-track">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+        </section>
+
+        <section class="view-section active" data-view="library">
+          <div class="control-row">
+            <input id="library-search" class="text-input flex-2" type="text" placeholder="Search: cat, birthday, person:alice type:video" />
+            <select id="library-type" class="select-input">
+              <option value="all">All media</option>
+              <option value="image">Images</option>
+              <option value="video">Videos</option>
+              <option value="gif">GIFs</option>
+              <option value="live_photo">Live photos</option>
+            </select>
+            <select id="library-persona-kind" class="select-input">
+              <option value="all">All personas</option>
+              <option value="person">People</option>
+              <option value="pet">Pets</option>
+            </select>
+            <select id="library-persona" class="select-input">
+              <option value="">Any persona</option>
+            </select>
+            <label class="check-input"><input id="library-favorites" type="checkbox" /> Favorites</label>
+          </div>
+
+          <div class="split-layout">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Results</h2>
+                <span id="library-results-count" class="muted-text">0 items</span>
+              </div>
+              <div id="library-grid" class="media-grid"></div>
+            </div>
+
+            <div class="detail-column">
+              <div class="panel detail-panel">
+                <div class="panel-header">
+                  <h2>Selected Item</h2>
+                  <button class="secondary-button compact" id="item-favorite-button">Toggle Favorite</button>
+                </div>
+                <div id="item-preview" class="item-preview empty">Select an item to preview it.</div>
+                <div class="inline-actions">
+                  <button class="secondary-button compact" id="item-open-file-button">Open File</button>
+                  <button class="secondary-button compact" id="item-open-folder-detail-button">Show In Folder</button>
+                </div>
+                <pre id="item-details" class="details-block">No item selected.</pre>
+              </div>
+
+              <div class="panel">
+                <div class="panel-header">
+                  <h2>Corrections</h2>
+                </div>
+                <div id="item-detections" class="detection-list"></div>
+                <div class="inline-form">
+                  <select id="assign-kind" class="select-input">
+                    <option value="person">Person</option>
+                    <option value="pet">Pet</option>
+                  </select>
+                  <select id="assign-persona" class="select-input">
+                    <option value="">Existing persona</option>
+                  </select>
+                  <input id="assign-new-name" class="text-input" type="text" placeholder="Or create new persona" />
+                </div>
+                <div class="inline-actions">
+                  <button class="primary-button compact" id="assign-region-button">Assign Selected Region</button>
+                  <button class="secondary-button compact" id="clear-region-button">Clear Region</button>
+                  <button class="primary-button compact" id="assign-item-button">Assign Whole Asset</button>
+                  <button class="secondary-button compact" id="clear-item-button">Clear Whole Asset</button>
+                </div>
+              </div>
+
+              <div class="panel">
+                <div class="panel-header">
+                  <h2>Albums</h2>
+                </div>
+                <div class="inline-form">
+                  <select id="album-select" class="select-input">
+                    <option value="">Existing album</option>
+                  </select>
+                  <input id="album-new-name" class="text-input" type="text" placeholder="Or create new album" />
+                </div>
+                <div class="inline-actions">
+                  <button class="primary-button compact" id="album-add-button">Add Selected Item</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view-section" data-view="personas">
+          <div class="control-row">
+            <select id="persona-kind-filter" class="select-input">
+              <option value="all">All personas</option>
+              <option value="person">People</option>
+              <option value="pet">Pets</option>
+            </select>
+            <select id="new-persona-kind" class="select-input">
+              <option value="person">Person</option>
+              <option value="pet">Pet</option>
+            </select>
+            <input id="new-persona-name" class="text-input flex-2" type="text" placeholder="Create a new persona" />
+            <button class="primary-button" id="new-persona-button">Create Persona</button>
+          </div>
+          <div class="split-layout">
+            <div class="panel narrow-panel">
+              <div class="panel-header">
+                <h2>Personas</h2>
+              </div>
+              <div id="persona-list" class="list-stack"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h2 id="persona-detail-title">Select a persona</h2>
+              </div>
+              <div id="persona-reference-strip" class="reference-strip"></div>
+              <div id="persona-grid" class="media-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view-section" data-view="unknown">
+          <div class="control-row">
+            <select id="unknown-kind" class="select-input">
+              <option value="all">All unknown</option>
+              <option value="person">People</option>
+              <option value="pet">Pets</option>
+            </select>
+            <select id="unknown-assign-kind" class="select-input">
+              <option value="person">Person</option>
+              <option value="pet">Pet</option>
+            </select>
+            <select id="unknown-assign-persona" class="select-input">
+              <option value="">Existing persona</option>
+            </select>
+            <input id="unknown-new-name" class="text-input flex-2" type="text" placeholder="Or create new persona" />
+            <button class="primary-button" id="unknown-assign-button">Assign Selected Clusters</button>
+          </div>
+          <div class="split-layout">
+            <div class="panel narrow-panel">
+              <div class="panel-header">
+                <h2>Clusters</h2>
+              </div>
+              <div id="unknown-list" class="list-stack selectable multi-select"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Cluster Items</h2>
+                <span id="unknown-summary" class="muted-text">Select one or more clusters.</span>
+              </div>
+              <div id="unknown-grid" class="media-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view-section" data-view="albums">
+          <div class="control-row">
+            <input id="new-album-name" class="text-input flex-2" type="text" placeholder="Create a new empty album" />
+            <button class="primary-button" id="new-album-button">Create Album</button>
+            <button class="secondary-button" id="delete-album-button">Delete Selected Album</button>
+          </div>
+          <div class="split-layout">
+            <div class="panel narrow-panel">
+              <div class="panel-header">
+                <h2>Albums</h2>
+              </div>
+              <div id="album-list" class="list-stack"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h2 id="album-detail-title">Select an album</h2>
+              </div>
+              <div id="album-grid" class="media-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view-section" data-view="memories">
+          <div class="split-layout">
+            <div class="panel narrow-panel">
+              <div class="panel-header">
+                <h2>Memories</h2>
+              </div>
+              <div id="memory-list" class="list-stack"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h2 id="memory-detail-title">Select a memory</h2>
+              </div>
+              <div id="memory-summary" class="memory-summary">Choose a memory to view its items.</div>
+              <div id="memory-grid" class="media-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view-section" data-view="models">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>AI Models</h2>
+              <button class="primary-button" id="download-models-button">Download Recommended Models</button>
+            </div>
+            <div id="model-list" class="model-list"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

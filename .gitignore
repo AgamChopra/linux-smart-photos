@@ -10,3 +10,5 @@ build/
 dist/
 packaging/tools/
 yolov8n.pt
+electron/node_modules/
+electron/package-lock.json
