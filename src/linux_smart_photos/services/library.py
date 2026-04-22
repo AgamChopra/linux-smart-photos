@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import difflib
 from itertools import combinations
 import math
+import os
 from pathlib import Path
 import re
 from typing import Callable, Iterable
@@ -32,7 +34,7 @@ from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaAssetSpec, build_as
 from ..models import Album, DetectionRegion, MediaItem, Memory, Persona, utc_now
 from ..store import JsonLibraryStore
 from .model_manager import ModelManager, ModelStatus
-from .vision import CAT_LABELS, PET_LABELS, VisionAnalyzer
+from .vision import AnalysisResult, CAT_LABELS, PET_LABELS, PreparedAssetInput, VideoFrameSample, VisionAnalyzer
 
 
 PERSONA_COLORS = [
@@ -60,6 +62,18 @@ class ProgressUpdate:
     current: int = 0
     total: int = 0
     detail: str = ""
+    indeterminate: bool = False
+
+
+@dataclass(slots=True)
+class PreparedSyncItem:
+    spec: MediaAssetSpec
+    existing: MediaItem | None
+    metadata: dict[str, object]
+    thumbnail_path: str
+    still_image: Image.Image | None
+    video_frames: list[VideoFrameSample]
+    video_metadata: dict[str, object]
 
 
 class LibraryService:
@@ -95,6 +109,7 @@ class LibraryService:
         updated = 0
         total_work = len(removed_ids) + len(sorted_assets) + 2
         completed = 0
+        changed_entries: list[tuple[str, MediaAssetSpec, MediaItem | None]] = []
 
         self._emit_progress(
             progress_callback,
@@ -137,22 +152,61 @@ class LibraryService:
                 )
                 continue
 
-            self.state.items[item_id] = self._build_item(spec, existing)
-            if existing is None:
-                added += 1
-            else:
-                updated += 1
-            completed += 1
-            self._emit_progress(
-                progress_callback,
-                ProgressUpdate(
-                    phase="sync",
-                    message="Analyzing media",
-                    current=completed,
-                    total=total_work,
-                    detail=spec.relative_key,
-                ),
-            )
+            changed_entries.append((item_id, spec, existing))
+
+        if changed_entries:
+            batch_size = self._scan_batch_size()
+            max_workers = min(self._prefetch_workers(), max(1, batch_size), len(changed_entries))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                total_batches = (len(changed_entries) + batch_size - 1) // batch_size
+                for batch_index, batch_start in enumerate(range(0, len(changed_entries), batch_size), start=1):
+                    batch_entries = changed_entries[batch_start : batch_start + batch_size]
+                    self._emit_progress(
+                        progress_callback,
+                        ProgressUpdate(
+                            phase="sync",
+                            message=f"Prefetching batch {batch_index}/{total_batches}",
+                            current=completed,
+                            total=total_work,
+                            detail=self._batch_detail(batch_entries),
+                            indeterminate=True,
+                        ),
+                    )
+                    prepared_batch = self._prepare_batch(batch_entries, executor)
+                    existing_by_id = {
+                        prepared.spec.id: prepared.existing
+                        for prepared in prepared_batch
+                    }
+                    self._emit_progress(
+                        progress_callback,
+                        ProgressUpdate(
+                            phase="sync",
+                            message=f"Running AI batch {batch_index}/{total_batches}",
+                            current=completed,
+                            total=total_work,
+                            detail=f"{len(prepared_batch)} items",
+                            indeterminate=True,
+                        ),
+                    )
+                    built_items = self._build_items_batch(prepared_batch)
+                    for item in built_items:
+                        self.state.items[item.id] = item
+                        source_existing = existing_by_id.get(item.id)
+                        if source_existing is None:
+                            added += 1
+                        else:
+                            updated += 1
+                        completed += 1
+                        self._emit_progress(
+                            progress_callback,
+                            ProgressUpdate(
+                                phase="sync",
+                                message="Indexed media",
+                                current=completed,
+                                total=total_work,
+                                detail=item.relative_key,
+                            ),
+                        )
 
         completed += 1
         self._emit_progress(
@@ -750,9 +804,79 @@ class LibraryService:
         ]
 
     def _build_item(self, spec: MediaAssetSpec, existing: MediaItem | None) -> MediaItem:
+        prepared = self._prepare_sync_item(spec, existing)
+        return self._build_items_batch([prepared])[0]
+
+    def _prepare_batch(
+        self,
+        entries: list[tuple[str, MediaAssetSpec, MediaItem | None]],
+        executor: ThreadPoolExecutor,
+    ) -> list[PreparedSyncItem]:
+        futures: list[Future[PreparedSyncItem]] = [
+            executor.submit(self._prepare_sync_item, spec, existing)
+            for _, spec, existing in entries
+        ]
+        return [future.result() for future in futures]
+
+    def _prepare_sync_item(
+        self,
+        spec: MediaAssetSpec,
+        existing: MediaItem | None,
+    ) -> PreparedSyncItem:
+        still_image: Image.Image | None = None
+        video_frames: list[VideoFrameSample] = []
+        video_metadata: dict[str, object] = {}
+
+        if spec.media_kind in {"image", "gif", "live_photo"}:
+            still_image = self.vision.load_preview_image(spec)
+        if spec.media_kind in {"video", "live_photo"}:
+            sampled_frames, sampled_metadata = self.vision.load_video_analysis_frames(spec)
+            video_frames = sampled_frames
+            video_metadata = sampled_metadata
+            if spec.media_kind == "video" and sampled_frames:
+                still_image = sampled_frames[0].image.copy()
+
         metadata = self._extract_metadata(spec)
-        thumbnail_path = self._ensure_thumbnail(spec)
-        analysis = self.vision.analyze(spec)
+        thumbnail_source = still_image.copy() if still_image is not None else None
+        thumbnail_path = self._ensure_thumbnail_from_image(spec, thumbnail_source)
+        return PreparedSyncItem(
+            spec=spec,
+            existing=existing,
+            metadata=metadata,
+            thumbnail_path=thumbnail_path,
+            still_image=still_image,
+            video_frames=video_frames,
+            video_metadata=video_metadata,
+        )
+
+    def _build_items_batch(self, prepared_items: list[PreparedSyncItem]) -> list[MediaItem]:
+        if not prepared_items:
+            return []
+
+        analyses = self.vision.analyze_batch(
+            [
+                PreparedAssetInput(
+                    spec=prepared.spec,
+                    still_image=None if prepared.spec.media_kind == "video" else prepared.still_image,
+                    video_frames=prepared.video_frames,
+                    video_metadata=prepared.video_metadata,
+                )
+                for prepared in prepared_items
+            ]
+        )
+        return [
+            self._build_item_from_prepared_analysis(prepared, analysis)
+            for prepared, analysis in zip(prepared_items, analyses, strict=False)
+        ]
+
+    def _build_item_from_prepared_analysis(
+        self,
+        prepared: PreparedSyncItem,
+        analysis: AnalysisResult,
+    ) -> MediaItem:
+        spec = prepared.spec
+        existing = prepared.existing
+        metadata = prepared.metadata
         tags = sorted(
             {
                 spec.media_kind,
@@ -774,7 +898,7 @@ class LibraryService:
             modified_ts=spec.modified_ts,
             captured_at=metadata["captured_at"],
             discovered_at=existing.discovered_at if existing else utc_now(),
-            thumbnail_path=thumbnail_path,
+            thumbnail_path=prepared.thumbnail_path,
             width=metadata["width"],
             height=metadata["height"],
             duration_seconds=metadata["duration_seconds"],
@@ -849,6 +973,12 @@ class LibraryService:
         if image is None:
             return ""
 
+        return self._ensure_thumbnail_from_image(spec, image)
+
+    def _ensure_thumbnail_from_image(self, spec: MediaAssetSpec, image: Image.Image | None) -> str:
+        if image is None:
+            return ""
+        cache_path = self.config.cache_path / f"{spec.id}.jpg"
         image.thumbnail((self.config.thumbnail_size, self.config.thumbnail_size))
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(cache_path, format="JPEG", quality=88)
@@ -1112,6 +1242,26 @@ class LibraryService:
             if len(left) != len(right):
                 return math.inf
             return float(sum(left_char != right_char for left_char, right_char in zip(left, right, strict=False)))
+
+    def _scan_batch_size(self) -> int:
+        return max(1, int(self.config.scan_batch_size))
+
+    def _prefetch_workers(self) -> int:
+        configured = max(1, int(self.config.prefetch_workers))
+        cpu_count = os.cpu_count() or configured
+        return max(1, min(configured, cpu_count))
+
+    def _batch_detail(
+        self,
+        entries: list[tuple[str, MediaAssetSpec, MediaItem | None]],
+    ) -> str:
+        if not entries:
+            return ""
+        first = entries[0][1].relative_key
+        last = entries[-1][1].relative_key
+        if first == last:
+            return first
+        return f"{first} -> {last}"
 
     def _emit_progress(
         self,

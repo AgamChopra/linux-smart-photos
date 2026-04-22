@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +65,37 @@ class AnalysisResult:
     metadata: dict[str, Any]
 
 
+@dataclass(slots=True)
+class VideoFrameSample:
+    sample_number: int
+    frame_index: int
+    timestamp_seconds: float
+    image: Image.Image
+
+
+@dataclass(slots=True)
+class PreparedAssetInput:
+    spec: MediaAssetSpec
+    still_image: Image.Image | None = None
+    video_frames: list[VideoFrameSample] = field(default_factory=list)
+    video_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class PetFaceCandidate:
+    label: str
+    confidence: float
+    bbox: list[int]
+
+
+@dataclass(slots=True)
+class _AnalysisUnit:
+    asset_index: int
+    image: Image.Image
+    unit_kind: str
+    video_prefix: str = ""
+
+
 class PetEmbeddingModel:
     def __init__(self, model_dir: Path) -> None:
         if torch is None or AutoModel is None or AutoImageProcessor is None:
@@ -74,7 +105,14 @@ class PetEmbeddingModel:
         self.model = AutoModel.from_pretrained(str(model_dir)).to(self.device).eval()
 
     def embed(self, image: Image.Image) -> list[float]:
-        inputs = self.processor(images=[image], return_tensors="pt")
+        embeddings = self.embed_batch([image])
+        return embeddings[0] if embeddings else []
+
+    def embed_batch(self, images: list[Image.Image]) -> list[list[float]]:
+        if not images:
+            return []
+
+        inputs = self.processor(images=images, return_tensors="pt")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -87,8 +125,11 @@ class PetEmbeddingModel:
             raise RuntimeError("Pet embedding model returned an unsupported output structure.")
 
         tensor = torch.nn.functional.normalize(tensor, dim=1)
-        vector = tensor.detach().cpu().numpy()[0]
-        return [round(float(value), 6) for value in vector.tolist()]
+        vectors = tensor.detach().cpu().numpy()
+        return [
+            [round(float(value), 6) for value in vector.tolist()]
+            for vector in vectors
+        ]
 
 
 class VisionAnalyzer:
@@ -183,27 +224,124 @@ class VisionAnalyzer:
             "cat_face_fallback": bool(self.cat_face_detector),
         }
 
-    def _analyze_video(self, spec: MediaAssetSpec) -> AnalysisResult:
+    def analyze_batch(self, assets: list[PreparedAssetInput]) -> list[AnalysisResult]:
+        if not assets:
+            return []
+
+        units: list[_AnalysisUnit] = []
+        for asset_index, asset in enumerate(assets):
+            if asset.spec.media_kind == "video":
+                for frame in asset.video_frames:
+                    units.append(
+                        _AnalysisUnit(
+                            asset_index=asset_index,
+                            image=frame.image,
+                            unit_kind="video",
+                            video_prefix=f"video-{frame.sample_number:02d}-{frame.timestamp_seconds:07.2f}",
+                        )
+                    )
+                continue
+
+            if asset.still_image is not None:
+                units.append(
+                    _AnalysisUnit(
+                        asset_index=asset_index,
+                        image=asset.still_image,
+                        unit_kind="still",
+                    )
+                )
+
+            if asset.spec.media_kind == "live_photo":
+                for frame in asset.video_frames:
+                    units.append(
+                        _AnalysisUnit(
+                            asset_index=asset_index,
+                            image=frame.image,
+                            unit_kind="video",
+                            video_prefix=f"video-{frame.sample_number:02d}-{frame.timestamp_seconds:07.2f}",
+                        )
+                    )
+
+        unit_results = self._analyze_units_batch(units)
+        grouped_units: list[list[tuple[_AnalysisUnit, AnalysisResult]]] = [[] for _ in assets]
+        for unit, unit_result in zip(units, unit_results, strict=False):
+            grouped_units[unit.asset_index].append((unit, unit_result))
+
+        aggregated: list[AnalysisResult] = []
+        for asset_index, asset in enumerate(assets):
+            still_result = self._empty_analysis()
+            video_tags: set[str] = set()
+            video_detections: list[DetectionRegion] = []
+            analyzed_video_image: Image.Image | None = None
+
+            for unit, unit_result in grouped_units[asset_index]:
+                if unit.unit_kind == "still":
+                    still_result = unit_result
+                    continue
+
+                frame_detections = [
+                    detection
+                    for detection in unit_result.detections
+                    if detection.kind == "face" or self._is_pet_detection(detection)
+                ]
+                video_tags.update(unit_result.tags)
+                self._merge_unique_detections(
+                    video_detections,
+                    self._prefix_detections(frame_detections, prefix=unit.video_prefix),
+                )
+                if analyzed_video_image is None:
+                    analyzed_video_image = unit.image
+
+            if asset.spec.media_kind == "video":
+                aggregated.append(
+                    self._build_video_analysis_result(
+                        analyzed_video_image=analyzed_video_image,
+                        tags=video_tags,
+                        detections=video_detections,
+                        video_metadata=asset.video_metadata,
+                    )
+                )
+                continue
+
+            if asset.spec.media_kind == "live_photo":
+                video_result = self._build_video_analysis_result(
+                    analyzed_video_image=analyzed_video_image,
+                    tags=video_tags,
+                    detections=video_detections,
+                    video_metadata=asset.video_metadata,
+                )
+                if video_result.tags or video_result.detections or video_result.metadata.get("video_ai_frames_analyzed"):
+                    aggregated.append(self._merge_analysis_results(still_result, video_result))
+                else:
+                    aggregated.append(still_result)
+                continue
+
+            aggregated.append(still_result)
+
+        return aggregated
+
+    def load_video_analysis_frames(
+        self,
+        spec: MediaAssetSpec,
+    ) -> tuple[list[VideoFrameSample], dict[str, Any]]:
         if cv2 is None or not self.config.video_ai_enabled:
-            return self._empty_analysis()
+            return [], {}
 
         video_path = self.primary_video_path(spec)
         if not video_path:
-            return self._empty_analysis()
+            return [], {}
 
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
             capture.release()
-            return self._empty_analysis()
+            return [], {}
 
         try:
             fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
             frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
             sample_indices = self._build_video_sample_indices(frame_count, fps)
-            tags: set[str] = set()
-            detections: list[DetectionRegion] = []
+            samples: list[VideoFrameSample] = []
             sampled_timestamps: list[float] = []
-            analyzed_image: Image.Image | None = None
 
             for sample_number, frame_index in enumerate(sample_indices):
                 capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
@@ -212,42 +350,39 @@ class VisionAnalyzer:
                     continue
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image = Image.fromarray(rgb_frame)
-                frame_result = self._analyze_still_image(image)
-                frame_detections = [
-                    detection
-                    for detection in frame_result.detections
-                    if detection.kind == "face" or self._is_pet_detection(detection)
-                ]
                 timestamp_seconds = frame_index / fps if fps > 0 else float(sample_number)
-                tags.update(frame_result.tags)
-                self._merge_unique_detections(
-                    detections,
-                    self._prefix_detections(
-                        frame_detections,
-                        prefix=f"video-{sample_number:02d}-{timestamp_seconds:07.2f}",
-                    ),
+                samples.append(
+                    VideoFrameSample(
+                        sample_number=sample_number,
+                        frame_index=frame_index,
+                        timestamp_seconds=round(timestamp_seconds, 2),
+                        image=Image.fromarray(rgb_frame),
+                    )
                 )
                 sampled_timestamps.append(round(timestamp_seconds, 2))
-                if analyzed_image is None:
-                    analyzed_image = image
 
-            if analyzed_image is None:
-                return self._empty_analysis()
-
-            metadata = self._analysis_metadata(analyzed_image)
-            metadata.update(
-                {
-                    "video_ai_frames_analyzed": len(sampled_timestamps),
-                    "video_ai_sample_timestamps": sampled_timestamps,
-                    "video_ai_mode": "interval_sampling",
-                    "video_ai_frame_count": frame_count,
-                    "video_ai_fps": round(fps, 3) if fps > 0 else 0.0,
-                }
-            )
-            return AnalysisResult(tags=sorted(tags), detections=detections, metadata=metadata)
+            metadata = {
+                "video_ai_frames_analyzed": len(sampled_timestamps),
+                "video_ai_sample_timestamps": sampled_timestamps,
+                "video_ai_mode": "interval_sampling",
+                "video_ai_frame_count": frame_count,
+                "video_ai_fps": round(fps, 3) if fps > 0 else 0.0,
+            }
+            return samples, metadata
         finally:
             capture.release()
+
+    def _analyze_video(self, spec: MediaAssetSpec) -> AnalysisResult:
+        video_frames, video_metadata = self.load_video_analysis_frames(spec)
+        return self.analyze_batch(
+            [
+                PreparedAssetInput(
+                    spec=spec,
+                    video_frames=video_frames,
+                    video_metadata=video_metadata,
+                )
+            ]
+        )[0]
 
     def _build_video_sample_indices(self, frame_count: int, fps: float) -> list[int]:
         max_frames = max(1, int(self.config.video_max_analysis_frames))
@@ -272,6 +407,77 @@ class VisionAnalyzer:
 
         unique_indices = sorted({max(0, min(frame_count - 1, index)) for index in indices})
         return unique_indices[:max_frames]
+
+    def _analyze_units_batch(self, units: list[_AnalysisUnit]) -> list[AnalysisResult]:
+        if not units:
+            return []
+
+        images = [unit.image for unit in units]
+        object_batches = self._detect_objects_batch(images)
+        pet_face_batches = self._detect_pet_face_candidates_batch(images)
+        results: list[AnalysisResult] = []
+        pet_embedding_requests: list[tuple[DetectionRegion, Image.Image]] = []
+
+        for index, unit in enumerate(units):
+            image = unit.image
+            tags: set[str] = set()
+            detections: list[DetectionRegion] = []
+
+            human_face_detections = self._detect_human_faces(image)
+            if human_face_detections:
+                tags.update({"face", "person"})
+                detections.extend(human_face_detections)
+
+            object_detections, object_tags = object_batches[index]
+            pet_detections, pet_tags = self._build_pet_detections_from_candidates(
+                image,
+                object_detections,
+                pet_face_batches[index],
+                embed=False,
+            )
+            for detection in pet_detections:
+                crop = self.crop_region(image, detection.bbox)
+                if crop is not None:
+                    pet_embedding_requests.append((detection, crop))
+            non_pet_object_detections = [
+                detection
+                for detection in object_detections
+                if detection.label.lower() not in PET_LABELS
+            ]
+            detections.extend(pet_detections)
+            detections.extend(non_pet_object_detections)
+            tags.update(object_tags - PET_LABELS)
+            tags.update(pet_tags)
+            results.append(
+                AnalysisResult(
+                    tags=sorted(tags),
+                    detections=detections,
+                    metadata=self._analysis_metadata(image),
+                )
+            )
+
+        embeddings = self._embed_pet_crops_batch([crop for _, crop in pet_embedding_requests])
+        for (detection, _), embedding in zip(pet_embedding_requests, embeddings, strict=False):
+            detection.encoding = embedding
+        return results
+
+    def _build_video_analysis_result(
+        self,
+        analyzed_video_image: Image.Image | None,
+        tags: set[str],
+        detections: list[DetectionRegion],
+        video_metadata: dict[str, Any],
+    ) -> AnalysisResult:
+        if analyzed_video_image is None and not video_metadata.get("video_ai_frames_analyzed"):
+            return self._empty_analysis()
+
+        metadata = self._analysis_metadata(analyzed_video_image) if analyzed_video_image is not None else {}
+        metadata.update(video_metadata)
+        return AnalysisResult(
+            tags=sorted(tags),
+            detections=detections,
+            metadata=metadata,
+        )
 
     def _prefix_detections(
         self,
@@ -500,6 +706,16 @@ class VisionAnalyzer:
     def _yolo_device_label(self) -> str:
         return f"cuda:{self.yolo_device}" if isinstance(self.yolo_device, int) else str(self.yolo_device)
 
+    def _analysis_batch_size(self) -> int:
+        return max(1, int(self.config.analysis_batch_size))
+
+    def _pet_embedding_batch_size(self) -> int:
+        return max(1, int(self.config.pet_embedding_batch_size))
+
+    def _iter_batches(self, values: list[Any], batch_size: int):
+        for start in range(0, len(values), batch_size):
+            yield values[start : start + batch_size]
+
     def _load_human_face_backend(self):
         if FaceAnalysis is None or not self.config.face_recognition_enabled:
             return None
@@ -629,22 +845,45 @@ class VisionAnalyzer:
         return detections
 
     def _detect_objects(self, image: Image.Image) -> tuple[list[DetectionRegion], set[str]]:
+        return self._detect_objects_batch([image])[0]
+
+    def _detect_objects_batch(
+        self,
+        images: list[Image.Image],
+    ) -> list[tuple[list[DetectionRegion], set[str]]]:
+        if not images:
+            return []
         if self.object_model is None:
-            return [], set()
+            return [([], set()) for _ in images]
 
-        rgb = np.asarray(image)
-        try:
-            results = self.object_model.predict(
-                rgb,
-                device=self.yolo_device,
-                verbose=False,
-            )
-        except Exception:
-            return [], set()
+        outputs: list[tuple[list[DetectionRegion], set[str]]] = []
+        for image_batch in self._iter_batches(images, self._analysis_batch_size()):
+            rgb_batch = [np.asarray(image) for image in image_batch]
+            try:
+                results = self.object_model.predict(
+                    rgb_batch,
+                    device=self.yolo_device,
+                    verbose=False,
+                )
+            except Exception:
+                outputs.extend([([], set()) for _ in image_batch])
+                continue
 
+            for image, result in zip(image_batch, results, strict=False):
+                outputs.append(self._parse_object_result(image, result))
+
+            missing_results = len(image_batch) - len(results)
+            if missing_results > 0:
+                outputs.extend([([], set()) for _ in range(missing_results)])
+        return outputs
+
+    def _parse_object_result(
+        self,
+        image: Image.Image,
+        result: Any,
+    ) -> tuple[list[DetectionRegion], set[str]]:
         detections: list[DetectionRegion] = []
         tags: set[str] = set()
-        result = results[0]
         names = getattr(result, "names", getattr(self.object_model, "names", {}))
         boxes = getattr(result, "boxes", None)
         if boxes is None:
@@ -687,9 +926,29 @@ class VisionAnalyzer:
         image: Image.Image,
         object_detections: list[DetectionRegion],
     ) -> tuple[list[DetectionRegion], set[str]]:
+        pet_face_candidates = self._detect_pet_face_candidates_batch([image])[0]
+        return self._build_pet_detections_from_candidates(
+            image,
+            object_detections,
+            pet_face_candidates,
+            embed=True,
+        )
+
+    def _build_pet_detections_from_candidates(
+        self,
+        image: Image.Image,
+        object_detections: list[DetectionRegion],
+        pet_face_candidates: list[PetFaceCandidate],
+        embed: bool,
+    ) -> tuple[list[DetectionRegion], set[str]]:
         pet_detections: list[DetectionRegion] = []
         pet_tags: set[str] = set()
-        pet_face_detections = self._detect_pet_faces(image, object_detections)
+        pet_face_detections = self._build_pet_face_detections_from_candidates(
+            image,
+            object_detections,
+            pet_face_candidates,
+            embed=embed,
+        )
         pet_detections.extend(pet_face_detections)
         for detection in pet_face_detections:
             pet_tags.update(self._pet_tags_for_label(detection.label, face_detection=True))
@@ -722,6 +981,7 @@ class VisionAnalyzer:
                                 bbox=bbox,
                                 confidence=max(detection.confidence, 0.55),
                                 kind="pet_face",
+                                embed=embed,
                             )
                         )
                     pet_tags.update({"animal", "pet", "cat", "cat face"})
@@ -735,6 +995,7 @@ class VisionAnalyzer:
                         bbox=detection.bbox,
                         confidence=detection.confidence,
                         kind="pet",
+                        embed=embed,
                     )
                 )
                 continue
@@ -751,6 +1012,7 @@ class VisionAnalyzer:
                     bbox=detection.bbox,
                     confidence=detection.confidence,
                     kind="pet",
+                    embed=embed,
                 )
             )
             pet_tags.update({"animal", "pet", label})
@@ -767,6 +1029,7 @@ class VisionAnalyzer:
                         bbox=bbox,
                         confidence=0.52,
                         kind="pet_face",
+                        embed=embed,
                     )
                 )
                 pet_tags.update({"animal", "pet", "cat", "cat face"})
@@ -778,46 +1041,89 @@ class VisionAnalyzer:
         image: Image.Image,
         object_detections: list[DetectionRegion],
     ) -> list[DetectionRegion]:
+        pet_face_candidates = self._detect_pet_face_candidates_batch([image])[0]
+        return self._build_pet_face_detections_from_candidates(
+            image,
+            object_detections,
+            pet_face_candidates,
+            embed=True,
+        )
+
+    def _detect_pet_face_candidates_batch(
+        self,
+        images: list[Image.Image],
+    ) -> list[list[PetFaceCandidate]]:
+        if not images:
+            return []
         if self.pet_face_model is None:
-            return []
+            return [[] for _ in images]
 
-        rgb = np.asarray(image)
-        try:
-            results = self.pet_face_model.predict(
-                rgb,
-                device=self.yolo_device,
-                verbose=False,
-            )
-        except Exception:
-            return []
+        outputs: list[list[PetFaceCandidate]] = []
+        for image_batch in self._iter_batches(images, self._analysis_batch_size()):
+            rgb_batch = [np.asarray(image) for image in image_batch]
+            try:
+                results = self.pet_face_model.predict(
+                    rgb_batch,
+                    device=self.yolo_device,
+                    verbose=False,
+                )
+            except Exception:
+                outputs.extend([[] for _ in image_batch])
+                continue
 
-        detections: list[DetectionRegion] = []
-        result = results[0]
+            for result in results:
+                outputs.append(self._parse_pet_face_candidates(result))
+
+            missing_results = len(image_batch) - len(results)
+            if missing_results > 0:
+                outputs.extend([[] for _ in range(missing_results)])
+        return outputs
+
+    def _parse_pet_face_candidates(self, result: Any) -> list[PetFaceCandidate]:
         names = getattr(result, "names", getattr(self.pet_face_model, "names", {}))
         boxes = getattr(result, "boxes", None)
         if boxes is None:
             return []
 
-        for index, box in enumerate(boxes):
+        candidates: list[PetFaceCandidate] = []
+        for box in boxes:
             confidence = float(box.conf[0])
             label_index = int(box.cls[0])
             raw_label = str(names.get(label_index, label_index)).replace("_", " ").lower()
             x1, y1, x2, y2 = [int(value) for value in box.xyxy[0].tolist()]
             bbox = [x1, y1, max(0, x2 - x1), max(0, y2 - y1)]
-            label = self._normalize_pet_face_label(raw_label, image, bbox, object_detections)
-            if confidence < self._pet_face_threshold(label or raw_label):
+            candidates.append(
+                PetFaceCandidate(
+                    label=raw_label,
+                    confidence=confidence,
+                    bbox=bbox,
+                )
+            )
+        return candidates
+
+    def _build_pet_face_detections_from_candidates(
+        self,
+        image: Image.Image,
+        object_detections: list[DetectionRegion],
+        pet_face_candidates: list[PetFaceCandidate],
+        embed: bool,
+    ) -> list[DetectionRegion]:
+        detections: list[DetectionRegion] = []
+        for index, candidate in enumerate(pet_face_candidates):
+            label = self._normalize_pet_face_label(candidate.label, image, candidate.bbox, object_detections)
+            if candidate.confidence < self._pet_face_threshold(label or candidate.label):
                 continue
             detections.append(
                 self._build_pet_region(
                     image=image,
                     detection_id=f"pet-face-{index}",
                     label=label or "pet",
-                    bbox=bbox,
-                    confidence=confidence,
+                    bbox=candidate.bbox,
+                    confidence=candidate.confidence,
                     kind="pet_face",
+                    embed=embed,
                 )
             )
-
         return detections
 
     def _build_pet_region(
@@ -828,9 +1134,10 @@ class VisionAnalyzer:
         bbox: list[int],
         confidence: float,
         kind: str,
+        embed: bool = True,
     ) -> DetectionRegion:
         crop = self.crop_region(image, bbox)
-        embedding = self._embed_pet_crop(crop) if crop is not None else []
+        embedding = self._embed_pet_crop(crop) if crop is not None and embed else []
         return DetectionRegion(
             id=detection_id,
             kind=kind,
@@ -842,12 +1149,22 @@ class VisionAnalyzer:
         )
 
     def _embed_pet_crop(self, crop: Image.Image | None) -> list[float]:
-        if crop is None or self.pet_embedding_model is None:
+        if crop is None:
             return []
-        try:
-            return self.pet_embedding_model.embed(crop)
-        except Exception:
-            return []
+        embeddings = self._embed_pet_crops_batch([crop])
+        return embeddings[0] if embeddings else []
+
+    def _embed_pet_crops_batch(self, crops: list[Image.Image]) -> list[list[float]]:
+        if not crops or self.pet_embedding_model is None:
+            return [[] for _ in crops]
+
+        outputs: list[list[float]] = []
+        for crop_batch in self._iter_batches(crops, self._pet_embedding_batch_size()):
+            try:
+                outputs.extend(self.pet_embedding_model.embed_batch(crop_batch))
+            except Exception:
+                outputs.extend([[] for _ in crop_batch])
+        return outputs
 
     def _normalize_pet_face_label(
         self,

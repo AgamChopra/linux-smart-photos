@@ -23,6 +23,10 @@ class AppConfig:
     video_ai_enabled: bool = True
     video_frame_sample_seconds: float = 2.0
     video_max_analysis_frames: int = 12
+    scan_batch_size: int = 8
+    analysis_batch_size: int = 24
+    pet_embedding_batch_size: int = 64
+    prefetch_workers: int = 4
     face_match_threshold: float = 0.42
     face_embedding_similarity_threshold: float = 0.57
     pet_embedding_similarity_threshold: float = 0.70

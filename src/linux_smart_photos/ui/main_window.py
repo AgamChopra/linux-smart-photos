@@ -651,11 +651,11 @@ class MainWindow(QMainWindow):
         if not isinstance(update, ProgressUpdate):
             return
 
-        if update.total > 0:
+        if update.indeterminate or update.total <= 0:
+            self.progress_bar.setRange(0, 0)
+        else:
             self.progress_bar.setRange(0, update.total)
             self.progress_bar.setValue(min(update.current, update.total))
-        else:
-            self.progress_bar.setRange(0, 0)
 
         detail = f": {update.detail}" if update.detail else ""
         self.progress_label.setText(f"{update.message}{detail}")
