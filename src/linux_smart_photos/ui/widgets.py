@@ -19,17 +19,34 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-try:
-    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-    from PySide6.QtMultimediaWidgets import QVideoWidget
-except Exception:
-    QAudioOutput = None
-    QMediaPlayer = None
-    QVideoWidget = None
-
 from ..media import VIDEO_EXTENSIONS
 from ..models import MediaItem
 from ..services.library import LibraryService
+
+
+QAudioOutput = None
+QMediaPlayer = None
+QVideoWidget = None
+_MULTIMEDIA_IMPORT_ATTEMPTED = False
+
+
+def _load_multimedia_backend():
+    global QAudioOutput, QMediaPlayer, QVideoWidget, _MULTIMEDIA_IMPORT_ATTEMPTED
+
+    if _MULTIMEDIA_IMPORT_ATTEMPTED:
+        return QAudioOutput, QMediaPlayer, QVideoWidget
+
+    _MULTIMEDIA_IMPORT_ATTEMPTED = True
+    try:
+        from PySide6.QtMultimedia import QAudioOutput as _QAudioOutput, QMediaPlayer as _QMediaPlayer
+        from PySide6.QtMultimediaWidgets import QVideoWidget as _QVideoWidget
+    except Exception:
+        return None, None, None
+
+    QAudioOutput = _QAudioOutput
+    QMediaPlayer = _QMediaPlayer
+    QVideoWidget = _QVideoWidget
+    return QAudioOutput, QMediaPlayer, QVideoWidget
 
 
 class MediaGridWidget(QWidget):
@@ -40,6 +57,7 @@ class MediaGridWidget(QWidget):
         self.service = service
         self._items: dict[str, MediaItem] = {}
         self._movie: QMovie | None = None
+        self._preview_video_path = ""
 
         self.list_widget = QListWidget()
         self.list_widget.setViewMode(QListWidget.IconMode)
@@ -73,18 +91,9 @@ class MediaGridWidget(QWidget):
         self.video_widget = None
         self.media_player = None
         self.audio_output = None
-        if QMediaPlayer is not None and QVideoWidget is not None and QAudioOutput is not None:
-            self.video_widget = QVideoWidget()
-            self.media_player = QMediaPlayer(self)
-            self.audio_output = QAudioOutput(self)
-            self.audio_output.setVolume(0.0)
-            self.media_player.setAudioOutput(self.audio_output)
-            self.media_player.setVideoOutput(self.video_widget)
-            self.preview_stack.addWidget(self.video_widget)
-        else:
-            self.preview_stack.addWidget(self.video_status_label)
+        self.preview_stack.addWidget(self.video_status_label)
 
-        self.video_toggle_button = QPushButton("Pause Preview")
+        self.video_toggle_button = QPushButton("Play Preview")
         self.video_toggle_button.clicked.connect(self._toggle_video)
         self.video_toggle_button.setVisible(False)
 
@@ -112,6 +121,7 @@ class MediaGridWidget(QWidget):
         layout.addWidget(splitter)
 
     def set_items(self, items: list[MediaItem]) -> None:
+        previous_item_id = self.current_item_id()
         self._items = {item.id: item for item in items}
         self._clear_preview_media()
         self.list_widget.clear()
@@ -127,11 +137,18 @@ class MediaGridWidget(QWidget):
             list_item.setToolTip(item.path)
             self.list_widget.addItem(list_item)
 
-        if items:
-            self.list_widget.setCurrentRow(0)
-        else:
+        if previous_item_id:
+            for index in range(self.list_widget.count()):
+                list_item = self.list_widget.item(index)
+                if str(list_item.data(Qt.UserRole)) == previous_item_id:
+                    self.list_widget.setCurrentItem(list_item)
+                    break
+
+        if not self.list_widget.currentItem():
             self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("No media items match the current view")
+            self.preview_label.setText(
+                "No media items match the current view" if not items else "Select a media item"
+            )
             self.preview_stack.setCurrentWidget(self.preview_label)
             self.video_toggle_button.setVisible(False)
             self.details.setText("")
@@ -209,21 +226,13 @@ class MediaGridWidget(QWidget):
             self._show_image_preview(item)
             return
 
-        if self.media_player is None or self.video_widget is None:
-            self.video_status_label.setText(
-                f"Video preview needs Qt multimedia support.\n\n{video_path}"
-            )
-            self.preview_stack.setCurrentWidget(self.video_status_label)
-            self.video_toggle_button.setVisible(False)
-            return
-
-        self.preview_stack.setCurrentWidget(self.video_widget)
-        self.media_player.setSource(QUrl.fromLocalFile(video_path))
-        self.media_player.play()
-        self.video_toggle_button.setText("Pause Preview")
+        self._preview_video_path = video_path
+        self._show_image_preview(item)
+        self.video_toggle_button.setText("Play Preview")
         self.video_toggle_button.setVisible(True)
 
     def _clear_preview_media(self) -> None:
+        self._preview_video_path = ""
         if self._movie is not None:
             self._movie.stop()
             self._movie = None
@@ -233,8 +242,25 @@ class MediaGridWidget(QWidget):
             self.media_player.setSource(QUrl())
 
     def _toggle_video(self) -> None:
-        if self.media_player is None:
+        if not self._preview_video_path:
             return
+
+        if not self._ensure_video_backend():
+            self.video_status_label.setText(
+                f"Video preview needs Qt multimedia support.\n\n{self._preview_video_path}"
+            )
+            self.preview_stack.setCurrentWidget(self.video_status_label)
+            self.video_toggle_button.setText("Play Preview")
+            return
+
+        target_url = QUrl.fromLocalFile(self._preview_video_path)
+        if self.preview_stack.currentWidget() is not self.video_widget or self.media_player.source() != target_url:
+            self.preview_stack.setCurrentWidget(self.video_widget)
+            self.media_player.setSource(target_url)
+            self.media_player.play()
+            self.video_toggle_button.setText("Pause Preview")
+            return
+
         if self.media_player.playbackState() == QMediaPlayer.PlayingState:
             self.media_player.pause()
             self.video_toggle_button.setText("Play Preview")
@@ -249,3 +275,26 @@ class MediaGridWidget(QWidget):
         if Path(item.path).suffix.lower() in VIDEO_EXTENSIONS and Path(item.path).exists():
             return item.path
         return ""
+
+    def _ensure_video_backend(self) -> bool:
+        if self.media_player is not None and self.video_widget is not None:
+            return True
+
+        audio_output_cls, media_player_cls, video_widget_cls = _load_multimedia_backend()
+        if audio_output_cls is None or media_player_cls is None or video_widget_cls is None:
+            return False
+
+        try:
+            self.video_widget = video_widget_cls()
+            self.media_player = media_player_cls(self)
+            self.audio_output = audio_output_cls(self)
+            self.audio_output.setVolume(0.0)
+            self.media_player.setAudioOutput(self.audio_output)
+            self.media_player.setVideoOutput(self.video_widget)
+            self.preview_stack.addWidget(self.video_widget)
+            return True
+        except Exception:
+            self.video_widget = None
+            self.media_player = None
+            self.audio_output = None
+            return False

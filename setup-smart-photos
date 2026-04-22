@@ -104,8 +104,8 @@ echo "Installing Python dependencies"
   "$VENV_DIR/bin/pip" install -e ".[ai]"
 )
 
-echo "Installing recommended AI models"
-"$VENV_DIR/bin/python" -m linux_smart_photos.bootstrap
+echo "Initializing local configuration"
+"$VENV_DIR/bin/python" -m linux_smart_photos.bootstrap --skip-models
 
 echo "Installing desktop integration"
 mkdir -p "$ICON_DEST_DIR" "$DESKTOP_DIR" "$BIN_DIR"

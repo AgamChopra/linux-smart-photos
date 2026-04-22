@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
+from typing import Any
+
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -13,6 +15,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTabWidget,
     QTextEdit,
@@ -20,9 +23,73 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..services.library import LibraryService
+from ..config import AppConfig
+from ..services.library import LibraryService, ProgressUpdate
 from .dialogs import AlbumDialog, CorrectionsDialog
 from .widgets import MediaGridWidget
+
+
+class BackgroundTaskWorker(QObject):
+    progress = Signal(object)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: AppConfig, task_name: str, model_id: str = "") -> None:
+        super().__init__()
+        self.config = config
+        self.task_name = task_name
+        self.model_id = model_id
+
+    def run(self) -> None:
+        service = LibraryService(self.config)
+        try:
+            if self.task_name == "startup":
+                missing_model_ids = service.missing_recommended_model_ids()
+                download_error = ""
+                if missing_model_ids:
+                    try:
+                        service.download_recommended_models(progress_callback=self._emit_progress)
+                    except Exception as exc:
+                        download_error = str(exc)
+                summary = service.sync(progress_callback=self._emit_progress)
+                self.completed.emit(
+                    {
+                        "task": self.task_name,
+                        "summary": summary,
+                        "missing_model_ids": missing_model_ids,
+                        "download_error": download_error,
+                    }
+                )
+                return
+
+            if self.task_name == "sync":
+                summary = service.sync(progress_callback=self._emit_progress)
+                self.completed.emit({"task": self.task_name, "summary": summary})
+                return
+
+            if self.task_name == "download_recommended_models":
+                missing_model_ids = service.missing_recommended_model_ids()
+                paths = service.download_recommended_models(progress_callback=self._emit_progress)
+                self.completed.emit(
+                    {
+                        "task": self.task_name,
+                        "paths": paths,
+                        "missing_model_ids": missing_model_ids,
+                    }
+                )
+                return
+
+            if self.task_name == "download_model":
+                path = service.download_model(self.model_id, progress_callback=self._emit_progress)
+                self.completed.emit({"task": self.task_name, "path": path, "model_id": self.model_id})
+                return
+
+            raise ValueError(f"Unsupported background task: {self.task_name}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _emit_progress(self, update: ProgressUpdate) -> None:
+        self.progress.emit(update)
 
 
 class LibraryPage(QWidget):
@@ -58,14 +125,14 @@ class LibraryPage(QWidget):
         self.favorites_only = QCheckBox("Favorites")
         self.favorites_only.stateChanged.connect(self.refresh)
 
-        refresh_button = QPushButton("Refresh Library")
-        refresh_button.clicked.connect(self.owner.sync_library)
-        correct_button = QPushButton("Assign / Correct")
-        correct_button.clicked.connect(self.open_corrections)
-        album_button = QPushButton("Add To Album")
-        album_button.clicked.connect(self.add_to_album)
-        favorite_button = QPushButton("Toggle Favorite")
-        favorite_button.clicked.connect(self.toggle_favorite)
+        self.refresh_button = QPushButton("Refresh Library")
+        self.refresh_button.clicked.connect(self.owner.sync_library)
+        self.correct_button = QPushButton("Assign / Correct")
+        self.correct_button.clicked.connect(self.open_corrections)
+        self.album_button = QPushButton("Add To Album")
+        self.album_button.clicked.connect(self.add_to_album)
+        self.favorite_button = QPushButton("Toggle Favorite")
+        self.favorite_button.clicked.connect(self.toggle_favorite)
 
         controls.addWidget(self.search_box)
         controls.addWidget(self.type_filter)
@@ -73,10 +140,10 @@ class LibraryPage(QWidget):
         controls.addWidget(self.persona_filter)
         controls.addWidget(self.favorites_only)
         controls.addStretch(1)
-        controls.addWidget(correct_button)
-        controls.addWidget(album_button)
-        controls.addWidget(favorite_button)
-        controls.addWidget(refresh_button)
+        controls.addWidget(self.correct_button)
+        controls.addWidget(self.album_button)
+        controls.addWidget(self.favorite_button)
+        controls.addWidget(self.refresh_button)
 
         self.grid = MediaGridWidget(service)
 
@@ -148,6 +215,15 @@ class LibraryPage(QWidget):
         self.service.toggle_favorite(item_ids)
         self.owner.refresh_views()
 
+    def set_busy(self, busy: bool) -> None:
+        for button in (
+            self.refresh_button,
+            self.correct_button,
+            self.album_button,
+            self.favorite_button,
+        ):
+            button.setEnabled(not busy)
+
 
 class PeoplePage(QWidget):
     def __init__(self, service: LibraryService, owner: "MainWindow") -> None:
@@ -164,24 +240,24 @@ class PeoplePage(QWidget):
         self.persona_list = QListWidget()
         self.persona_list.currentItemChanged.connect(self._show_persona_items)
 
-        new_persona_button = QPushButton("New Persona")
-        new_persona_button.clicked.connect(self._create_persona)
+        self.new_persona_button = QPushButton("New Persona")
+        self.new_persona_button.clicked.connect(self._create_persona)
 
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.kind_filter)
         left_layout.addWidget(self.persona_list)
-        left_layout.addWidget(new_persona_button)
+        left_layout.addWidget(self.new_persona_button)
 
         left_panel = QWidget()
         left_panel.setLayout(left_layout)
         left_panel.setMaximumWidth(320)
 
         self.grid = MediaGridWidget(service)
-        correct_button = QPushButton("Correct Current Selection")
-        correct_button.clicked.connect(self._open_corrections)
+        self.correct_button = QPushButton("Correct Current Selection")
+        self.correct_button.clicked.connect(self._open_corrections)
 
         right_layout = QVBoxLayout()
-        right_layout.addWidget(correct_button)
+        right_layout.addWidget(self.correct_button)
         right_layout.addWidget(self.grid)
 
         right_panel = QWidget()
@@ -234,6 +310,10 @@ class PeoplePage(QWidget):
             return ""
         return str(current.data(Qt.UserRole))
 
+    def set_busy(self, busy: bool) -> None:
+        self.new_persona_button.setEnabled(not busy)
+        self.correct_button.setEnabled(not busy)
+
 
 class AlbumsPage(QWidget):
     def __init__(self, service: LibraryService, owner: "MainWindow") -> None:
@@ -244,15 +324,15 @@ class AlbumsPage(QWidget):
         self.album_list = QListWidget()
         self.album_list.currentItemChanged.connect(self._show_album_items)
 
-        new_album_button = QPushButton("New Empty Album")
-        new_album_button.clicked.connect(self._new_album)
-        delete_album_button = QPushButton("Delete Album")
-        delete_album_button.clicked.connect(self._delete_album)
+        self.new_album_button = QPushButton("New Empty Album")
+        self.new_album_button.clicked.connect(self._new_album)
+        self.delete_album_button = QPushButton("Delete Album")
+        self.delete_album_button.clicked.connect(self._delete_album)
 
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.album_list)
-        left_layout.addWidget(new_album_button)
-        left_layout.addWidget(delete_album_button)
+        left_layout.addWidget(self.new_album_button)
+        left_layout.addWidget(self.delete_album_button)
 
         left_panel = QWidget()
         left_panel.setLayout(left_layout)
@@ -303,6 +383,10 @@ class AlbumsPage(QWidget):
             return ""
         return str(current.data(Qt.UserRole))
 
+    def set_busy(self, busy: bool) -> None:
+        self.new_album_button.setEnabled(not busy)
+        self.delete_album_button.setEnabled(not busy)
+
 
 class MemoriesPage(QWidget):
     def __init__(self, service: LibraryService, owner: "MainWindow") -> None:
@@ -313,12 +397,12 @@ class MemoriesPage(QWidget):
         self.memory_list = QListWidget()
         self.memory_list.currentItemChanged.connect(self._show_memory_items)
 
-        regenerate_button = QPushButton("Rebuild Memories")
-        regenerate_button.clicked.connect(self._rebuild_memories)
+        self.regenerate_button = QPushButton("Rebuild Memories")
+        self.regenerate_button.clicked.connect(self._rebuild_memories)
 
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.memory_list)
-        left_layout.addWidget(regenerate_button)
+        left_layout.addWidget(self.regenerate_button)
 
         left_panel = QWidget()
         left_panel.setLayout(left_layout)
@@ -375,6 +459,9 @@ class MemoriesPage(QWidget):
             return ""
         return str(current.data(Qt.UserRole))
 
+    def set_busy(self, busy: bool) -> None:
+        self.regenerate_button.setEnabled(not busy)
+
 
 class ModelsPage(QWidget):
     def __init__(self, service: LibraryService, owner: "MainWindow") -> None:
@@ -388,18 +475,18 @@ class ModelsPage(QWidget):
         self.details = QTextEdit()
         self.details.setReadOnly(True)
 
-        refresh_button = QPushButton("Refresh Model Status")
-        refresh_button.clicked.connect(self.refresh)
-        download_selected_button = QPushButton("Download Selected Model")
-        download_selected_button.clicked.connect(self._download_selected_model)
-        download_recommended_button = QPushButton("Download Recommended Models")
-        download_recommended_button.clicked.connect(self._download_recommended_models)
+        self.refresh_button = QPushButton("Refresh Model Status")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.download_selected_button = QPushButton("Download Selected Model")
+        self.download_selected_button.clicked.connect(self._download_selected_model)
+        self.download_recommended_button = QPushButton("Download Recommended Models")
+        self.download_recommended_button.clicked.connect(self._download_recommended_models)
 
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.model_list)
-        left_layout.addWidget(refresh_button)
-        left_layout.addWidget(download_selected_button)
-        left_layout.addWidget(download_recommended_button)
+        left_layout.addWidget(self.refresh_button)
+        left_layout.addWidget(self.download_selected_button)
+        left_layout.addWidget(self.download_recommended_button)
 
         left_panel = QWidget()
         left_panel.setLayout(left_layout)
@@ -457,30 +544,14 @@ class ModelsPage(QWidget):
         )
 
     def _download_recommended_models(self, *_args) -> None:
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            paths = self.service.download_recommended_models()
-            self.owner.statusBar().showMessage(f"Downloaded {len(paths)} recommended models.")
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self, "Model Download Failed", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.owner.download_recommended_models()
 
     def _download_selected_model(self, *_args) -> None:
         model_id = self._current_model_id()
         if not model_id:
             QMessageBox.warning(self, "No Model Selected", "Choose a model first.")
             return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            path = self.service.download_model(model_id)
-            self.owner.statusBar().showMessage(f"Downloaded model to {path}")
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self, "Model Download Failed", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.owner.download_model(model_id)
 
     def _current_model_id(self) -> str:
         current = self.model_list.currentItem()
@@ -488,11 +559,19 @@ class ModelsPage(QWidget):
             return ""
         return str(current.data(Qt.UserRole))
 
+    def set_busy(self, busy: bool) -> None:
+        self.refresh_button.setEnabled(not busy)
+        self.download_selected_button.setEnabled(not busy)
+        self.download_recommended_button.setEnabled(not busy)
+
 
 class MainWindow(QMainWindow):
     def __init__(self, service: LibraryService) -> None:
         super().__init__()
         self.service = service
+        self._task_thread: QThread | None = None
+        self._task_worker: BackgroundTaskWorker | None = None
+        self._active_task = ""
         self.setWindowTitle("Linux Smart Photos")
         self.resize(1560, 980)
 
@@ -510,9 +589,16 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.models_page, "AI Models")
         self.setCentralWidget(self.tabs)
 
-        self.statusBar().showMessage("Ready")
+        self.progress_label = QLabel("Ready")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(320)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.hide()
+        self.statusBar().addWidget(self.progress_label, 1)
+        self.statusBar().addPermanentWidget(self.progress_bar)
+
         self.refresh_views()
-        QTimer.singleShot(0, self.sync_library)
+        QTimer.singleShot(0, self._start_startup_tasks)
 
     def refresh_views(self) -> None:
         self.library_page._refresh_persona_filter()
@@ -522,15 +608,150 @@ class MainWindow(QMainWindow):
         self.memories_page.refresh()
         self.models_page.refresh()
 
+    def _start_startup_tasks(self) -> None:
+        self._start_background_task("startup")
+
     def sync_library(self, *_args) -> None:
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            summary = self.service.sync()
-            self.statusBar().showMessage(
-                f"Sync complete: {summary.added} added, {summary.updated} updated, {summary.removed} removed"
+        self._start_background_task("sync")
+
+    def download_recommended_models(self) -> None:
+        self._start_background_task("download_recommended_models")
+
+    def download_model(self, model_id: str) -> None:
+        self._start_background_task("download_model", model_id=model_id)
+
+    def _start_background_task(self, task_name: str, model_id: str = "") -> bool:
+        if self._task_thread is not None:
+            self.progress_label.setText("A background task is already running.")
+            return False
+
+        self._active_task = task_name
+        self._set_busy(True, self._task_start_message(task_name, model_id))
+
+        thread = QThread(self)
+        worker = BackgroundTaskWorker(self.service.config, task_name, model_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._handle_task_progress)
+        worker.completed.connect(self._handle_task_completed)
+        worker.failed.connect(self._handle_task_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_task_handles)
+
+        self._task_thread = thread
+        self._task_worker = worker
+        thread.start()
+        return True
+
+    def _handle_task_progress(self, update: Any) -> None:
+        if not isinstance(update, ProgressUpdate):
+            return
+
+        if update.total > 0:
+            self.progress_bar.setRange(0, update.total)
+            self.progress_bar.setValue(min(update.current, update.total))
+        else:
+            self.progress_bar.setRange(0, 0)
+
+        detail = f": {update.detail}" if update.detail else ""
+        self.progress_label.setText(f"{update.message}{detail}")
+
+    def _handle_task_completed(self, payload: Any) -> None:
+        task_name = str(payload.get("task", self._active_task))
+        self.service.reload()
+        self.refresh_views()
+        self._set_busy(False, self._task_success_message(task_name, payload))
+        if task_name == "startup" and payload.get("download_error"):
+            QMessageBox.warning(
+                self,
+                "AI Model Download Incomplete",
+                f"{payload['download_error']}\n\nThe library scan still completed. "
+                "Open the AI Models tab to retry the missing downloads.",
             )
-            self.refresh_views()
-        except Exception as exc:
-            QMessageBox.critical(self, "Sync Failed", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+
+    def _handle_task_failed(self, message: str) -> None:
+        task_name = self._active_task
+        self.service.reload()
+        self.refresh_views()
+        self._set_busy(False, self._task_failure_message(task_name))
+        QMessageBox.critical(self, "Background Task Failed", message)
+
+    def _clear_task_handles(self) -> None:
+        self._task_thread = None
+        self._task_worker = None
+        self._active_task = ""
+
+    def _set_busy(self, busy: bool, message: str) -> None:
+        for page in (
+            self.library_page,
+            self.people_page,
+            self.albums_page,
+            self.memories_page,
+            self.models_page,
+        ):
+            page.set_busy(busy)
+
+        if busy:
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.show()
+        else:
+            self.progress_bar.hide()
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+
+        self.progress_label.setText(message)
+
+    def _task_start_message(self, task_name: str, model_id: str) -> str:
+        if task_name == "startup":
+            return "Preparing AI models and scanning the library."
+        if task_name == "sync":
+            return "Scanning the library in the background."
+        if task_name == "download_recommended_models":
+            return "Downloading recommended AI models."
+        if task_name == "download_model":
+            return f"Downloading AI model: {model_id}"
+        return "Running background task."
+
+    def _task_success_message(self, task_name: str, payload: dict[str, Any]) -> str:
+        if task_name in {"startup", "sync"}:
+            summary = payload.get("summary")
+            if summary is not None:
+                return (
+                    f"Sync complete: {summary.added} added, "
+                    f"{summary.updated} updated, {summary.removed} removed"
+                )
+        if task_name == "download_recommended_models":
+            missing_model_ids = payload.get("missing_model_ids", [])
+            if missing_model_ids:
+                return f"Downloaded {len(missing_model_ids)} recommended models."
+            return "Recommended AI models are already installed."
+        if task_name == "download_model":
+            path = str(payload.get("path", ""))
+            return f"Model ready: {path}" if path else "Selected model is ready."
+        return "Background task complete."
+
+    def _task_failure_message(self, task_name: str) -> str:
+        if task_name == "startup":
+            return "Startup task failed."
+        if task_name == "sync":
+            return "Sync failed."
+        if task_name == "download_recommended_models":
+            return "Recommended model download failed."
+        if task_name == "download_model":
+            return "Model download failed."
+        return "Background task failed."
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._task_thread is not None:
+            QMessageBox.information(
+                self,
+                "Background Task Running",
+                "Wait for the current background task to finish before closing Smart Photos.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)

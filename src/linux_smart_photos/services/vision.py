@@ -17,6 +17,11 @@ try:
 except Exception:
     imagehash = None
 
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
+
 from ..config import AppConfig
 from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaAssetSpec
 from ..models import DetectionRegion
@@ -87,9 +92,12 @@ class PetEmbeddingModel:
 
 
 class VisionAnalyzer:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, model_manager: ModelManager | None = None) -> None:
         self.config = config
-        self.model_manager = ModelManager(config)
+        self.model_manager = model_manager or ModelManager(config)
+        self.human_face_providers: list[str] = []
+        self.human_face_uses_gpu = False
+        self.yolo_device = self._preferred_yolo_device()
         self.cat_face_detector = self._load_cat_face_detector()
         self.human_face_app = self._load_human_face_backend()
         self.object_model = self._load_object_model()
@@ -160,9 +168,18 @@ class VisionAnalyzer:
             "analyzed_width": image.size[0],
             "analyzed_height": image.size[1],
             "human_face_model": "insightface" if self.human_face_app else "",
+            "human_face_providers": list(self.human_face_providers),
+            "human_face_device": (
+                "cuda"
+                if self.human_face_uses_gpu
+                else ("cpu" if self.human_face_app else "")
+            ),
             "object_model": self.config.object_model_id if self.object_model else "",
+            "object_device": self._yolo_device_label() if self.object_model else "",
             "pet_face_model": self.config.pet_detector_model_id if self.pet_face_model else "",
+            "pet_face_device": self._yolo_device_label() if self.pet_face_model else "",
             "pet_embedding_model": self.config.pet_embedding_model_id if self.pet_embedding_model else "",
+            "pet_embedding_device": getattr(self.pet_embedding_model, "device", ""),
             "cat_face_fallback": bool(self.cat_face_detector),
         }
 
@@ -458,6 +475,31 @@ class VisionAnalyzer:
                 return cascade
         return None
 
+    def _preferred_onnx_providers(self) -> list[str]:
+        available = []
+        if ort is not None:
+            try:
+                available = list(ort.get_available_providers())
+            except Exception:
+                available = []
+
+        providers: list[str] = []
+        if "CUDAExecutionProvider" in available:
+            providers.append("CUDAExecutionProvider")
+        if "CPUExecutionProvider" in available:
+            providers.append("CPUExecutionProvider")
+        if not providers:
+            providers = ["CPUExecutionProvider"]
+        return providers
+
+    def _preferred_yolo_device(self) -> int | str:
+        if torch is not None and torch.cuda.is_available():
+            return 0
+        return "cpu"
+
+    def _yolo_device_label(self) -> str:
+        return f"cuda:{self.yolo_device}" if isinstance(self.yolo_device, int) else str(self.yolo_device)
+
     def _load_human_face_backend(self):
         if FaceAnalysis is None or not self.config.face_recognition_enabled:
             return None
@@ -474,14 +516,19 @@ class VisionAnalyzer:
                 return None
 
         try:
+            providers = self._preferred_onnx_providers()
             app = FaceAnalysis(
                 name=pack_name,
                 root=str(pack_root),
-                providers=["CPUExecutionProvider"],
+                providers=providers,
             )
-            app.prepare(ctx_id=0, det_size=(640, 640))
+            self.human_face_providers = providers
+            self.human_face_uses_gpu = "CUDAExecutionProvider" in providers
+            app.prepare(ctx_id=0 if self.human_face_uses_gpu else -1, det_size=(640, 640))
             return app
         except Exception:
+            self.human_face_providers = []
+            self.human_face_uses_gpu = False
             return None
 
     def _load_yolo_model(self, model_id: str, configured_path: str = ""):
@@ -587,7 +634,11 @@ class VisionAnalyzer:
 
         rgb = np.asarray(image)
         try:
-            results = self.object_model.predict(rgb, verbose=False)
+            results = self.object_model.predict(
+                rgb,
+                device=self.yolo_device,
+                verbose=False,
+            )
         except Exception:
             return [], set()
 
@@ -732,7 +783,11 @@ class VisionAnalyzer:
 
         rgb = np.asarray(image)
         try:
-            results = self.pet_face_model.predict(rgb, verbose=False)
+            results = self.pet_face_model.predict(
+                rgb,
+                device=self.yolo_device,
+                verbose=False,
+            )
         except Exception:
             return []
 

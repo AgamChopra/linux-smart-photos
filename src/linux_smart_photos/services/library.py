@@ -8,7 +8,7 @@ from itertools import combinations
 import math
 from pathlib import Path
 import re
-from typing import Iterable
+from typing import Callable, Iterable
 
 try:
     import cv2
@@ -31,7 +31,7 @@ from ..config import AppConfig
 from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaAssetSpec, build_asset_specs, stable_id
 from ..models import Album, DetectionRegion, MediaItem, Memory, Persona, utc_now
 from ..store import JsonLibraryStore
-from .model_manager import ModelStatus
+from .model_manager import ModelManager, ModelStatus
 from .vision import CAT_LABELS, PET_LABELS, VisionAnalyzer
 
 
@@ -53,29 +53,88 @@ class SyncSummary:
     removed: int
 
 
+@dataclass(slots=True)
+class ProgressUpdate:
+    phase: str
+    message: str
+    current: int = 0
+    total: int = 0
+    detail: str = ""
+
+
 class LibraryService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.store = JsonLibraryStore(config.database_file)
         self.state = self.store.load()
-        self.vision = VisionAnalyzer(config)
-        self.model_manager = self.vision.model_manager
+        self.model_manager = ModelManager(config)
+        self._vision: VisionAnalyzer | None = None
         config.cache_path.mkdir(parents=True, exist_ok=True)
 
-    def sync(self) -> SyncSummary:
+    @property
+    def vision(self) -> VisionAnalyzer:
+        if self._vision is None:
+            self._vision = VisionAnalyzer(self.config, model_manager=self.model_manager)
+        return self._vision
+
+    def reload(self) -> None:
+        self.state = self.store.load()
+        self.model_manager = ModelManager(self.config)
+        self._vision = None
+
+    def sync(
+        self,
+        progress_callback: Callable[[ProgressUpdate], None] | None = None,
+    ) -> SyncSummary:
         assets = build_asset_specs(self.config.media_root_path)
+        sorted_assets = self._sorted_asset_entries(assets)
         existing_ids = set(self.state.items)
         current_ids = set(assets)
         removed_ids = existing_ids - current_ids
         added = 0
         updated = 0
+        total_work = len(removed_ids) + len(sorted_assets) + 2
+        completed = 0
 
-        for item_id in removed_ids:
+        self._emit_progress(
+            progress_callback,
+            ProgressUpdate(
+                phase="sync",
+                message="Checking library for changes",
+                current=completed,
+                total=total_work,
+                detail=str(self.config.media_root_path),
+            ),
+        )
+
+        for item_id in sorted(removed_ids):
             self.state.items.pop(item_id, None)
+            completed += 1
+            self._emit_progress(
+                progress_callback,
+                ProgressUpdate(
+                    phase="sync",
+                    message="Removing missing items",
+                    current=completed,
+                    total=total_work,
+                    detail=item_id,
+                ),
+            )
 
-        for item_id, spec in assets.items():
+        for item_id, spec in sorted_assets:
             existing = self.state.items.get(item_id)
             if existing and existing.file_signature == spec.file_signature:
+                completed += 1
+                self._emit_progress(
+                    progress_callback,
+                    ProgressUpdate(
+                        phase="sync",
+                        message="Scanning library",
+                        current=completed,
+                        total=total_work,
+                        detail=spec.relative_key,
+                    ),
+                )
                 continue
 
             self.state.items[item_id] = self._build_item(spec, existing)
@@ -83,10 +142,41 @@ class LibraryService:
                 added += 1
             else:
                 updated += 1
+            completed += 1
+            self._emit_progress(
+                progress_callback,
+                ProgressUpdate(
+                    phase="sync",
+                    message="Analyzing media",
+                    current=completed,
+                    total=total_work,
+                    detail=spec.relative_key,
+                ),
+            )
 
+        completed += 1
+        self._emit_progress(
+            progress_callback,
+            ProgressUpdate(
+                phase="sync",
+                message="Refreshing albums and memories",
+                current=completed,
+                total=total_work,
+            ),
+        )
         self._cleanup_collections()
         self.regenerate_memories()
         self.save()
+        completed += 1
+        self._emit_progress(
+            progress_callback,
+            ProgressUpdate(
+                phase="sync",
+                message="Library sync complete",
+                current=completed,
+                total=total_work,
+            ),
+        )
         return SyncSummary(added=added, updated=updated, removed=len(removed_ids))
 
     def save(self) -> None:
@@ -119,16 +209,74 @@ class LibraryService:
     def model_statuses(self) -> list[ModelStatus]:
         return self.model_manager.all_statuses()
 
-    def download_recommended_models(self) -> list[str]:
-        paths = self.model_manager.download_recommended_models()
-        self.vision = VisionAnalyzer(self.config)
-        self.model_manager = self.vision.model_manager
+    def missing_recommended_model_ids(self) -> list[str]:
+        return [
+            spec.id
+            for spec in self.model_manager.recommended_specs()
+            if not self.model_manager.status(spec.id).installed
+        ]
+
+    def download_recommended_models(
+        self,
+        progress_callback: Callable[[ProgressUpdate], None] | None = None,
+    ) -> list[str]:
+        specs = self.model_manager.recommended_specs()
+        paths: list[str] = []
+        total = len(specs)
+        for index, spec in enumerate(specs, start=1):
+            installed = self.model_manager.status(spec.id).installed
+            self._emit_progress(
+                progress_callback,
+                ProgressUpdate(
+                    phase="models",
+                    message="Checking AI models" if installed else "Downloading AI models",
+                    current=index - 1,
+                    total=total,
+                    detail=spec.title,
+                ),
+            )
+            paths.append(self.model_manager.download_model(spec.id))
+            self._emit_progress(
+                progress_callback,
+                ProgressUpdate(
+                    phase="models",
+                    message="AI model ready",
+                    current=index,
+                    total=total,
+                    detail=spec.title,
+                ),
+            )
+        self._vision = None
         return paths
 
-    def download_model(self, model_id: str) -> str:
+    def download_model(
+        self,
+        model_id: str,
+        progress_callback: Callable[[ProgressUpdate], None] | None = None,
+    ) -> str:
+        status = self.model_manager.status(model_id)
+        self._emit_progress(
+            progress_callback,
+            ProgressUpdate(
+                phase="models",
+                message="Checking AI models" if status.installed else "Downloading AI models",
+                current=0,
+                total=1,
+                detail=status.title,
+            ),
+        )
         path = self.model_manager.download_model(model_id)
-        self.vision = VisionAnalyzer(self.config)
-        self.model_manager = self.vision.model_manager
+        self._emit_progress(
+            progress_callback,
+            ProgressUpdate(
+                phase="models",
+                message="AI model ready" if status.installed else "Downloaded AI model",
+                current=1,
+                total=1,
+                detail=status.title,
+            ),
+        )
+        self._vision = None
         return path
 
     def search_items(
@@ -964,3 +1112,36 @@ class LibraryService:
             if len(left) != len(right):
                 return math.inf
             return float(sum(left_char != right_char for left_char, right_char in zip(left, right, strict=False)))
+
+    def _emit_progress(
+        self,
+        progress_callback: Callable[[ProgressUpdate], None] | None,
+        update: ProgressUpdate,
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(update)
+
+    def _sorted_asset_entries(
+        self,
+        assets: dict[str, MediaAssetSpec],
+    ) -> list[tuple[str, MediaAssetSpec]]:
+        return sorted(
+            assets.items(),
+            key=lambda entry: self._scan_sort_key(entry[1]),
+            reverse=True,
+        )
+
+    def _scan_sort_key(
+        self,
+        spec: MediaAssetSpec,
+    ) -> tuple[tuple[tuple[int, int, str], ...], float, str]:
+        relative_path = Path(spec.relative_key)
+        parent_parts = relative_path.parts[:-1]
+        segment_key = tuple(self._segment_sort_key(part) for part in parent_parts)
+        return (segment_key, spec.modified_ts, relative_path.name.lower())
+
+    def _segment_sort_key(self, segment: str) -> tuple[int, int, str]:
+        numbers = [int(value) for value in re.findall(r"\d+", segment)]
+        if numbers:
+            return (1, numbers[0], segment.lower())
+        return (0, 0, segment.lower())
