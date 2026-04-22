@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+from threading import Lock
 from typing import Callable, Iterable
 
 try:
@@ -72,6 +73,7 @@ class ProgressUpdate:
     total: int = 0
     detail: str = ""
     indeterminate: bool = False
+    snapshot_ready: bool = False
 
 
 @dataclass(slots=True)
@@ -129,6 +131,7 @@ class LibraryService:
         self.state = self.store.load()
         self.model_manager = ModelManager(config)
         self._vision: VisionAnalyzer | None = None
+        self._vision_lock = Lock()
         config.cache_path.mkdir(parents=True, exist_ok=True)
         if self._cleanup_collections():
             self.save()
@@ -136,7 +139,9 @@ class LibraryService:
     @property
     def vision(self) -> VisionAnalyzer:
         if self._vision is None:
-            self._vision = VisionAnalyzer(self.config, model_manager=self.model_manager)
+            with self._vision_lock:
+                if self._vision is None:
+                    self._vision = VisionAnalyzer(self.config, model_manager=self.model_manager)
         return self._vision
 
     def reload(self) -> None:
@@ -205,6 +210,18 @@ class LibraryService:
             changed_entries.append((item_id, spec, existing))
 
         if changed_entries:
+            self._emit_progress(
+                progress_callback,
+                ProgressUpdate(
+                    phase="sync",
+                    message="Initializing AI backends",
+                    current=completed,
+                    total=total_work,
+                    detail="Preparing models for batched analysis",
+                    indeterminate=True,
+                ),
+            )
+            _ = self.vision
             batch_size = self._scan_batch_size()
             max_workers = min(self._prefetch_workers(), max(1, batch_size), len(changed_entries))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -255,6 +272,19 @@ class LibraryService:
                                 current=completed,
                                 total=total_work,
                                 detail=item.relative_key,
+                            ),
+                        )
+                    if built_items:
+                        self.save()
+                        self._emit_progress(
+                            progress_callback,
+                            ProgressUpdate(
+                                phase="sync",
+                                message=f"Updated live view for batch {batch_index}/{total_batches}",
+                                current=completed,
+                                total=total_work,
+                                detail=f"{len(self.state.items)} indexed items",
+                                snapshot_ready=True,
                             ),
                         )
 

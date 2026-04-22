@@ -795,6 +795,7 @@ class MainWindow(QMainWindow):
         self._task_thread: QThread | None = None
         self._task_worker: BackgroundTaskWorker | None = None
         self._active_task = ""
+        self._live_refresh_pending = False
         self.setWindowTitle("Linux Smart Photos")
         self.resize(1560, 980)
 
@@ -833,6 +834,13 @@ class MainWindow(QMainWindow):
         self.albums_page.refresh()
         self.memories_page.refresh()
         self.models_page.refresh()
+
+    def refresh_live_views(self) -> None:
+        self.library_page._refresh_persona_filter()
+        self.library_page.refresh()
+        self.people_page.refresh()
+        if self.tabs.currentWidget() is self.unknown_clusters_page:
+            self.unknown_clusters_page.refresh()
 
     def _start_startup_tasks(self) -> None:
         self._start_background_task("startup")
@@ -885,6 +893,8 @@ class MainWindow(QMainWindow):
 
         detail = f": {update.detail}" if update.detail else ""
         self.progress_label.setText(f"{update.message}{detail}")
+        if update.snapshot_ready:
+            self._schedule_live_refresh()
 
     def _handle_task_completed(self, payload: Any) -> None:
         task_name = str(payload.get("task", self._active_task))
@@ -910,6 +920,20 @@ class MainWindow(QMainWindow):
         self._task_thread = None
         self._task_worker = None
         self._active_task = ""
+        self._live_refresh_pending = False
+
+    def _schedule_live_refresh(self) -> None:
+        if self._live_refresh_pending:
+            return
+        self._live_refresh_pending = True
+        QTimer.singleShot(150, self._apply_live_refresh)
+
+    def _apply_live_refresh(self) -> None:
+        self._live_refresh_pending = False
+        if not self._active_task:
+            return
+        self.service.reload()
+        self.refresh_live_views()
 
     def _set_busy(self, busy: bool, message: str) -> None:
         for page in (
