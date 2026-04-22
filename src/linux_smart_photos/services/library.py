@@ -32,8 +32,8 @@ except Exception:
 
 from ..config import AppConfig
 from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaAssetSpec, build_asset_specs, stable_id
-from ..models import Album, DetectionRegion, MediaItem, Memory, Persona, utc_now
-from ..store import JsonLibraryStore
+from ..models import Album, DetectionRegion, LibraryState, MediaItem, Memory, Persona, utc_now
+from ..store import SQLiteLibraryStore
 from .model_manager import ModelManager, ModelStatus
 from .vision import AnalysisResult, CAT_LABELS, DOG_LABELS, PET_LABELS, PreparedAssetInput, VideoFrameSample, VisionAnalyzer
 
@@ -60,6 +60,7 @@ UNKNOWN_PERSON_CLUSTER_MERGE_MARGIN = 0.05
 UNKNOWN_PET_CLUSTER_MERGE_MARGIN = 0.04
 UNKNOWN_CLUSTER_SIGNATURE_MERGE_SLACK = 2.0
 SCAN_PROGRESS_EMIT_INTERVAL = 48
+SEARCH_CANDIDATE_LIMIT = 600
 
 
 @dataclass(slots=True)
@@ -131,14 +132,16 @@ class _UnknownClusterState:
 class LibraryService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self.store = JsonLibraryStore(config.database_file)
-        self.state = self.store.load()
+        self.store = SQLiteLibraryStore(config.database_file)
+        self.state = LibraryState(
+            schema_version=self.store.schema_version(),
+            updated_at=self.store.updated_at(),
+        )
+        self._state_loaded = False
         self.model_manager = ModelManager(config)
         self._vision: VisionAnalyzer | None = None
         self._vision_lock = Lock()
         config.cache_path.mkdir(parents=True, exist_ok=True)
-        if self._cleanup_collections():
-            self.save()
 
     @property
     def vision(self) -> VisionAnalyzer:
@@ -149,9 +152,19 @@ class LibraryService:
         return self._vision
 
     def reload(self) -> None:
-        self.state = self.store.load()
+        self.state = LibraryState(
+            schema_version=self.store.schema_version(),
+            updated_at=self.store.updated_at(),
+        )
+        self._state_loaded = False
         self.model_manager = ModelManager(self.config)
         self._vision = None
+
+    def _ensure_state_loaded(self) -> None:
+        if self._state_loaded:
+            return
+        self.state = self.store.load()
+        self._state_loaded = True
         if self._cleanup_collections():
             self.save()
 
@@ -159,6 +172,7 @@ class LibraryService:
         self,
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
     ) -> SyncSummary:
+        self._ensure_state_loaded()
         assets = build_asset_specs(self.config.media_root_path)
         sorted_assets = self._sorted_asset_entries(assets)
         existing_ids = set(self.state.items)
@@ -195,6 +209,8 @@ class LibraryService:
                         detail=item_id,
                     ),
                 )
+        if removed_ids:
+            self._save_progress_items([], removed_item_ids=sorted(removed_ids))
 
         for item_id, spec in sorted_assets:
             existing = self.state.items.get(item_id)
@@ -281,7 +297,7 @@ class LibraryService:
                                 detail=self._batch_detail(batch_entries),
                             ),
                         )
-                        self.save()
+                        self._save_progress_items(built_items)
                         self._emit_progress(
                             progress_callback,
                             ProgressUpdate(
@@ -323,7 +339,24 @@ class LibraryService:
         self.state.updated_at = utc_now()
         self.store.save(self.state)
 
+    def _save_progress_items(
+        self,
+        items: Iterable[MediaItem],
+        *,
+        removed_item_ids: Iterable[str] = (),
+    ) -> None:
+        self.state.updated_at = utc_now()
+        self.store.save_items_progress(
+            items,
+            removed_item_ids,
+            updated_at=self.state.updated_at,
+            schema_version=self.state.schema_version,
+            personas=self.state.personas,
+        )
+
     def list_items(self) -> list[MediaItem]:
+        if not self._state_loaded:
+            return self.store.query_items()
         return sorted(
             self.state.items.values(),
             key=lambda item: (self._item_datetime(item), item.modified_ts),
@@ -331,15 +364,21 @@ class LibraryService:
         )
 
     def list_personas(self, kind: str = "all") -> list[Persona]:
+        if not self._state_loaded:
+            return self.store.list_personas(kind=kind)
         personas = list(self.state.personas.values())
         if kind != "all":
             personas = [persona for persona in personas if persona.kind == kind]
         return sorted(personas, key=lambda persona: (persona.kind, persona.name.lower()))
 
     def list_albums(self) -> list[Album]:
+        if not self._state_loaded:
+            return self.store.list_albums()
         return sorted(self.state.albums.values(), key=lambda album: album.name.lower())
 
     def list_memories(self) -> list[Memory]:
+        if not self._state_loaded:
+            return self.store.list_memories()
         return sorted(
             self.state.memories.values(),
             key=lambda memory: memory.end_date or memory.created_at,
@@ -427,6 +466,14 @@ class LibraryService:
         persona_id: str = "",
         favorites_only: bool = False,
     ) -> list[MediaItem]:
+        if not self._state_loaded:
+            return self._search_items_from_store(
+                query=query,
+                media_kind=media_kind,
+                persona_kind=persona_kind,
+                persona_id=persona_id,
+                favorites_only=favorites_only,
+            )
         items = [item for item in self.list_items() if not item.hidden]
 
         if media_kind != "all":
@@ -463,6 +510,8 @@ class LibraryService:
         return [item for _, item in scored_items]
 
     def items_for_persona(self, persona_id: str) -> list[MediaItem]:
+        if not self._state_loaded:
+            return self.store.query_items(persona_ids=[persona_id])
         return [
             item
             for item in self.list_items()
@@ -470,12 +519,22 @@ class LibraryService:
         ]
 
     def items_for_album(self, album_id: str) -> list[MediaItem]:
+        if not self._state_loaded:
+            album = self.store.load_album(album_id)
+            if not album:
+                return []
+            return self.store.load_items_by_ids(album.item_ids)
         album = self.state.albums.get(album_id)
         if not album:
             return []
         return [self.state.items[item_id] for item_id in album.item_ids if item_id in self.state.items]
 
     def items_for_memory(self, memory_id: str) -> list[MediaItem]:
+        if not self._state_loaded:
+            memory = self.store.load_memory(memory_id)
+            if not memory:
+                return []
+            return self.store.load_items_by_ids(memory.item_ids)
         memory = self.state.memories.get(memory_id)
         if not memory:
             return []
@@ -489,6 +548,9 @@ class LibraryService:
         return sorted(persona_ids)
 
     def personas_for_item(self, item: MediaItem) -> list[Persona]:
+        if not self._state_loaded:
+            personas = self.store.load_personas_by_ids(self.item_persona_ids(item))
+            return sorted(personas, key=lambda persona: persona.name.lower())
         personas = []
         for persona_id in self.item_persona_ids(item):
             persona = self.state.personas.get(persona_id)
@@ -497,7 +559,7 @@ class LibraryService:
         return sorted(personas, key=lambda persona: persona.name.lower())
 
     def persona_reference_images(self, persona_id: str) -> list[dict[str, str]]:
-        persona = self.state.personas.get(persona_id)
+        persona = self.state.personas.get(persona_id) if self._state_loaded else self.store.load_persona(persona_id)
         if not persona:
             return []
         references = [
@@ -518,7 +580,27 @@ class LibraryService:
         for requested_kind in requested_kinds:
             if requested_kind not in {"person", "pet"}:
                 continue
-            clusters.extend(self._build_unknown_clusters(requested_kind))
+            cached_clusters = self.store.load_cached_unknown_clusters(
+                requested_kind,
+                revision=self.state.updated_at,
+            )
+            if cached_clusters is not None:
+                clusters.extend(
+                    self._deserialize_unknown_cluster(entry)
+                    for entry in cached_clusters
+                )
+                continue
+            self._ensure_state_loaded()
+            built_clusters = self._build_unknown_clusters(requested_kind)
+            self.store.save_cached_unknown_clusters(
+                requested_kind,
+                revision=self.state.updated_at,
+                clusters=[
+                    self._serialize_unknown_cluster(cluster)
+                    for cluster in built_clusters
+                ],
+            )
+            clusters.extend(built_clusters)
         return sorted(
             clusters,
             key=lambda cluster: (cluster.member_count, cluster.item_count, cluster.latest_captured_at),
@@ -532,7 +614,10 @@ class LibraryService:
         item_ids: set[str] = set()
         for cluster in clusters:
             item_ids.update(cluster.item_ids)
-        items = [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
+        if not self._state_loaded:
+            items = self.store.load_items_by_ids(sorted(item_ids))
+        else:
+            items = [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
         return sorted(
             items,
             key=lambda item: (self._item_datetime(item), item.modified_ts),
@@ -597,7 +682,43 @@ class LibraryService:
             for label, count in ordered
         )
 
+    def _serialize_unknown_cluster(self, cluster: UnknownPersonaCluster) -> dict[str, object]:
+        return {
+            "id": cluster.id,
+            "kind": cluster.kind,
+            "label": cluster.label,
+            "member_count": cluster.member_count,
+            "item_count": cluster.item_count,
+            "member_ids": [
+                [item_id, region_id]
+                for item_id, region_id in cluster.member_ids
+            ],
+            "item_ids": list(cluster.item_ids),
+            "preview_path": cluster.preview_path,
+            "latest_captured_at": cluster.latest_captured_at,
+            "average_confidence": cluster.average_confidence,
+        }
+
+    def _deserialize_unknown_cluster(self, payload: dict[str, object]) -> UnknownPersonaCluster:
+        return UnknownPersonaCluster(
+            id=str(payload.get("id", "")),
+            kind=str(payload.get("kind", "person")),
+            label=str(payload.get("label", "")),
+            member_count=int(payload.get("member_count", 0)),
+            item_count=int(payload.get("item_count", 0)),
+            member_ids=[
+                (str(entry[0]), str(entry[1]))
+                for entry in payload.get("member_ids", [])
+                if isinstance(entry, list) and len(entry) == 2
+            ],
+            item_ids=[str(item_id) for item_id in payload.get("item_ids", [])],
+            preview_path=str(payload.get("preview_path", "")),
+            latest_captured_at=str(payload.get("latest_captured_at", "")),
+            average_confidence=float(payload.get("average_confidence", 0.0)),
+        )
+
     def create_persona(self, name: str, kind: str) -> Persona:
+        self._ensure_state_loaded()
         normalized = name.strip()
         if not normalized:
             raise ValueError("Persona name is required.")
@@ -626,6 +747,7 @@ class LibraryService:
         new_name: str = "",
         kind: str = "person",
     ) -> Persona:
+        self._ensure_state_loaded()
         persona = self._resolve_persona(persona_id, new_name, kind)
         item = self.state.items[item_id]
         for detection in item.detections:
@@ -641,6 +763,7 @@ class LibraryService:
         return persona
 
     def clear_region_assignment(self, item_id: str, region_id: str) -> None:
+        self._ensure_state_loaded()
         item = self.state.items[item_id]
         for detection in item.detections:
             if detection.id == region_id:
@@ -656,6 +779,7 @@ class LibraryService:
         new_name: str = "",
         kind: str = "person",
     ) -> Persona:
+        self._ensure_state_loaded()
         persona = self._resolve_persona(persona_id, new_name, kind)
         item = self.state.items[item_id]
         if persona.id not in item.manual_persona_ids:
@@ -674,6 +798,7 @@ class LibraryService:
         return persona
 
     def clear_item_personas(self, item_id: str) -> None:
+        self._ensure_state_loaded()
         item = self.state.items[item_id]
         item.manual_persona_ids = []
         self.regenerate_memories()
@@ -686,6 +811,7 @@ class LibraryService:
         new_name: str = "",
         kind: str = "person",
     ) -> Persona:
+        self._ensure_state_loaded()
         cluster_list = list(clusters)
         if not cluster_list:
             raise ValueError("Select at least one cluster.")
@@ -728,6 +854,7 @@ class LibraryService:
         return persona
 
     def create_album(self, name: str, item_ids: Iterable[str] = ()) -> Album:
+        self._ensure_state_loaded()
         normalized = name.strip()
         if not normalized:
             raise ValueError("Album name is required.")
@@ -742,6 +869,7 @@ class LibraryService:
         return album
 
     def add_items_to_album(self, album_id: str, item_ids: Iterable[str]) -> None:
+        self._ensure_state_loaded()
         album = self.state.albums[album_id]
         for item_id in item_ids:
             if item_id in self.state.items and item_id not in album.item_ids:
@@ -749,10 +877,12 @@ class LibraryService:
         self.save()
 
     def delete_album(self, album_id: str) -> None:
+        self._ensure_state_loaded()
         self.state.albums.pop(album_id, None)
         self.save()
 
     def toggle_favorite(self, item_ids: Iterable[str]) -> bool:
+        self._ensure_state_loaded()
         selected_items = [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
         if not selected_items:
             return False
@@ -763,6 +893,7 @@ class LibraryService:
         return new_state
 
     def regenerate_memories(self) -> None:
+        self._ensure_state_loaded()
         self.state.memories = {}
         if not self.config.auto_generate_memories:
             return
@@ -1893,6 +2024,67 @@ class LibraryService:
                     continue
             free_text_tokens.append(token)
         return field_filters, " ".join(free_text_tokens).strip()
+
+    def _search_items_from_store(
+        self,
+        *,
+        query: str,
+        media_kind: str,
+        persona_kind: str,
+        persona_id: str,
+        favorites_only: bool,
+    ) -> list[MediaItem]:
+        field_filters, free_text = self._parse_query(query)
+        resolved_media_kind = field_filters.get("type", media_kind)
+        resolved_tag = field_filters.get("tag", "").lower()
+        resolved_year = field_filters.get("year", "")
+
+        persona_ids: list[str] = []
+        if persona_id:
+            persona_ids = [persona_id]
+
+        person_filter = field_filters.get("person", "").strip()
+        pet_filter = field_filters.get("pet", "").strip()
+        if person_filter:
+            candidate_ids = self.store.find_persona_ids_by_name("person", person_filter)
+            if not candidate_ids:
+                return []
+            persona_ids = candidate_ids if not persona_ids else [value for value in persona_ids if value in candidate_ids]
+            if not persona_ids:
+                return []
+            persona_kind = "person"
+        if pet_filter:
+            candidate_ids = self.store.find_persona_ids_by_name("pet", pet_filter)
+            if not candidate_ids:
+                return []
+            persona_ids = candidate_ids if not persona_ids else [value for value in persona_ids if value in candidate_ids]
+            if not persona_ids:
+                return []
+            persona_kind = "pet"
+
+        candidate_items = self.store.query_items(
+            media_kind=resolved_media_kind,
+            favorites_only=favorites_only,
+            persona_ids=persona_ids or None,
+            persona_kind=persona_kind,
+            year=resolved_year,
+            tag=resolved_tag,
+            search_text=free_text,
+            limit=SEARCH_CANDIDATE_LIMIT if free_text else None,
+        )
+        if not free_text:
+            return candidate_items
+
+        scored_items: list[tuple[int, MediaItem]] = []
+        for item in candidate_items:
+            score = self._score_item(item, free_text)
+            if score >= 35:
+                scored_items.append((score, item))
+        scored_items.sort(
+            key=lambda entry: (entry[0], self._item_datetime(entry[1]), entry[1].modified_ts),
+            reverse=True,
+        )
+        return [item for _, item in scored_items]
 
     def _apply_field_filters(
         self,

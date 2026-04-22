@@ -91,6 +91,8 @@ fi
 
 if [[ "$force_setup" != "1" && "$setup_current" == "1" ]]; then
   echo "Smart Photos setup is already up to date."
+  echo "Checking for legacy library migrations"
+  "$VENV_DIR/bin/smart-photos-migrate"
   exit 0
 fi
 
@@ -106,6 +108,9 @@ echo "Installing Python dependencies"
 
 echo "Initializing local configuration"
 "$VENV_DIR/bin/python" -m linux_smart_photos.bootstrap --skip-models
+
+echo "Migrating legacy library data"
+"$VENV_DIR/bin/smart-photos-migrate"
 
 echo "Installing desktop integration"
 mkdir -p "$ICON_DEST_DIR" "$DESKTOP_DIR" "$BIN_DIR"

@@ -17,7 +17,7 @@ The app is designed for photo libraries stored in a structure like:
 file/photos/<year>/<date>/<asset>
 ```
 
-Changes in the library are detected automatically when the app starts. New items are indexed, deleted items are removed, and saved people, pet, album, and memory data are kept in a local JSON database for fast loading.
+Changes in the library are detected automatically when the app starts. New items are indexed, deleted items are removed, and saved people, pet, album, and memory data are kept in a local SQLite database for fast loading.
 
 ## AI Features
 
@@ -37,6 +37,8 @@ The easiest way to start is with the wrapper launcher. On first run it will:
 
 - create `.venv`
 - install the app and AI dependencies
+- migrate older JSON libraries to SQLite if they are present
+- update `config.json` to the SQLite library path
 - download the recommended AI models
 - install a desktop launcher and icon in `~/.local/share/applications`
 - symlink the launcher to `~/.local/bin/smart-photos`
@@ -92,6 +94,7 @@ CLI mode:
 ./smart-photos --cli sync
 ./smart-photos --cli search cat --limit 10
 ./smart-photos --cli models status
+./smart-photos --cli migrate
 ```
 
 ## Files
@@ -102,11 +105,13 @@ On first launch the app writes config here:
 ~/.config/linux-smart-photos/config.json
 ```
 
-The JSON library database lives here by default:
+The library database lives here by default:
 
 ```text
-~/.local/share/linux-smart-photos/library.json
+~/.local/share/linux-smart-photos/library.sqlite3
 ```
+
+If an older `library.json` is present, setup imports it into SQLite, rewrites the configured database path to the SQLite file, and removes the old JSON file after a successful migration.
 
 Thumbnail cache lives here by default:
 

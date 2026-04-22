@@ -78,7 +78,7 @@ def default_config() -> AppConfig:
     _, data_dir, cache_dir = default_paths()
     return AppConfig(
         media_root=str(default_media_root()),
-        database_path=str(data_dir / "library.json"),
+        database_path=str(data_dir / "library.sqlite3"),
         cache_dir=str(cache_dir / "thumbnails"),
         models_dir=str(data_dir / "models"),
     )

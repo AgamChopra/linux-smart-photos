@@ -1,6 +1,6 @@
 {
   "media_root": "/home/your-user/file/photos",
-  "database_path": "/home/your-user/.local/share/linux-smart-photos/library.json",
+  "database_path": "/home/your-user/.local/share/linux-smart-photos/library.sqlite3",
   "cache_dir": "/home/your-user/.cache/linux-smart-photos/thumbnails",
   "models_dir": "/home/your-user/.local/share/linux-smart-photos/models",
   "thumbnail_size": 256,

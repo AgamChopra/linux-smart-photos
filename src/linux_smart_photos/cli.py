@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .branding import APP_NAME
 from .config import config_file_path, load_config
-from .services.library import LibraryService
+from .migration import migrate_configured_library
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional model ids. If omitted, installs the recommended set.",
     )
 
+    migrate_parser = subparsers.add_parser("migrate", help="Migrate legacy JSON library data to SQLite.")
+    migrate_parser.add_argument(
+        "--keep-legacy",
+        action="store_true",
+        help="Keep legacy JSON files after a successful migration.",
+    )
+
     subparsers.add_parser("gui", help="Launch the desktop UI.")
     return parser
 
@@ -62,8 +69,12 @@ def main(argv: list[str] | None = None) -> int:
         from .app import main as gui_main
 
         return gui_main()
+    if command == "migrate":
+        return run_migrate(args.config, keep_legacy=bool(args.keep_legacy))
 
     config = load_config(args.config)
+    from .services.library import LibraryService
+
     service = LibraryService(config)
 
     if command == "status":
@@ -83,10 +94,10 @@ def run_status(service: LibraryService, config_override: Path | None) -> int:
     print(APP_NAME)
     print(f"Config: {config_override or config_file_path()}")
     print(f"Media root: {service.config.media_root_path}")
-    print(f"Items: {len(service.state.items)}")
-    print(f"Personas: {len(service.state.personas)}")
-    print(f"Albums: {len(service.state.albums)}")
-    print(f"Memories: {len(service.state.memories)}")
+    print(f"Items: {len(service.list_items())}")
+    print(f"Personas: {len(service.list_personas())}")
+    print(f"Albums: {len(service.list_albums())}")
+    print(f"Memories: {len(service.list_memories())}")
     print("Models:")
     for status in service.model_statuses():
         state = "installed" if status.installed else "missing"
@@ -143,6 +154,25 @@ def run_models(service: LibraryService, models_command: str | None, model_ids: l
     print("Installed models:")
     for path in installed_paths:
         print(f"- {path}")
+    return 0
+
+
+def run_migrate(config_override: Path | None, *, keep_legacy: bool = False) -> int:
+    result = migrate_configured_library(config_override, delete_legacy=not keep_legacy)
+    print(f"{APP_NAME} migration")
+    print(f"Config: {config_override or config_file_path()}")
+    print(f"Database: {result.database_path}")
+    if result.migrated_from is not None:
+        print(f"Migrated from: {result.migrated_from}")
+    else:
+        print("Migrated from: none")
+    print(f"Config updated: {'yes' if result.config_updated else 'no'}")
+    if result.deleted_paths:
+        print("Deleted legacy files:")
+        for path in result.deleted_paths:
+            print(f"- {path}")
+    else:
+        print("Deleted legacy files: none")
     return 0
 
 

@@ -796,6 +796,7 @@ class MainWindow(QMainWindow):
         self._task_worker: BackgroundTaskWorker | None = None
         self._active_task = ""
         self._live_refresh_pending = False
+        self._unknown_clusters_dirty = True
         self.setWindowTitle("Linux Smart Photos")
         self.resize(1560, 980)
 
@@ -813,6 +814,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.albums_page, "Albums")
         self.tabs.addTab(self.memories_page, "Memories")
         self.tabs.addTab(self.models_page, "AI Models")
+        self.tabs.currentChanged.connect(self._handle_tab_changed)
         self.setCentralWidget(self.tabs)
 
         self.progress_label = QLabel("Ready")
@@ -823,17 +825,29 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.progress_label, 1)
         self.statusBar().addPermanentWidget(self.progress_bar)
 
-        self.refresh_views()
+        QTimer.singleShot(0, self._finish_startup)
+
+    def _finish_startup(self) -> None:
+        self.refresh_views(refresh_unknown=False)
         QTimer.singleShot(0, self._start_startup_tasks)
 
-    def refresh_views(self) -> None:
+    def refresh_views(self, refresh_unknown: bool | None = None) -> None:
         self.library_page._refresh_persona_filter()
         self.library_page.refresh()
         self.people_page.refresh()
-        self.unknown_clusters_page.refresh()
         self.albums_page.refresh()
         self.memories_page.refresh()
         self.models_page.refresh()
+        should_refresh_unknown = (
+            self.tabs.currentWidget() is self.unknown_clusters_page
+            if refresh_unknown is None
+            else refresh_unknown
+        )
+        if should_refresh_unknown:
+            self.unknown_clusters_page.refresh()
+            self._unknown_clusters_dirty = False
+        else:
+            self._unknown_clusters_dirty = True
 
     def refresh_live_views(self) -> None:
         self.library_page._refresh_persona_filter()
@@ -841,6 +855,9 @@ class MainWindow(QMainWindow):
         self.people_page.refresh()
         if self.tabs.currentWidget() is self.unknown_clusters_page:
             self.unknown_clusters_page.refresh()
+            self._unknown_clusters_dirty = False
+        else:
+            self._unknown_clusters_dirty = True
 
     def _start_startup_tasks(self) -> None:
         self._start_background_task("startup")
@@ -915,6 +932,11 @@ class MainWindow(QMainWindow):
         self.refresh_views()
         self._set_busy(False, self._task_failure_message(task_name))
         QMessageBox.critical(self, "Background Task Failed", message)
+
+    def _handle_tab_changed(self, _index: int) -> None:
+        if self.tabs.currentWidget() is self.unknown_clusters_page and self._unknown_clusters_dirty:
+            self.unknown_clusters_page.refresh()
+            self._unknown_clusters_dirty = False
 
     def _clear_task_handles(self) -> None:
         self._task_thread = None
