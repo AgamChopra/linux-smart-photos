@@ -691,11 +691,47 @@ class VisionAnalyzer:
 
         providers: list[str] = []
         if "CUDAExecutionProvider" in available:
+            self._prepare_onnxruntime_cuda()
             providers.append("CUDAExecutionProvider")
         if "CPUExecutionProvider" in available:
             providers.append("CPUExecutionProvider")
         if not providers:
             providers = ["CPUExecutionProvider"]
+        return providers
+
+    def _prepare_onnxruntime_cuda(self) -> None:
+        if ort is None:
+            return
+        preload = getattr(ort, "preload_dlls", None)
+        if not callable(preload):
+            return
+        try:
+            preload(directory="")
+        except TypeError:
+            try:
+                preload()
+            except Exception:
+                return
+        except Exception:
+            try:
+                preload()
+            except Exception:
+                return
+
+    def _face_session_providers(self, app: Any) -> list[str]:
+        providers: list[str] = []
+        models = getattr(app, "models", None)
+        if isinstance(models, dict):
+            for model in models.values():
+                session = getattr(model, "session", None) or getattr(model, "_session", None)
+                if session is None or not hasattr(session, "get_providers"):
+                    continue
+                try:
+                    for provider in session.get_providers():
+                        if provider not in providers:
+                            providers.append(provider)
+                except Exception:
+                    continue
         return providers
 
     def _preferred_yolo_device(self) -> int | str:
@@ -738,9 +774,11 @@ class VisionAnalyzer:
                 root=str(pack_root),
                 providers=providers,
             )
-            self.human_face_providers = providers
-            self.human_face_uses_gpu = "CUDAExecutionProvider" in providers
-            app.prepare(ctx_id=0 if self.human_face_uses_gpu else -1, det_size=(640, 640))
+            requested_gpu = "CUDAExecutionProvider" in providers
+            app.prepare(ctx_id=0 if requested_gpu else -1, det_size=(640, 640))
+            actual_providers = self._face_session_providers(app)
+            self.human_face_providers = actual_providers or providers
+            self.human_face_uses_gpu = "CUDAExecutionProvider" in self.human_face_providers
             return app
         except Exception:
             self.human_face_providers = []

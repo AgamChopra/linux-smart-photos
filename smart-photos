@@ -69,7 +69,7 @@ while (($#)); do
       mode="cli"
       shift
       ;;
-    --setup)
+    --setup|--force)
       force_setup="1"
       shift
       ;;

@@ -520,6 +520,18 @@ class LibraryService:
         video_ai_frames = item.metadata.get("video_ai_frames_analyzed")
         if video_ai_frames:
             lines.append(f"Video AI frames: {video_ai_frames}")
+        human_face_device = item.metadata.get("human_face_device")
+        object_device = item.metadata.get("object_device")
+        pet_face_device = item.metadata.get("pet_face_device")
+        pet_embedding_device = item.metadata.get("pet_embedding_device")
+        if human_face_device:
+            lines.append(f"Human Face Device: {human_face_device}")
+        if object_device:
+            lines.append(f"Object Device: {object_device}")
+        if pet_face_device:
+            lines.append(f"Pet Face Device: {pet_face_device}")
+        if pet_embedding_device:
+            lines.append(f"Pet Embedding Device: {pet_embedding_device}")
         if item.component_paths and len(item.component_paths) > 1:
             lines.append(f"Components: {len(item.component_paths)}")
         return "\n".join(lines)
@@ -1851,12 +1863,15 @@ class LibraryService:
             return float(sum(left_char != right_char for left_char, right_char in zip(left, right, strict=False)))
 
     def _scan_batch_size(self) -> int:
-        return max(1, int(self.config.scan_batch_size))
+        configured = max(1, int(self.config.scan_batch_size))
+        analysis_batch = max(1, int(self.config.analysis_batch_size))
+        return max(configured, min(analysis_batch, 32))
 
     def _prefetch_workers(self) -> int:
         configured = max(1, int(self.config.prefetch_workers))
         cpu_count = os.cpu_count() or configured
-        return max(1, min(configured, cpu_count))
+        target = max(configured, min(8, cpu_count))
+        return max(1, min(target, cpu_count))
 
     def _batch_detail(
         self,
