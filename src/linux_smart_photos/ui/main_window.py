@@ -114,7 +114,7 @@ class UnknownClustersWorker(QObject):
             service = LibraryService(self.config)
             clusters = service.list_unknown_persona_clusters(
                 kind=self.kind,
-                allow_stale_cache=True,
+                allow_stale_cache=False,
             )
             self.completed.emit(clusters)
         except Exception as exc:
