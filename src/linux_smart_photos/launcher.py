@@ -43,6 +43,15 @@ def _launch_electron(args: list[str]) -> int:
         "GTK_DATA_PREFIX",
         "GTK2_RC_FILES",
         "GTK_RC_FILES",
+        "GTK_THEME",
+        "GTK_IM_MODULE",
+        "GDK_BACKEND",
+        "GDK_PIXBUF_MODULEDIR",
+        "GDK_PIXBUF_MODULE_FILE",
+        "GIO_MODULE_DIR",
+        "GI_TYPELIB_PATH",
+        "LD_PRELOAD",
+        "QT_PLUGIN_PATH",
     ):
         env.pop(key, None)
     command = [str(electron_binary), str(root / "electron"), *args]

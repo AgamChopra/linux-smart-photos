@@ -1211,9 +1211,23 @@ class LibraryService:
             if spec.media_kind == "video" and sampled_frames:
                 still_image = sampled_frames[0].image.copy()
 
-        metadata = self._extract_metadata(spec)
-        thumbnail_source = still_image.copy() if still_image is not None else None
-        thumbnail_path = self._ensure_thumbnail_from_image(spec, thumbnail_source)
+        if analysis_mode == "human_faces_only" and existing is not None:
+            metadata = {
+                "captured_at": existing.captured_at,
+                "width": existing.width,
+                "height": existing.height,
+                "duration_seconds": existing.duration_seconds,
+                "metadata": {
+                    key: value
+                    for key, value in existing.metadata.items()
+                    if not key.startswith("human_face_")
+                },
+            }
+            thumbnail_path = existing.thumbnail_path
+        else:
+            metadata = self._extract_metadata(spec)
+            thumbnail_source = still_image.copy() if still_image is not None else None
+            thumbnail_path = self._ensure_thumbnail_from_image(spec, thumbnail_source)
         return PreparedSyncItem(
             spec=spec,
             existing=existing,
@@ -1530,54 +1544,10 @@ class LibraryService:
     def _current_human_face_pipeline_revision(self) -> str:
         if not self.config.face_recognition_enabled:
             return ""
-        detector_name, recognizer_name = self._resolved_human_face_model_names()
-        if not detector_name or not recognizer_name:
+        vision = self.vision
+        if vision.human_face_backend is None:
             return ""
-        return VisionAnalyzer.human_face_pipeline_revision(
-            detector_name=detector_name,
-            recognizer_name=recognizer_name,
-        )
-
-    def _resolved_human_face_model_names(self) -> tuple[str, str]:
-        detector_name = ""
-        recognizer_name = ""
-
-        explicit_detector = Path(self.config.human_face_detector_path).expanduser() if self.config.human_face_detector_path else None
-        if explicit_detector and explicit_detector.exists():
-            detector_name = explicit_detector.name
-        else:
-            detector_name = self._resolve_detector_name_from_model(self.config.human_face_detector_model_id)
-            if not detector_name:
-                detector_name = self._resolve_detector_name_from_model(self.config.human_face_model_id)
-
-        recognizer_name = self._resolve_recognizer_name_from_model(self.config.human_face_model_id)
-        return detector_name, recognizer_name
-
-    def _resolve_detector_name_from_model(self, model_id: str) -> str:
-        status = self.model_manager.status(model_id)
-        if not status.installed:
-            return ""
-        model_path = Path(status.local_path)
-        if model_path.is_file():
-            return model_path.name
-        for candidate_name in ("scrfd_10g_bnkps.onnx", "det_500m.onnx"):
-            candidate_path = model_path / candidate_name
-            if candidate_path.exists():
-                return candidate_path.name
-        return ""
-
-    def _resolve_recognizer_name_from_model(self, model_id: str) -> str:
-        status = self.model_manager.status(model_id)
-        if not status.installed:
-            return ""
-        model_path = Path(status.local_path)
-        if model_path.is_file():
-            return model_path.name
-        for candidate_name in ("w600k_mbf.onnx", "glintr100.onnx"):
-            candidate_path = model_path / candidate_name
-            if candidate_path.exists():
-                return candidate_path.name
-        return ""
+        return vision.human_face_pipeline_id
 
     def _best_previous_detection_match(
         self,

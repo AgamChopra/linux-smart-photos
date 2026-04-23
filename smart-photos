@@ -71,6 +71,15 @@ sanitize_electron_env() {
   unset GTK_DATA_PREFIX
   unset GTK2_RC_FILES
   unset GTK_RC_FILES
+  unset GTK_THEME
+  unset GTK_IM_MODULE
+  unset GDK_BACKEND
+  unset GDK_PIXBUF_MODULEDIR
+  unset GDK_PIXBUF_MODULE_FILE
+  unset GIO_MODULE_DIR
+  unset GI_TYPELIB_PATH
+  unset LD_PRELOAD
+  unset QT_PLUGIN_PATH
 }
 
 while (($#)); do

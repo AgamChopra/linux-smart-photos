@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ctypes
+import ctypes.util
 import logging
 from pathlib import Path
 from typing import Any
@@ -821,7 +823,11 @@ class VisionAnalyzer:
         available = self._available_onnx_providers()
         providers: list[Any] = []
         prefer_tensorrt = self.config.human_face_detector_backend in {"auto", "tensorrt"}
-        if prefer_tensorrt and "TensorrtExecutionProvider" in available:
+        if (
+            prefer_tensorrt
+            and "TensorrtExecutionProvider" in available
+            and self._tensorrt_runtime_available()
+        ):
             self._prepare_onnxruntime_cuda()
             trt_options: dict[str, object] = {
                 "device_id": 0,
@@ -878,6 +884,28 @@ class VisionAnalyzer:
         cache_root = self.config.cache_path.parent / "onnxruntime-trt"
         cache_root.mkdir(parents=True, exist_ok=True)
         return cache_root
+
+    def _tensorrt_runtime_available(self) -> bool:
+        required_libraries = (
+            "libnvinfer.so.10",
+            "libnvinfer_plugin.so.10",
+        )
+        for library_name in required_libraries:
+            if self._can_load_shared_library(library_name):
+                continue
+            generic_name = library_name.split(".so", 1)[0].removeprefix("lib")
+            resolved_name = ctypes.util.find_library(generic_name)
+            if resolved_name and self._can_load_shared_library(resolved_name):
+                continue
+            return False
+        return True
+
+    def _can_load_shared_library(self, library_name: str) -> bool:
+        try:
+            ctypes.CDLL(library_name)
+            return True
+        except OSError:
+            return False
 
     def _prepare_onnxruntime_cuda(self) -> None:
         if ort is None:
