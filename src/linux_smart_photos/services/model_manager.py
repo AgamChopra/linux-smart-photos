@@ -75,6 +75,18 @@ class ModelManager:
                 recommended=True,
             ),
             ModelSpec(
+                id="insightface_antelope",
+                role="Human Face Detector",
+                title="InsightFace antelope",
+                source_url="https://github.com/deepinsight/insightface/issues/891",
+                download_url="https://github.com/deepinsight/insightface/releases/download/v0.7/antelope.zip",
+                storage_kind="zip_dir",
+                local_path="insightface/models/antelope",
+                summary="High-recall SCRFD-10G-KPS detector bundle used for faster GPU-first human face detection.",
+                license_note="InsightFace pretrained model packs are for non-commercial research purposes only.",
+                recommended=True,
+            ),
+            ModelSpec(
                 id="avito_dinov2_small_petface",
                 role="Pet Personas",
                 title="AvitoTech DINOv2-Small Animal ID",

@@ -85,6 +85,7 @@ class ProgressUpdate:
 class PreparedSyncItem:
     spec: MediaAssetSpec
     existing: MediaItem | None
+    analysis_mode: str
     metadata: dict[str, object]
     thumbnail_path: str
     still_image: Image.Image | None
@@ -182,7 +183,7 @@ class LibraryService:
         updated = 0
         total_work = len(removed_ids) + len(sorted_assets) + 2
         completed = 0
-        changed_entries: list[tuple[str, MediaAssetSpec, MediaItem | None]] = []
+        changed_entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]] = []
 
         self._emit_progress(
             progress_callback,
@@ -214,7 +215,8 @@ class LibraryService:
 
         for item_id, spec in sorted_assets:
             existing = self.state.items.get(item_id)
-            if existing and existing.file_signature == spec.file_signature:
+            reanalysis_mode = self._reanalysis_mode(existing)
+            if existing and existing.file_signature == spec.file_signature and reanalysis_mode == "none":
                 completed += 1
                 if self._should_emit_scan_progress(completed, total_work):
                     self._emit_progress(
@@ -229,7 +231,10 @@ class LibraryService:
                     )
                 continue
 
-            changed_entries.append((item_id, spec, existing))
+            analysis_mode = "full"
+            if existing and existing.file_signature == spec.file_signature and reanalysis_mode == "human_faces_only":
+                analysis_mode = "human_faces_only"
+            changed_entries.append((item_id, spec, existing, analysis_mode))
 
         if changed_entries:
             self._emit_progress(
@@ -512,36 +517,41 @@ class LibraryService:
         ranked_items = [item for _, item in scored_items]
         return ranked_items if limit is None else ranked_items[:limit]
 
-    def items_for_persona(self, persona_id: str) -> list[MediaItem]:
+    def items_for_persona(self, persona_id: str, limit: int | None = None) -> list[MediaItem]:
         if not self._state_loaded:
-            return self.store.query_items(persona_ids=[persona_id])
-        return [
+            return self.store.query_items(persona_ids=[persona_id], limit=limit)
+        items = [
             item
             for item in self.list_items()
             if persona_id in self.item_persona_ids(item)
         ]
+        return items if limit is None else items[:limit]
 
-    def items_for_album(self, album_id: str) -> list[MediaItem]:
+    def items_for_album(self, album_id: str, limit: int | None = None) -> list[MediaItem]:
         if not self._state_loaded:
             album = self.store.load_album(album_id)
             if not album:
                 return []
-            return self.store.load_items_by_ids(album.item_ids)
+            item_ids = album.item_ids if limit is None else album.item_ids[:limit]
+            return self.store.load_items_by_ids(item_ids)
         album = self.state.albums.get(album_id)
         if not album:
             return []
-        return [self.state.items[item_id] for item_id in album.item_ids if item_id in self.state.items]
+        item_ids = album.item_ids if limit is None else album.item_ids[:limit]
+        return [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
 
-    def items_for_memory(self, memory_id: str) -> list[MediaItem]:
+    def items_for_memory(self, memory_id: str, limit: int | None = None) -> list[MediaItem]:
         if not self._state_loaded:
             memory = self.store.load_memory(memory_id)
             if not memory:
                 return []
-            return self.store.load_items_by_ids(memory.item_ids)
+            item_ids = memory.item_ids if limit is None else memory.item_ids[:limit]
+            return self.store.load_items_by_ids(item_ids)
         memory = self.state.memories.get(memory_id)
         if not memory:
             return []
-        return [self.state.items[item_id] for item_id in memory.item_ids if item_id in self.state.items]
+        item_ids = memory.item_ids if limit is None else memory.item_ids[:limit]
+        return [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
 
     def item_persona_ids(self, item: MediaItem) -> list[str]:
         persona_ids = set(item.manual_persona_ids)
@@ -573,7 +583,12 @@ class LibraryService:
         references.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
         return references
 
-    def list_unknown_persona_clusters(self, kind: str = "person") -> list[UnknownPersonaCluster]:
+    def list_unknown_persona_clusters(
+        self,
+        kind: str = "person",
+        *,
+        allow_stale_cache: bool = False,
+    ) -> list[UnknownPersonaCluster]:
         requested_kinds = (
             ["person", "pet"]
             if kind == "all"
@@ -593,6 +608,14 @@ class LibraryService:
                     for entry in cached_clusters
                 )
                 continue
+            if allow_stale_cache:
+                stale_clusters = self.store.load_latest_cached_unknown_clusters(requested_kind)
+                if stale_clusters is not None:
+                    clusters.extend(
+                        self._deserialize_unknown_cluster(entry)
+                        for entry in stale_clusters
+                    )
+                    continue
             self._ensure_state_loaded()
             built_clusters = self._build_unknown_clusters(requested_kind)
             self.store.save_cached_unknown_clusters(
@@ -613,19 +636,21 @@ class LibraryService:
     def items_for_unknown_clusters(
         self,
         clusters: Iterable[UnknownPersonaCluster],
+        limit: int | None = None,
     ) -> list[MediaItem]:
         item_ids: set[str] = set()
         for cluster in clusters:
             item_ids.update(cluster.item_ids)
         if not self._state_loaded:
-            items = self.store.load_items_by_ids(sorted(item_ids))
+            items = self.store.query_items_by_ids(sorted(item_ids), limit=limit)
         else:
             items = [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
-        return sorted(
+        ranked_items = sorted(
             items,
             key=lambda item: (self._item_datetime(item), item.modified_ts),
             reverse=True,
         )
+        return ranked_items if limit is None else ranked_items[:limit]
 
     def build_item_details(self, item: MediaItem) -> str:
         personas = ", ".join(persona.name for persona in self.personas_for_item(item)) or "None"
@@ -646,10 +671,16 @@ class LibraryService:
         video_ai_frames = item.metadata.get("video_ai_frames_analyzed")
         if video_ai_frames:
             lines.append(f"Video AI frames: {video_ai_frames}")
+        human_face_detector_model = item.metadata.get("human_face_detector_model")
+        human_face_recognizer_model = item.metadata.get("human_face_recognizer_model")
         human_face_device = item.metadata.get("human_face_device")
         object_device = item.metadata.get("object_device")
         pet_face_device = item.metadata.get("pet_face_device")
         pet_embedding_device = item.metadata.get("pet_embedding_device")
+        if human_face_detector_model:
+            lines.append(f"Human Face Detector: {human_face_detector_model}")
+        if human_face_recognizer_model:
+            lines.append(f"Human Face Recognizer: {human_face_recognizer_model}")
         if human_face_device:
             lines.append(f"Human Face Device: {human_face_device}")
         if object_device:
@@ -1151,12 +1182,12 @@ class LibraryService:
 
     def _prepare_batch(
         self,
-        entries: list[tuple[str, MediaAssetSpec, MediaItem | None]],
+        entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]],
         executor: ThreadPoolExecutor,
     ) -> list[PreparedSyncItem]:
         futures: list[Future[PreparedSyncItem]] = [
-            executor.submit(self._prepare_sync_item, spec, existing)
-            for _, spec, existing in entries
+            executor.submit(self._prepare_sync_item, spec, existing, analysis_mode=analysis_mode)
+            for _, spec, existing, analysis_mode in entries
         ]
         return [future.result() for future in futures]
 
@@ -1164,6 +1195,8 @@ class LibraryService:
         self,
         spec: MediaAssetSpec,
         existing: MediaItem | None,
+        *,
+        analysis_mode: str = "full",
     ) -> PreparedSyncItem:
         still_image: Image.Image | None = None
         video_frames: list[VideoFrameSample] = []
@@ -1184,6 +1217,7 @@ class LibraryService:
         return PreparedSyncItem(
             spec=spec,
             existing=existing,
+            analysis_mode=analysis_mode,
             metadata=metadata,
             thumbnail_path=thumbnail_path,
             still_image=still_image,
@@ -1195,21 +1229,43 @@ class LibraryService:
         if not prepared_items:
             return []
 
-        analyses = self.vision.analyze_batch(
-            [
-                PreparedAssetInput(
-                    spec=prepared.spec,
-                    still_image=None if prepared.spec.media_kind == "video" else prepared.still_image,
-                    video_frames=prepared.video_frames,
-                    video_metadata=prepared.video_metadata,
-                )
-                for prepared in prepared_items
+        analyses: list[AnalysisResult | None] = [None] * len(prepared_items)
+        for analysis_mode in ("full", "human_faces_only"):
+            batch_indices = [
+                index
+                for index, prepared in enumerate(prepared_items)
+                if prepared.analysis_mode == analysis_mode
             ]
-        )
-        return [
-            self._build_item_from_prepared_analysis(prepared, analysis)
-            for prepared, analysis in zip(prepared_items, analyses, strict=False)
-        ]
+            if not batch_indices:
+                continue
+            batch_analyses = self.vision.analyze_batch(
+                [
+                    PreparedAssetInput(
+                        spec=prepared_items[index].spec,
+                        still_image=(
+                            None
+                            if prepared_items[index].spec.media_kind == "video"
+                            else prepared_items[index].still_image
+                        ),
+                        video_frames=prepared_items[index].video_frames,
+                        video_metadata=prepared_items[index].video_metadata,
+                    )
+                    for index in batch_indices
+                ],
+                analysis_mode=analysis_mode,
+            )
+            for item_index, analysis in zip(batch_indices, batch_analyses, strict=False):
+                analyses[item_index] = analysis
+
+        built_items: list[MediaItem] = []
+        for prepared, analysis in zip(prepared_items, analyses, strict=False):
+            if analysis is None:
+                raise RuntimeError("Missing analysis result for prepared media item.")
+            if prepared.analysis_mode == "human_faces_only":
+                built_items.append(self._build_item_from_face_reanalysis(prepared, analysis))
+            else:
+                built_items.append(self._build_item_from_prepared_analysis(prepared, analysis))
+        return built_items
 
     def _build_item_from_prepared_analysis(
         self,
@@ -1255,6 +1311,70 @@ class LibraryService:
             ],
             notes=existing.notes if existing else "",
             metadata=metadata["metadata"] | analysis.metadata,
+        )
+        self._merge_detection_assignments(item, existing)
+        self._auto_assign_personas(item)
+        return item
+
+    def _build_item_from_face_reanalysis(
+        self,
+        prepared: PreparedSyncItem,
+        analysis: AnalysisResult,
+    ) -> MediaItem:
+        existing = prepared.existing
+        if existing is None:
+            return self._build_item_from_prepared_analysis(prepared, analysis)
+
+        metadata = prepared.metadata
+        tags = set(existing.tags)
+        tags.discard("face")
+        tags.discard("person")
+        if analysis.detections:
+            tags.update({"face", "person"})
+
+        preserved_detections = [
+            self._clone_detection_region(detection)
+            for detection in existing.detections
+            if detection.kind != "face"
+        ]
+        face_metadata = {
+            key: value
+            for key, value in analysis.metadata.items()
+            if key.startswith("human_face_") or key in {"analyzed_width", "analyzed_height"}
+        }
+        preserved_metadata = {
+            key: value
+            for key, value in existing.metadata.items()
+            if not key.startswith("human_face_")
+        }
+        item = MediaItem(
+            id=existing.id,
+            path=existing.path,
+            component_paths=list(existing.component_paths),
+            relative_key=existing.relative_key,
+            title=existing.title,
+            media_kind=existing.media_kind,
+            extension=existing.extension,
+            file_signature=existing.file_signature,
+            size_bytes=existing.size_bytes,
+            modified_ts=existing.modified_ts,
+            captured_at=str(metadata.get("captured_at", existing.captured_at)),
+            discovered_at=existing.discovered_at,
+            thumbnail_path=existing.thumbnail_path,
+            width=int(metadata.get("width", existing.width)),
+            height=int(metadata.get("height", existing.height)),
+            duration_seconds=float(metadata.get("duration_seconds", existing.duration_seconds)),
+            favorite=existing.favorite,
+            hidden=existing.hidden,
+            tags=sorted(tags),
+            detections=[*analysis.detections, *preserved_detections],
+            manual_persona_ids=[
+                persona_id
+                for persona_id in existing.manual_persona_ids
+                if persona_id in self.state.personas
+            ],
+            notes=existing.notes,
+            metadata=preserved_metadata | face_metadata,
         )
         self._merge_detection_assignments(item, existing)
         self._auto_assign_personas(item)
@@ -1326,6 +1446,18 @@ class LibraryService:
         image.save(cache_path, format="JPEG", quality=88)
         return str(cache_path)
 
+    def _clone_detection_region(self, detection: DetectionRegion) -> DetectionRegion:
+        return DetectionRegion(
+            id=detection.id,
+            kind=detection.kind,
+            label=detection.label,
+            confidence=detection.confidence,
+            bbox=list(detection.bbox),
+            persona_id=detection.persona_id,
+            encoding=list(detection.encoding),
+            signature=detection.signature,
+        )
+
     def _merge_detection_assignments(
         self,
         item: MediaItem,
@@ -1334,10 +1466,21 @@ class LibraryService:
         if not existing:
             return
         existing_regions = {region.id: region for region in existing.detections}
+        matched_region_ids: set[str] = set()
         for detection in item.detections:
             prior = existing_regions.get(detection.id)
             if prior and prior.persona_id in self.state.personas:
                 detection.persona_id = prior.persona_id
+                matched_region_ids.add(prior.id)
+                continue
+            prior = self._best_previous_detection_match(
+                detection,
+                existing.detections,
+                matched_region_ids,
+            )
+            if prior and prior.persona_id in self.state.personas:
+                detection.persona_id = prior.persona_id
+                matched_region_ids.add(prior.id)
 
     def _auto_assign_personas(self, item: MediaItem) -> None:
         for detection in item.detections:
@@ -1373,6 +1516,136 @@ class LibraryService:
         if best_distance <= self.config.face_match_threshold:
             return best_persona_id
         return None
+
+    def _reanalysis_mode(self, item: MediaItem | None) -> str:
+        if item is None:
+            return "full"
+        if self.config.face_recognition_enabled:
+            recorded_revision = str(item.metadata.get("human_face_pipeline", ""))
+            current_revision = self._current_human_face_pipeline_revision()
+            if current_revision and recorded_revision != current_revision:
+                return "human_faces_only"
+        return "none"
+
+    def _current_human_face_pipeline_revision(self) -> str:
+        if not self.config.face_recognition_enabled:
+            return ""
+        detector_name, recognizer_name = self._resolved_human_face_model_names()
+        if not detector_name or not recognizer_name:
+            return ""
+        return VisionAnalyzer.human_face_pipeline_revision(
+            detector_name=detector_name,
+            recognizer_name=recognizer_name,
+        )
+
+    def _resolved_human_face_model_names(self) -> tuple[str, str]:
+        detector_name = ""
+        recognizer_name = ""
+
+        explicit_detector = Path(self.config.human_face_detector_path).expanduser() if self.config.human_face_detector_path else None
+        if explicit_detector and explicit_detector.exists():
+            detector_name = explicit_detector.name
+        else:
+            detector_name = self._resolve_detector_name_from_model(self.config.human_face_detector_model_id)
+            if not detector_name:
+                detector_name = self._resolve_detector_name_from_model(self.config.human_face_model_id)
+
+        recognizer_name = self._resolve_recognizer_name_from_model(self.config.human_face_model_id)
+        return detector_name, recognizer_name
+
+    def _resolve_detector_name_from_model(self, model_id: str) -> str:
+        status = self.model_manager.status(model_id)
+        if not status.installed:
+            return ""
+        model_path = Path(status.local_path)
+        if model_path.is_file():
+            return model_path.name
+        for candidate_name in ("scrfd_10g_bnkps.onnx", "det_500m.onnx"):
+            candidate_path = model_path / candidate_name
+            if candidate_path.exists():
+                return candidate_path.name
+        return ""
+
+    def _resolve_recognizer_name_from_model(self, model_id: str) -> str:
+        status = self.model_manager.status(model_id)
+        if not status.installed:
+            return ""
+        model_path = Path(status.local_path)
+        if model_path.is_file():
+            return model_path.name
+        for candidate_name in ("w600k_mbf.onnx", "glintr100.onnx"):
+            candidate_path = model_path / candidate_name
+            if candidate_path.exists():
+                return candidate_path.name
+        return ""
+
+    def _best_previous_detection_match(
+        self,
+        detection: DetectionRegion,
+        prior_detections: list[DetectionRegion],
+        matched_region_ids: set[str],
+    ) -> DetectionRegion | None:
+        best_candidate: DetectionRegion | None = None
+        best_score = -1.0
+        for prior in prior_detections:
+            if prior.id in matched_region_ids:
+                continue
+            if prior.kind != detection.kind:
+                continue
+
+            score = -1.0
+            if detection.kind == "face":
+                if detection.encoding and prior.encoding:
+                    similarity = self._cosine_similarity(detection.encoding, prior.encoding)
+                    if similarity >= 0.50:
+                        score = 2.0 + similarity
+                elif detection.signature and prior.signature:
+                    distance = self._signature_distance(detection.signature, prior.signature)
+                    if distance <= 10:
+                        score = 1.5 - (distance / 20.0)
+            elif self._is_pet_detection(detection) and self._is_pet_detection(prior):
+                if detection.encoding and prior.encoding:
+                    similarity = self._cosine_similarity(detection.encoding, prior.encoding)
+                    if similarity >= 0.60:
+                        score = 2.0 + similarity
+                elif detection.signature and prior.signature:
+                    distance = self._signature_distance(detection.signature, prior.signature)
+                    if distance <= 10:
+                        score = 1.5 - (distance / 20.0)
+
+            iou_score = self._iou(detection.bbox, prior.bbox)
+            if iou_score >= 0.55:
+                score = max(score, 1.0 + iou_score)
+
+            if score > best_score:
+                best_score = score
+                best_candidate = prior
+        return best_candidate
+
+    def _iou(self, left_bbox: list[int], right_bbox: list[int]) -> float:
+        left_x1, left_y1, left_width, left_height = left_bbox
+        right_x1, right_y1, right_width, right_height = right_bbox
+        left_x2 = left_x1 + left_width
+        left_y2 = left_y1 + left_height
+        right_x2 = right_x1 + right_width
+        right_y2 = right_y1 + right_height
+
+        inter_x1 = max(left_x1, right_x1)
+        inter_y1 = max(left_y1, right_y1)
+        inter_x2 = min(left_x2, right_x2)
+        inter_y2 = min(left_y2, right_y2)
+        inter_width = max(0, inter_x2 - inter_x1)
+        inter_height = max(0, inter_y2 - inter_y1)
+        if inter_width == 0 or inter_height == 0:
+            return 0.0
+
+        intersection = inter_width * inter_height
+        left_area = max(1, left_width * left_height)
+        right_area = max(1, right_width * right_height)
+        union = left_area + right_area - intersection
+        if union <= 0:
+            return 0.0
+        return intersection / union
 
     def _match_pet_to_persona(self, embedding: list[float], signature: str | None) -> str | None:
         if embedding:
@@ -2239,7 +2512,7 @@ class LibraryService:
 
     def _batch_detail(
         self,
-        entries: list[tuple[str, MediaAssetSpec, MediaItem | None]],
+        entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]],
     ) -> str:
         if not entries:
             return ""

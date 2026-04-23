@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QIcon, QMovie, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -50,6 +50,8 @@ def _load_multimedia_backend():
 
 
 class MediaGridWidget(QWidget):
+    POPULATE_CHUNK_SIZE = 96
+
     selectionChanged = Signal(list)
 
     def __init__(self, service: LibraryService, parent: QWidget | None = None) -> None:
@@ -68,6 +70,13 @@ class MediaGridWidget(QWidget):
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_widget.currentItemChanged.connect(self._update_preview)
         self.list_widget.itemSelectionChanged.connect(self._emit_selection)
+        self._placeholder_icon = self.style().standardIcon(QStyle.SP_FileIcon)
+        self._pending_items: list[MediaItem] = []
+        self._populate_cursor = 0
+        self._pending_previous_item_id = ""
+        self._populate_timer = QTimer(self)
+        self._populate_timer.setSingleShot(True)
+        self._populate_timer.timeout.connect(self._populate_next_chunk)
 
         self.preview_label = QLabel("Select a media item")
         self.preview_label.setAlignment(Qt.AlignCenter)
@@ -124,34 +133,26 @@ class MediaGridWidget(QWidget):
         previous_item_id = self.current_item_id()
         self._items = {item.id: item for item in items}
         self._clear_preview_media()
+        self._populate_timer.stop()
         self.list_widget.clear()
+        self._pending_items = list(items)
+        self._populate_cursor = 0
+        self._pending_previous_item_id = previous_item_id
 
-        placeholder_icon = self.style().standardIcon(QStyle.SP_FileIcon)
-        for item in items:
-            icon = placeholder_icon
-            thumbnail_path = Path(item.thumbnail_path)
-            if item.thumbnail_path and thumbnail_path.exists():
-                icon = QIcon(str(thumbnail_path))
-            list_item = QListWidgetItem(icon, item.title)
-            list_item.setData(Qt.UserRole, item.id)
-            list_item.setToolTip(item.path)
-            self.list_widget.addItem(list_item)
-
-        if previous_item_id:
-            for index in range(self.list_widget.count()):
-                list_item = self.list_widget.item(index)
-                if str(list_item.data(Qt.UserRole)) == previous_item_id:
-                    self.list_widget.setCurrentItem(list_item)
-                    break
-
-        if not self.list_widget.currentItem():
+        if not items:
             self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText(
-                "No media items match the current view" if not items else "Select a media item"
-            )
+            self.preview_label.setText("No media items match the current view")
             self.preview_stack.setCurrentWidget(self.preview_label)
             self.video_toggle_button.setVisible(False)
             self.details.setText("")
+            return
+
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText(f"Loading {len(items)} media items...")
+        self.preview_stack.setCurrentWidget(self.preview_label)
+        self.video_toggle_button.setVisible(False)
+        self.details.setText("")
+        self._populate_timer.start(0)
 
     def current_item_id(self) -> str:
         current = self.list_widget.currentItem()
@@ -298,3 +299,40 @@ class MediaGridWidget(QWidget):
             self.media_player = None
             self.audio_output = None
             return False
+
+    def _populate_next_chunk(self) -> None:
+        end_index = min(
+            len(self._pending_items),
+            self._populate_cursor + self.POPULATE_CHUNK_SIZE,
+        )
+        for item in self._pending_items[self._populate_cursor:end_index]:
+            icon = self._placeholder_icon
+            thumbnail_path = Path(item.thumbnail_path)
+            if item.thumbnail_path and thumbnail_path.exists():
+                icon = QIcon(str(thumbnail_path))
+            list_item = QListWidgetItem(icon, item.title)
+            list_item.setData(Qt.UserRole, item.id)
+            list_item.setToolTip(item.path)
+            self.list_widget.addItem(list_item)
+
+        self._populate_cursor = end_index
+        if self._populate_cursor < len(self._pending_items):
+            self.preview_label.setText(
+                f"Loading {self._populate_cursor} / {len(self._pending_items)} media items..."
+            )
+            self._populate_timer.start(0)
+            return
+
+        if self._pending_previous_item_id:
+            for index in range(self.list_widget.count()):
+                list_item = self.list_widget.item(index)
+                if str(list_item.data(Qt.UserRole)) == self._pending_previous_item_id:
+                    self.list_widget.setCurrentItem(list_item)
+                    break
+
+        if not self.list_widget.currentItem():
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Select a media item")
+            self.preview_stack.setCurrentWidget(self.preview_label)
+            self.video_toggle_button.setVisible(False)
+            self.details.setText("")

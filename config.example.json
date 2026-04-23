@@ -23,6 +23,9 @@
   "memory_min_items": 6,
   "object_model_path": "",
   "object_model_id": "ultralytics_yolo11n",
+  "human_face_detector_model_id": "insightface_antelope",
+  "human_face_detector_path": "",
+  "human_face_detector_backend": "auto",
   "human_face_model_id": "insightface_buffalo_sc",
   "pet_detector_model_id": "lostpet_yolov7_pet_face",
   "pet_embedding_model_id": "avito_dinov2_small_petface"

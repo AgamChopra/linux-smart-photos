@@ -31,6 +31,12 @@ from .dialogs import AlbumDialog, AssignPersonaDialog, CorrectionsDialog
 from .widgets import MediaGridWidget
 
 
+LIVE_LIBRARY_ITEM_LIMIT = 480
+PAGE_ITEM_PREVIEW_LIMIT = 720
+CLUSTER_RENDER_CHUNK_SIZE = 128
+LIVE_REFRESH_INTERVAL_MS = 600
+
+
 class BackgroundTaskWorker(QObject):
     progress = Signal(object)
     completed = Signal(object)
@@ -92,6 +98,56 @@ class BackgroundTaskWorker(QObject):
 
     def _emit_progress(self, update: ProgressUpdate) -> None:
         self.progress.emit(update)
+
+
+class UnknownClustersWorker(QObject):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: AppConfig, kind: str) -> None:
+        super().__init__()
+        self.config = config
+        self.kind = kind
+
+    def run(self) -> None:
+        try:
+            service = LibraryService(self.config)
+            clusters = service.list_unknown_persona_clusters(
+                kind=self.kind,
+                allow_stale_cache=True,
+            )
+            self.completed.emit(clusters)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ItemLoadWorker(QObject):
+    completed = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, config: AppConfig, request_id: int, mode: str, payload: Any) -> None:
+        super().__init__()
+        self.config = config
+        self.request_id = request_id
+        self.mode = mode
+        self.payload = payload
+
+    def run(self) -> None:
+        try:
+            service = LibraryService(self.config)
+            if self.mode == "persona":
+                items = service.items_for_persona(str(self.payload), limit=PAGE_ITEM_PREVIEW_LIMIT)
+            elif self.mode == "unknown_clusters":
+                items = service.items_for_unknown_clusters(self.payload, limit=PAGE_ITEM_PREVIEW_LIMIT)
+            elif self.mode == "album":
+                items = service.items_for_album(str(self.payload), limit=PAGE_ITEM_PREVIEW_LIMIT)
+            elif self.mode == "memory":
+                items = service.items_for_memory(str(self.payload), limit=PAGE_ITEM_PREVIEW_LIMIT)
+            else:
+                raise ValueError(f"Unsupported item load mode: {self.mode}")
+            self.completed.emit(self.request_id, items)
+        except Exception as exc:
+            self.failed.emit(self.request_id, str(exc))
 
 
 class LibraryPage(QWidget):
@@ -175,13 +231,14 @@ class LibraryPage(QWidget):
         self.persona_filter.setCurrentIndex(max(index, 0))
         self.persona_filter.blockSignals(False)
 
-    def refresh(self, *_args) -> None:
+    def refresh(self, *_args, limit: int | None = None) -> None:
         items = self.service.search_items(
             query=self.search_box.text(),
             media_kind=str(self.type_filter.currentData()),
             persona_kind=str(self.kind_filter.currentData()),
             persona_id=str(self.persona_filter.currentData()),
             favorites_only=self.favorites_only.isChecked(),
+            limit=limit,
         )
         self.grid.set_items(items)
 
@@ -232,6 +289,10 @@ class PeoplePage(QWidget):
         super().__init__()
         self.service = service
         self.owner = owner
+        self._items_thread: QThread | None = None
+        self._items_worker: ItemLoadWorker | None = None
+        self._pending_item_request: tuple[int, str] | None = None
+        self._latest_item_request_id = 0
 
         self.kind_filter = QComboBox()
         self.kind_filter.addItem("All Personas", "all")
@@ -282,7 +343,7 @@ class PeoplePage(QWidget):
         outer_layout.addWidget(left_panel)
         outer_layout.addWidget(right_panel, 1)
 
-    def refresh(self, *_args) -> None:
+    def refresh(self, *_args, load_items: bool = True) -> None:
         selected_id = self._current_persona_id()
         self.persona_list.blockSignals(True)
         self.persona_list.clear()
@@ -295,12 +356,16 @@ class PeoplePage(QWidget):
         self.persona_list.blockSignals(False)
         if self.persona_list.count() and not self.persona_list.currentItem():
             self.persona_list.setCurrentRow(0)
-        self._show_persona_items()
+        if load_items:
+            self._show_persona_items()
 
     def _show_persona_items(self, *_args) -> None:
         persona_id = self._current_persona_id()
         self._show_reference_images(persona_id)
-        self.grid.set_items(self.service.items_for_persona(persona_id) if persona_id else [])
+        if not persona_id:
+            self.grid.set_items([])
+            return
+        self._queue_item_load(persona_id)
 
     def _show_reference_images(self, persona_id: str) -> None:
         references = self.service.persona_reference_images(persona_id) if persona_id else []
@@ -351,6 +416,52 @@ class PeoplePage(QWidget):
             return ""
         return str(current.data(Qt.UserRole))
 
+    def _queue_item_load(self, persona_id: str) -> None:
+        self._latest_item_request_id += 1
+        self._pending_item_request = (self._latest_item_request_id, persona_id)
+        if self._items_thread is None:
+            self._start_next_item_request()
+
+    def _start_next_item_request(self) -> None:
+        if self._pending_item_request is None or self._items_thread is not None:
+            return
+        request_id, persona_id = self._pending_item_request
+        self._pending_item_request = None
+
+        thread = QThread(self)
+        worker = ItemLoadWorker(self.service.config, request_id, "persona", persona_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_items_loaded)
+        worker.failed.connect(self._handle_items_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_item_handles)
+
+        self._items_thread = thread
+        self._items_worker = worker
+        thread.start()
+
+    def _handle_items_loaded(self, request_id: int, payload: Any) -> None:
+        if request_id != self._latest_item_request_id:
+            return
+        items = payload if isinstance(payload, list) else []
+        self.grid.set_items(items)
+
+    def _handle_items_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._latest_item_request_id:
+            return
+        QMessageBox.warning(self, "Persona Items", f"Unable to load persona items: {message}")
+
+    def _clear_item_handles(self) -> None:
+        self._items_thread = None
+        self._items_worker = None
+        if self._pending_item_request is not None:
+            QTimer.singleShot(0, self._start_next_item_request)
+
     def set_busy(self, busy: bool) -> None:
         self.new_persona_button.setEnabled(not busy)
         self.correct_button.setEnabled(not busy)
@@ -362,6 +473,20 @@ class UnknownClustersPage(QWidget):
         self.service = service
         self.owner = owner
         self._clusters_by_id: dict[str, UnknownPersonaCluster] = {}
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker: UnknownClustersWorker | None = None
+        self._refresh_pending = False
+        self._refresh_kind = "all"
+        self._pending_render_clusters: list[UnknownPersonaCluster] = []
+        self._pending_selected_cluster_ids: set[str] = set()
+        self._render_cursor = 0
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_next_cluster_chunk)
+        self._items_thread: QThread | None = None
+        self._items_worker: ItemLoadWorker | None = None
+        self._pending_item_request: tuple[int, list[UnknownPersonaCluster], str, int] | None = None
+        self._latest_item_request_id = 0
 
         self.kind_filter = QComboBox()
         self.kind_filter.addItem("All Unknown", "all")
@@ -408,27 +533,34 @@ class UnknownClustersPage(QWidget):
         outer_layout.addWidget(right_panel, 1)
 
     def refresh(self, *_args) -> None:
-        selected_ids = {str(item.data(Qt.UserRole)) for item in self.cluster_list.selectedItems()}
-        clusters = self.service.list_unknown_persona_clusters(kind=str(self.kind_filter.currentData()))
-        self._clusters_by_id = {cluster.id: cluster for cluster in clusters}
+        self._refresh_kind = str(self.kind_filter.currentData())
+        if self._refresh_thread is not None:
+            self._refresh_pending = True
+            return
 
-        self.cluster_list.blockSignals(True)
-        self.cluster_list.clear()
-        for index, cluster in enumerate(clusters, start=1):
-            title = self._cluster_title(cluster, index)
-            icon = QIcon(cluster.preview_path) if cluster.preview_path else QIcon()
-            item = QListWidgetItem(icon, title)
-            item.setData(Qt.UserRole, cluster.id)
-            item.setToolTip(self._cluster_tooltip(cluster))
-            self.cluster_list.addItem(item)
-            if cluster.id in selected_ids:
-                item.setSelected(True)
-        self.cluster_list.blockSignals(False)
+        if self.cluster_list.count():
+            self.summary.setText("Refreshing unknown clusters in the background...")
+        else:
+            self.summary.setText("Loading unknown clusters...")
+            self.cluster_list.setEnabled(False)
+        self.refresh_button.setEnabled(False)
 
-        if not self.cluster_list.selectedItems() and self.cluster_list.count():
-            self.cluster_list.item(0).setSelected(True)
-            self.cluster_list.setCurrentRow(0)
-        self._show_selected_clusters()
+        thread = QThread(self)
+        worker = UnknownClustersWorker(self.service.config, self._refresh_kind)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_refresh_completed)
+        worker.failed.connect(self._handle_refresh_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_refresh_handles)
+
+        self._refresh_thread = thread
+        self._refresh_worker = worker
+        thread.start()
 
     def _show_selected_clusters(self, *_args) -> None:
         clusters = self._selected_clusters()
@@ -441,9 +573,8 @@ class UnknownClustersPage(QWidget):
             self.grid.set_items([])
             return
 
-        items = self.service.items_for_unknown_clusters(clusters)
         total_members = sum(cluster.member_count for cluster in clusters)
-        total_items = len({item.id for item in items})
+        total_items = len({item_id for cluster in clusters for item_id in cluster.item_ids})
         cluster_names = ", ".join(self._cluster_kind_name(cluster) for cluster in clusters[:4])
         if len(clusters) > 4:
             cluster_names = f"{cluster_names}, ..."
@@ -453,7 +584,16 @@ class UnknownClustersPage(QWidget):
             f"Items: {total_items}\n"
             f"Types: {cluster_names or 'unknown'}"
         )
-        self.grid.set_items(items)
+        self._queue_item_load(
+            clusters,
+            summary_text=(
+                f"Selected clusters: {len(clusters)}\n"
+                f"Detections: {total_members}\n"
+                f"Items: {total_items}\n"
+                f"Types: {cluster_names or 'unknown'}"
+            ),
+            total_items=total_items,
+        )
 
     def _assign_selected_clusters(self, *_args) -> None:
         clusters = self._selected_clusters()
@@ -532,10 +672,148 @@ class UnknownClustersPage(QWidget):
         return cluster.label or "pet"
 
     def set_busy(self, busy: bool) -> None:
-        self.kind_filter.setEnabled(not busy)
-        self.refresh_button.setEnabled(not busy)
+        self.refresh_button.setEnabled(self._refresh_thread is None)
         self.assign_button.setEnabled(not busy)
         self.review_button.setEnabled(not busy)
+
+    def _handle_refresh_completed(self, payload: Any) -> None:
+        clusters = payload if isinstance(payload, list) else []
+        selected_ids = {str(item.data(Qt.UserRole)) for item in self.cluster_list.selectedItems()}
+        self._clusters_by_id = {cluster.id: cluster for cluster in clusters if isinstance(cluster, UnknownPersonaCluster)}
+        self._pending_render_clusters = [
+            cluster for cluster in clusters if isinstance(cluster, UnknownPersonaCluster)
+        ]
+        self._pending_selected_cluster_ids = selected_ids
+        self._render_cursor = 0
+        self.cluster_list.blockSignals(True)
+        self.cluster_list.clear()
+        self.cluster_list.blockSignals(False)
+        self.summary.setText(f"Rendering {len(self._pending_render_clusters)} unknown clusters...")
+        self._render_timer.start(0)
+
+    def _handle_refresh_failed(self, message: str) -> None:
+        self.cluster_list.setEnabled(True)
+        self.refresh_button.setEnabled(True)
+        self.summary.setText(f"Unable to load unknown clusters: {message}")
+
+    def _clear_refresh_handles(self) -> None:
+        self._refresh_thread = None
+        self._refresh_worker = None
+        if self._refresh_pending:
+            self._refresh_pending = False
+            QTimer.singleShot(0, self.refresh)
+
+    def _render_next_cluster_chunk(self) -> None:
+        if self._render_cursor >= len(self._pending_render_clusters):
+            self.cluster_list.setEnabled(True)
+            self.refresh_button.setEnabled(True)
+            if not self.cluster_list.selectedItems() and self.cluster_list.count():
+                self.cluster_list.item(0).setSelected(True)
+                self.cluster_list.setCurrentRow(0)
+            self._show_selected_clusters()
+            return
+
+        batch = self._pending_render_clusters[
+            self._render_cursor : self._render_cursor + CLUSTER_RENDER_CHUNK_SIZE
+        ]
+        self.cluster_list.blockSignals(True)
+        for cluster in batch:
+            index = self._render_cursor + 1
+            title = self._cluster_title(cluster, index)
+            icon = QIcon(cluster.preview_path) if cluster.preview_path else QIcon()
+            item = QListWidgetItem(icon, title)
+            item.setData(Qt.UserRole, cluster.id)
+            item.setToolTip(self._cluster_tooltip(cluster))
+            self.cluster_list.addItem(item)
+            if cluster.id in self._pending_selected_cluster_ids:
+                item.setSelected(True)
+            self._render_cursor += 1
+        self.cluster_list.blockSignals(False)
+        self.summary.setText(
+            f"Rendering {len(self._pending_render_clusters)} unknown clusters..."
+            f" ({self._render_cursor}/{len(self._pending_render_clusters)})"
+        )
+        self._render_timer.start(0)
+
+    def _queue_item_load(
+        self,
+        clusters: list[UnknownPersonaCluster],
+        *,
+        summary_text: str,
+        total_items: int,
+    ) -> None:
+        self._latest_item_request_id += 1
+        self._pending_item_request = (
+            self._latest_item_request_id,
+            clusters,
+            summary_text,
+            total_items,
+        )
+        if self._items_thread is None:
+            self._start_next_item_request()
+
+    def _start_next_item_request(self) -> None:
+        if self._pending_item_request is None or self._items_thread is not None:
+            return
+        request_id, clusters, summary_text, total_items = self._pending_item_request
+        self._pending_item_request = None
+        self.summary.setText(
+            f"{summary_text}\nShowing latest items while the background load completes..."
+        )
+
+        thread = QThread(self)
+        worker = ItemLoadWorker(self.service.config, request_id, "unknown_clusters", clusters)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda completed_request_id, payload: self._handle_item_load_completed(
+                completed_request_id,
+                payload,
+                summary_text=summary_text,
+                total_items=total_items,
+            )
+        )
+        worker.failed.connect(self._handle_item_load_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_item_handles)
+
+        self._items_thread = thread
+        self._items_worker = worker
+        thread.start()
+
+    def _handle_item_load_completed(
+        self,
+        request_id: int,
+        payload: Any,
+        *,
+        summary_text: str,
+        total_items: int,
+    ) -> None:
+        if request_id != self._latest_item_request_id:
+            return
+        items = payload if isinstance(payload, list) else []
+        self.grid.set_items(items)
+        if total_items > len(items):
+            self.summary.setText(
+                f"{summary_text}\nShowing latest {len(items)} of {total_items} items."
+            )
+        else:
+            self.summary.setText(summary_text)
+
+    def _handle_item_load_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._latest_item_request_id:
+            return
+        QMessageBox.warning(self, "Unknown Clusters", f"Unable to load cluster items: {message}")
+
+    def _clear_item_handles(self) -> None:
+        self._items_thread = None
+        self._items_worker = None
+        if self._pending_item_request is not None:
+            QTimer.singleShot(0, self._start_next_item_request)
 
 
 class AlbumsPage(QWidget):
@@ -567,7 +845,7 @@ class AlbumsPage(QWidget):
         outer_layout.addWidget(left_panel)
         outer_layout.addWidget(self.grid, 1)
 
-    def refresh(self, *_args) -> None:
+    def refresh(self, *_args, load_items: bool = True) -> None:
         selected_id = self._current_album_id()
         self.album_list.blockSignals(True)
         self.album_list.clear()
@@ -580,7 +858,8 @@ class AlbumsPage(QWidget):
         self.album_list.blockSignals(False)
         if self.album_list.count() and not self.album_list.currentItem():
             self.album_list.setCurrentRow(0)
-        self._show_album_items()
+        if load_items:
+            self._show_album_items()
 
     def _show_album_items(self, *_args) -> None:
         album_id = self._current_album_id()
@@ -646,7 +925,7 @@ class MemoriesPage(QWidget):
         outer_layout.addWidget(left_panel)
         outer_layout.addWidget(right_panel, 1)
 
-    def refresh(self, *_args) -> None:
+    def refresh(self, *_args, load_items: bool = True) -> None:
         selected_id = self._current_memory_id()
         self.memory_list.blockSignals(True)
         self.memory_list.clear()
@@ -659,7 +938,8 @@ class MemoriesPage(QWidget):
         self.memory_list.blockSignals(False)
         if self.memory_list.count() and not self.memory_list.currentItem():
             self.memory_list.setCurrentRow(0)
-        self._show_memory_items()
+        if load_items:
+            self._show_memory_items()
 
     def _show_memory_items(self, *_args) -> None:
         memory_id = self._current_memory_id()
@@ -796,7 +1076,12 @@ class MainWindow(QMainWindow):
         self._task_worker: BackgroundTaskWorker | None = None
         self._active_task = ""
         self._live_refresh_pending = False
+        self._library_dirty = False
+        self._people_dirty = False
         self._unknown_clusters_dirty = True
+        self._albums_dirty = False
+        self._memories_dirty = False
+        self._models_dirty = False
         self.setWindowTitle("Linux Smart Photos")
         self.resize(1560, 980)
 
@@ -828,18 +1113,35 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._finish_startup)
 
     def _finish_startup(self) -> None:
-        self.refresh_views(refresh_unknown=False)
+        self.refresh_views(refresh_unknown=False, library_limit=LIVE_LIBRARY_ITEM_LIMIT)
         QTimer.singleShot(0, self._start_startup_tasks)
 
-    def refresh_views(self, refresh_unknown: bool | None = None) -> None:
+    def refresh_views(
+        self,
+        refresh_unknown: bool | None = None,
+        library_limit: int | None = None,
+    ) -> None:
+        current_widget = self.tabs.currentWidget()
         self.library_page._refresh_persona_filter()
-        self.library_page.refresh()
-        self.people_page.refresh()
-        self.albums_page.refresh()
-        self.memories_page.refresh()
+        if current_widget is self.library_page:
+            self.library_page.refresh(limit=library_limit)
+            self._library_dirty = False
+        else:
+            self._library_dirty = True
+
+        self.people_page.refresh(load_items=current_widget is self.people_page)
+        self._people_dirty = current_widget is not self.people_page
+
+        self.albums_page.refresh(load_items=current_widget is self.albums_page)
+        self._albums_dirty = current_widget is not self.albums_page
+
+        self.memories_page.refresh(load_items=current_widget is self.memories_page)
+        self._memories_dirty = current_widget is not self.memories_page
+
         self.models_page.refresh()
+        self._models_dirty = False
         should_refresh_unknown = (
-            self.tabs.currentWidget() is self.unknown_clusters_page
+            current_widget is self.unknown_clusters_page
             if refresh_unknown is None
             else refresh_unknown
         )
@@ -850,14 +1152,30 @@ class MainWindow(QMainWindow):
             self._unknown_clusters_dirty = True
 
     def refresh_live_views(self) -> None:
-        self.library_page._refresh_persona_filter()
-        self.library_page.refresh()
-        self.people_page.refresh()
-        if self.tabs.currentWidget() is self.unknown_clusters_page:
+        current_widget = self.tabs.currentWidget()
+
+        if current_widget is self.library_page:
+            self.library_page._refresh_persona_filter()
+            self.library_page.refresh(limit=LIVE_LIBRARY_ITEM_LIMIT)
+            self._library_dirty = False
+        else:
+            self._library_dirty = True
+
+        if current_widget is self.people_page:
+            self.people_page.refresh()
+            self._people_dirty = False
+        else:
+            self._people_dirty = True
+
+        if current_widget is self.unknown_clusters_page:
             self.unknown_clusters_page.refresh()
             self._unknown_clusters_dirty = False
         else:
             self._unknown_clusters_dirty = True
+
+        self._albums_dirty = True
+        self._memories_dirty = True
+        self._models_dirty = True
 
     def _start_startup_tasks(self) -> None:
         self._start_background_task("startup")
@@ -934,9 +1252,26 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Background Task Failed", message)
 
     def _handle_tab_changed(self, _index: int) -> None:
-        if self.tabs.currentWidget() is self.unknown_clusters_page and self._unknown_clusters_dirty:
+        current_widget = self.tabs.currentWidget()
+        if current_widget is self.library_page and self._library_dirty:
+            self.library_page._refresh_persona_filter()
+            self.library_page.refresh()
+            self._library_dirty = False
+        if current_widget is self.people_page and self._people_dirty:
+            self.people_page.refresh(load_items=True)
+            self._people_dirty = False
+        if current_widget is self.unknown_clusters_page and self._unknown_clusters_dirty:
             self.unknown_clusters_page.refresh()
             self._unknown_clusters_dirty = False
+        if current_widget is self.albums_page and self._albums_dirty:
+            self.albums_page.refresh(load_items=True)
+            self._albums_dirty = False
+        if current_widget is self.memories_page and self._memories_dirty:
+            self.memories_page.refresh(load_items=True)
+            self._memories_dirty = False
+        if current_widget is self.models_page and self._models_dirty:
+            self.models_page.refresh()
+            self._models_dirty = False
 
     def _clear_task_handles(self) -> None:
         self._task_thread = None
@@ -948,7 +1283,7 @@ class MainWindow(QMainWindow):
         if self._live_refresh_pending:
             return
         self._live_refresh_pending = True
-        QTimer.singleShot(150, self._apply_live_refresh)
+        QTimer.singleShot(LIVE_REFRESH_INTERVAL_MS, self._apply_live_refresh)
 
     def _apply_live_refresh(self) -> None:
         self._live_refresh_pending = False

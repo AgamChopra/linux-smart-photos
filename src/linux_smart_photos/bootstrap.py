@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from .branding import APP_NAME
-from .config import config_file_path, load_config
+from .config import config_file_path, normalize_config_file
 from .services.model_manager import ModelManager
 
 
@@ -31,10 +31,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    config = load_config(args.config)
+    config, normalized = normalize_config_file(args.config)
     print(f"{APP_NAME} config: {args.config or config_file_path()}")
     print(f"Media root: {config.media_root_path}")
     print(f"Model cache: {config.models_path}")
+    if normalized:
+        print("Config normalized with current defaults.")
 
     if args.skip_models:
         print("Skipped AI model downloads.")

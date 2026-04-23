@@ -150,9 +150,12 @@ If an AppImage release is available, it can be used as a portable Linux build.
 Smart Photos includes download links for these models:
 
 - Object detection: [Ultralytics YOLO11n](https://docs.ultralytics.com/models/yolo11/)
-- Human face personas: [InsightFace `buffalo_sc`](https://github.com/deepinsight/insightface/blob/master/model_zoo/README.md)
+- Human face detector: [InsightFace `antelope` bundle with `SCRFD-10G-KPS`](https://github.com/deepinsight/insightface/issues/891)
+- Human face embeddings: [InsightFace `buffalo_sc`](https://github.com/deepinsight/insightface/blob/master/model_zoo/README.md)
 - Pet personas: [AvitoTech DINOv2-Small Animal Identification](https://huggingface.co/AvitoTech/DINO-v2-small-for-animal-identification)
 - Pet face detector: [LostPetInitiative `yolov7-pet-face.pt`](https://zenodo.org/records/7607110)
+
+On systems where ONNX Runtime exposes `TensorrtExecutionProvider`, Smart Photos will prefer TensorRT for the human face detector automatically and fall back to CUDA or CPU if TensorRT is unavailable.
 
 ## Search Examples
 

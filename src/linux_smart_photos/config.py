@@ -34,6 +34,9 @@ class AppConfig:
     memory_min_items: int = 6
     object_model_path: str = ""
     object_model_id: str = "ultralytics_yolo11n"
+    human_face_detector_model_id: str = "insightface_antelope"
+    human_face_detector_path: str = ""
+    human_face_detector_backend: str = "auto"
     human_face_model_id: str = "insightface_buffalo_sc"
     pet_detector_model_id: str = "lostpet_yolov7_pet_face"
     pet_embedding_model_id: str = "avito_dinov2_small_petface"
@@ -101,6 +104,29 @@ def load_config(path: Path | None = None) -> AppConfig:
     config.cache_path.mkdir(parents=True, exist_ok=True)
     config.models_path.mkdir(parents=True, exist_ok=True)
     return config
+
+
+def normalize_config_file(path: Path | None = None) -> tuple[AppConfig, bool]:
+    config_path = path or config_file_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not config_path.exists():
+        config = default_config()
+        write_config(config, config_path)
+        return config, True
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    merged_payload = asdict(default_config())
+    merged_payload.update(payload)
+    config = AppConfig(**merged_payload)
+    normalized = payload != merged_payload
+    if normalized:
+        write_config(config, config_path)
+    else:
+        config.database_file.parent.mkdir(parents=True, exist_ok=True)
+        config.cache_path.mkdir(parents=True, exist_ok=True)
+        config.models_path.mkdir(parents=True, exist_ok=True)
+    return config, normalized
 
 
 def write_config(config: AppConfig, path: Path | None = None) -> None:

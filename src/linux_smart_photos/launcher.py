@@ -36,8 +36,23 @@ def _launch_electron(args: list[str]) -> int:
 
     env = os.environ.copy()
     env.setdefault("SMART_PHOTOS_VENV_PYTHON", sys.executable)
+    for key in (
+        "GTK_PATH",
+        "GTK_MODULES",
+        "GTK_EXE_PREFIX",
+        "GTK_DATA_PREFIX",
+        "GTK2_RC_FILES",
+        "GTK_RC_FILES",
+    ):
+        env.pop(key, None)
     command = [str(electron_binary), str(root / "electron"), *args]
-    return subprocess.call(command, cwd=str(root), env=env)
+    exit_code = subprocess.call(command, cwd=str(root), env=env)
+    if exit_code == 0:
+        return 0
+
+    from .app import main as gui_main
+
+    return gui_main()
 
 
 def main(argv: list[str] | None = None) -> int:

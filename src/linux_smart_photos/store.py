@@ -181,7 +181,6 @@ class SQLiteLibraryStore:
                 )
                 self._delete_item_indexes(conn, [item.id for item in buffered_items])
                 self._insert_item_indexes(conn, buffered_items, personas or {})
-            self._clear_cache_entries(conn)
 
     def load_item(self, item_id: str) -> MediaItem | None:
         row = self._fetch_payload_row("items", item_id)
@@ -202,6 +201,28 @@ class SQLiteLibraryStore:
             for row in rows
         }
         return [items_by_id[item_id] for item_id in ordered_ids if item_id in items_by_id]
+
+    def query_items_by_ids(
+        self,
+        item_ids: Sequence[str],
+        *,
+        limit: int | None = None,
+    ) -> list[MediaItem]:
+        filtered_ids = [item_id for item_id in item_ids if item_id]
+        if not filtered_ids:
+            return []
+        placeholders = ",".join("?" for _ in filtered_ids)
+        params: list[Any] = list(filtered_ids)
+        sql = (
+            f"SELECT payload FROM items WHERE id IN ({placeholders}) "
+            "ORDER BY captured_at DESC, modified_ts DESC"
+        )
+        if limit is not None and limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [MediaItem.from_dict(json.loads(row["payload"])) for row in rows]
 
     def list_personas(self, kind: str = "all") -> list[Persona]:
         params: list[Any] = []
@@ -349,6 +370,20 @@ class SQLiteLibraryStore:
             row = conn.execute(
                 "SELECT payload FROM cache_entries WHERE cache_key = ? AND revision = ?",
                 (cache_key, revision),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload"])
+        if isinstance(payload, list):
+            return [entry for entry in payload if isinstance(entry, dict)]
+        return None
+
+    def load_latest_cached_unknown_clusters(self, kind: str) -> list[dict[str, Any]] | None:
+        cache_key = self._unknown_clusters_cache_key(kind)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM cache_entries WHERE cache_key = ?",
+                (cache_key,),
             ).fetchone()
         if row is None:
             return None

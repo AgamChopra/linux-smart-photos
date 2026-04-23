@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
-import io
 import logging
 from pathlib import Path
 from typing import Any
-import warnings
 
 try:
     import cv2
@@ -26,9 +23,15 @@ try:
 except Exception:
     ort = None
 
+try:
+    import onnx
+except Exception:
+    onnx = None
+
 from ..config import AppConfig
 from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaAssetSpec
 from ..models import DetectionRegion
+from .human_face_backend import HUMAN_FACE_PIPELINE_VERSION, HumanFaceBackend
 from .model_manager import ModelManager
 
 try:
@@ -37,11 +40,6 @@ try:
     register_heif_opener()
 except Exception:
     pass
-
-try:
-    from insightface.app import FaceAnalysis
-except Exception:
-    FaceAnalysis = None
 
 try:
     from ultralytics import YOLO
@@ -109,8 +107,11 @@ class PetEmbeddingModel:
         if torch is None or AutoModel is None or AutoImageProcessor is None:
             raise RuntimeError("Pet embedding dependencies are not installed.")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.use_half = self.device == "cuda"
         self.processor = AutoImageProcessor.from_pretrained(str(model_dir), use_fast=True)
         self.model = AutoModel.from_pretrained(str(model_dir)).to(self.device).eval()
+        if self.use_half:
+            self.model = self.model.half()
 
     def embed(self, image: Image.Image) -> list[float]:
         embeddings = self.embed_batch([image])
@@ -121,9 +122,14 @@ class PetEmbeddingModel:
             return []
 
         inputs = self.processor(images=images, return_tensors="pt")
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        converted_inputs: dict[str, Any] = {}
+        for key, value in inputs.items():
+            tensor = value.to(self.device)
+            if self.use_half and torch.is_floating_point(tensor):
+                tensor = tensor.half()
+            converted_inputs[key] = tensor
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            outputs = self.model(**converted_inputs)
 
         if hasattr(outputs, "last_hidden_state"):
             tensor = outputs.last_hidden_state[:, 0, :]
@@ -146,34 +152,47 @@ class VisionAnalyzer:
         self.model_manager = model_manager or ModelManager(config)
         self.human_face_providers: list[str] = []
         self.human_face_uses_gpu = False
+        self.human_face_device_label = ""
+        self.human_face_detector_name = ""
+        self.human_face_recognizer_name = ""
+        self.human_face_pipeline_id = self.human_face_pipeline_revision(config)
         self.yolo_device = self._preferred_yolo_device()
         self.cat_face_detector = self._load_cat_face_detector()
-        self.human_face_app = self._load_human_face_backend()
+        self.human_face_backend = self._load_human_face_backend()
         self.object_model = self._load_object_model()
         self.pet_face_model = self._load_pet_face_model()
         self.pet_embedding_model = self._load_pet_embedding_model()
 
-    def analyze(self, spec: MediaAssetSpec) -> AnalysisResult:
+    def analyze(self, spec: MediaAssetSpec, *, analysis_mode: str = "full") -> AnalysisResult:
         if spec.media_kind == "video":
-            video_result = self._analyze_video(spec)
+            video_result = self._analyze_video(spec, analysis_mode=analysis_mode)
             if video_result.tags or video_result.detections or video_result.metadata.get("video_ai_frames_analyzed"):
                 return video_result
 
         if spec.media_kind == "live_photo":
             still_image = self.load_preview_image(spec)
-            still_result = self._analyze_still_image(still_image) if still_image is not None else self._empty_analysis()
-            video_result = self._analyze_video(spec)
+            still_result = (
+                self._analyze_still_image(still_image, analysis_mode=analysis_mode)
+                if still_image is not None
+                else self._empty_analysis()
+            )
+            video_result = self._analyze_video(spec, analysis_mode=analysis_mode)
             if video_result.tags or video_result.detections or video_result.metadata.get("video_ai_frames_analyzed"):
                 return self._merge_analysis_results(still_result, video_result)
             return still_result
 
         image = self.load_preview_image(spec)
-        return self._analyze_still_image(image)
+        return self._analyze_still_image(image, analysis_mode=analysis_mode)
 
     def _empty_analysis(self) -> AnalysisResult:
         return AnalysisResult(tags=[], detections=[], metadata={})
 
-    def _analyze_still_image(self, image: Image.Image | None) -> AnalysisResult:
+    def _analyze_still_image(
+        self,
+        image: Image.Image | None,
+        *,
+        analysis_mode: str = "full",
+    ) -> AnalysisResult:
         if image is None:
             return self._empty_analysis()
 
@@ -184,6 +203,13 @@ class VisionAnalyzer:
         if human_face_detections:
             tags.update({"face", "person"})
             detections.extend(human_face_detections)
+
+        if analysis_mode == "human_faces_only":
+            return AnalysisResult(
+                tags=sorted(tags),
+                detections=detections,
+                metadata=self._analysis_metadata(image),
+            )
 
         object_detections, object_tags = self._detect_objects(image)
         pet_detections, pet_tags = self._build_pet_detections(image, object_detections)
@@ -216,13 +242,16 @@ class VisionAnalyzer:
         return {
             "analyzed_width": image.size[0],
             "analyzed_height": image.size[1],
-            "human_face_model": "insightface" if self.human_face_app else "",
-            "human_face_providers": list(self.human_face_providers),
-            "human_face_device": (
-                "cuda"
-                if self.human_face_uses_gpu
-                else ("cpu" if self.human_face_app else "")
+            "human_face_model": (
+                f"{self.human_face_detector_name}+{self.human_face_recognizer_name}"
+                if self.human_face_backend
+                else ""
             ),
+            "human_face_pipeline": self.human_face_pipeline_id if self.human_face_backend else "",
+            "human_face_providers": list(self.human_face_providers),
+            "human_face_device": self.human_face_device_label if self.human_face_backend else "",
+            "human_face_detector_model": self.human_face_detector_name if self.human_face_backend else "",
+            "human_face_recognizer_model": self.human_face_recognizer_name if self.human_face_backend else "",
             "object_model": self.config.object_model_id if self.object_model else "",
             "object_device": self._yolo_device_label() if self.object_model else "",
             "pet_face_model": self.config.pet_detector_model_id if self.pet_face_model else "",
@@ -232,7 +261,12 @@ class VisionAnalyzer:
             "cat_face_fallback": bool(self.cat_face_detector),
         }
 
-    def analyze_batch(self, assets: list[PreparedAssetInput]) -> list[AnalysisResult]:
+    def analyze_batch(
+        self,
+        assets: list[PreparedAssetInput],
+        *,
+        analysis_mode: str = "full",
+    ) -> list[AnalysisResult]:
         if not assets:
             return []
 
@@ -270,7 +304,7 @@ class VisionAnalyzer:
                         )
                     )
 
-        unit_results = self._analyze_units_batch(units)
+        unit_results = self._analyze_units_batch(units, analysis_mode=analysis_mode)
         grouped_units: list[list[tuple[_AnalysisUnit, AnalysisResult]]] = [[] for _ in assets]
         for unit, unit_result in zip(units, unit_results, strict=False):
             grouped_units[unit.asset_index].append((unit, unit_result))
@@ -384,7 +418,7 @@ class VisionAnalyzer:
         finally:
             capture.release()
 
-    def _analyze_video(self, spec: MediaAssetSpec) -> AnalysisResult:
+    def _analyze_video(self, spec: MediaAssetSpec, *, analysis_mode: str = "full") -> AnalysisResult:
         video_frames, video_metadata = self.load_video_analysis_frames(spec)
         return self.analyze_batch(
             [
@@ -393,7 +427,8 @@ class VisionAnalyzer:
                     video_frames=video_frames,
                     video_metadata=video_metadata,
                 )
-            ]
+            ],
+            analysis_mode=analysis_mode,
         )[0]
 
     def _build_video_sample_indices(self, frame_count: int, fps: float) -> list[int]:
@@ -420,13 +455,19 @@ class VisionAnalyzer:
         unique_indices = sorted({max(0, min(frame_count - 1, index)) for index in indices})
         return unique_indices[:max_frames]
 
-    def _analyze_units_batch(self, units: list[_AnalysisUnit]) -> list[AnalysisResult]:
+    def _analyze_units_batch(
+        self,
+        units: list[_AnalysisUnit],
+        *,
+        analysis_mode: str = "full",
+    ) -> list[AnalysisResult]:
         if not units:
             return []
 
         images = [unit.image for unit in units]
-        object_batches = self._detect_objects_batch(images)
-        pet_face_batches = self._detect_pet_face_candidates_batch(images)
+        human_face_batches = self._detect_human_faces_batch(images)
+        object_batches = self._detect_objects_batch(images) if analysis_mode != "human_faces_only" else []
+        pet_face_batches = self._detect_pet_face_candidates_batch(images) if analysis_mode != "human_faces_only" else []
         results: list[AnalysisResult] = []
         pet_embedding_requests: list[tuple[DetectionRegion, Image.Image]] = []
 
@@ -435,10 +476,20 @@ class VisionAnalyzer:
             tags: set[str] = set()
             detections: list[DetectionRegion] = []
 
-            human_face_detections = self._detect_human_faces(image)
+            human_face_detections = human_face_batches[index]
             if human_face_detections:
                 tags.update({"face", "person"})
                 detections.extend(human_face_detections)
+
+            if analysis_mode == "human_faces_only":
+                results.append(
+                    AnalysisResult(
+                        tags=sorted(tags),
+                        detections=detections,
+                        metadata=self._analysis_metadata(image),
+                    )
+                )
+                continue
 
             object_detections, object_tags = object_batches[index]
             pet_detections, pet_tags = self._build_pet_detections_from_candidates(
@@ -467,6 +518,9 @@ class VisionAnalyzer:
                     metadata=self._analysis_metadata(image),
                 )
             )
+
+        if analysis_mode == "human_faces_only":
+            return results
 
         embeddings = self._embed_pet_crops_batch([crop for _, crop in pet_embedding_requests])
         for (detection, _), embedding in zip(pet_embedding_requests, embeddings, strict=False):
@@ -727,27 +781,113 @@ class VisionAnalyzer:
                 return cascade
         return None
 
-    def _preferred_onnx_providers(self) -> list[str]:
-        available = []
+    def _available_onnx_providers(self) -> list[str]:
+        available: list[str] = []
         if ort is not None:
             try:
                 available = list(ort.get_available_providers())
             except Exception:
                 available = []
+        return available
 
-        providers: list[str] = []
+    def _preferred_recognizer_provider_specs(self) -> list[Any]:
+        available = self._available_onnx_providers()
+        providers: list[Any] = []
         if "CUDAExecutionProvider" in available:
             self._prepare_onnxruntime_cuda()
-            providers.append("CUDAExecutionProvider")
+            providers.append(
+                (
+                    "CUDAExecutionProvider",
+                    {
+                        "device_id": 0,
+                        "arena_extend_strategy": "kNextPowerOfTwo",
+                        "cudnn_conv_algo_search": "EXHAUSTIVE",
+                        "do_copy_in_default_stream": True,
+                    },
+                )
+            )
         if "CPUExecutionProvider" in available:
             providers.append("CPUExecutionProvider")
         if not providers:
             providers = ["CPUExecutionProvider"]
         return providers
 
+    def _preferred_detector_provider_specs(
+        self,
+        detector_path: Path,
+        *,
+        detection_input_size: tuple[int, int],
+    ) -> list[Any]:
+        available = self._available_onnx_providers()
+        providers: list[Any] = []
+        prefer_tensorrt = self.config.human_face_detector_backend in {"auto", "tensorrt"}
+        if prefer_tensorrt and "TensorrtExecutionProvider" in available:
+            self._prepare_onnxruntime_cuda()
+            trt_options: dict[str, object] = {
+                "device_id": 0,
+                "trt_fp16_enable": True,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(self._tensorrt_cache_path()),
+                "trt_timing_cache_enable": True,
+            }
+            detector_input_name = self._inspect_onnx_input_name(detector_path)
+            if detector_input_name:
+                width, height = detection_input_size
+                trt_options["trt_profile_min_shapes"] = f"{detector_input_name}:1x3x{height}x{width}"
+                trt_options["trt_profile_opt_shapes"] = f"{detector_input_name}:8x3x{height}x{width}"
+                trt_options["trt_profile_max_shapes"] = f"{detector_input_name}:32x3x{height}x{width}"
+            providers.append(("TensorrtExecutionProvider", trt_options))
+        if "CUDAExecutionProvider" in available:
+            self._prepare_onnxruntime_cuda()
+            providers.append(
+                (
+                    "CUDAExecutionProvider",
+                    {
+                        "device_id": 0,
+                        "arena_extend_strategy": "kNextPowerOfTwo",
+                        "cudnn_conv_algo_search": "EXHAUSTIVE",
+                        "do_copy_in_default_stream": True,
+                    },
+                )
+            )
+        if "CPUExecutionProvider" in available:
+            providers.append("CPUExecutionProvider")
+        if not providers:
+            providers = ["CPUExecutionProvider"]
+        return providers
+
+    def _inspect_onnx_input_name(self, model_path: Path) -> str:
+        if onnx is not None:
+            try:
+                model = onnx.load(str(model_path), load_external_data=False)
+                if model.graph.input:
+                    return str(model.graph.input[0].name)
+            except Exception:
+                pass
+        if ort is not None:
+            try:
+                session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+                inputs = session.get_inputs()
+                if inputs:
+                    return str(inputs[0].name)
+            except Exception:
+                return ""
+        return ""
+
+    def _tensorrt_cache_path(self) -> Path:
+        cache_root = self.config.cache_path.parent / "onnxruntime-trt"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        return cache_root
+
     def _prepare_onnxruntime_cuda(self) -> None:
         if ort is None:
             return
+        set_severity = getattr(ort, "set_default_logger_severity", None)
+        if callable(set_severity):
+            try:
+                set_severity(3)
+            except Exception:
+                pass
         preload = getattr(ort, "preload_dlls", None)
         if not callable(preload):
             return
@@ -764,22 +904,6 @@ class VisionAnalyzer:
             except Exception:
                 return
 
-    def _face_session_providers(self, app: Any) -> list[str]:
-        providers: list[str] = []
-        models = getattr(app, "models", None)
-        if isinstance(models, dict):
-            for model in models.values():
-                session = getattr(model, "session", None) or getattr(model, "_session", None)
-                if session is None or not hasattr(session, "get_providers"):
-                    continue
-                try:
-                    for provider in session.get_providers():
-                        if provider not in providers:
-                            providers.append(provider)
-                except Exception:
-                    continue
-        return providers
-
     def _preferred_yolo_device(self) -> int | str:
         if torch is not None and torch.cuda.is_available():
             return 0
@@ -790,6 +914,8 @@ class VisionAnalyzer:
 
     def _analysis_batch_size(self) -> int:
         configured = max(1, int(self.config.analysis_batch_size))
+        if isinstance(self.yolo_device, int):
+            return min(configured, 48)
         return min(configured, 12)
 
     def _pet_embedding_batch_size(self) -> int:
@@ -800,38 +926,111 @@ class VisionAnalyzer:
             yield values[start : start + batch_size]
 
     def _load_human_face_backend(self):
-        if FaceAnalysis is None or not self.config.face_recognition_enabled:
+        if ort is None or cv2 is None or not self.config.face_recognition_enabled:
             return None
 
-        pack_root = self.config.models_path / "insightface"
-        pack_root.mkdir(parents=True, exist_ok=True)
-        pack_name = self._insightface_pack_name()
-        pack_dir = pack_root / "models" / pack_name
-
-        if not pack_dir.exists():
-            if self.config.auto_download_models:
-                self.model_manager.download_model(self.config.human_face_model_id)
-            else:
-                return None
+        detector_path = self._resolve_human_face_detector_path(download_missing=self.config.auto_download_models)
+        recognizer_path = self._resolve_human_face_recognizer_path(download_missing=self.config.auto_download_models)
+        if detector_path is None or recognizer_path is None:
+            return None
 
         try:
-            providers = self._preferred_onnx_providers()
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                app = FaceAnalysis(
-                    name=pack_name,
-                    root=str(pack_root),
-                    providers=providers,
-                )
-                requested_gpu = "CUDAExecutionProvider" in providers
-                app.prepare(ctx_id=0 if requested_gpu else -1, det_size=(640, 640))
-            actual_providers = self._face_session_providers(app)
-            self.human_face_providers = actual_providers or providers
-            self.human_face_uses_gpu = "CUDAExecutionProvider" in self.human_face_providers
-            return app
+            detection_input_size = (640, 640)
+            detector_providers = self._preferred_detector_provider_specs(
+                detector_path,
+                detection_input_size=detection_input_size,
+            )
+            recognizer_providers = self._preferred_recognizer_provider_specs()
+            backend = HumanFaceBackend(
+                detector_path=detector_path,
+                recognizer_path=recognizer_path,
+                detector_providers=detector_providers,
+                recognizer_providers=recognizer_providers,
+                detection_input_size=detection_input_size,
+            )
+            self.human_face_detector_name = detector_path.name
+            self.human_face_recognizer_name = recognizer_path.name
+            self.human_face_pipeline_id = self.human_face_pipeline_revision(
+                detector_name=self.human_face_detector_name,
+                recognizer_name=self.human_face_recognizer_name,
+            )
+            provider_order = list(backend.detector_providers)
+            for provider in backend.recognizer_providers:
+                if provider not in provider_order:
+                    provider_order.append(provider)
+            self.human_face_providers = provider_order
+            self.human_face_uses_gpu = backend.uses_gpu
+            self.human_face_device_label = backend.device_label
+            return backend
         except Exception:
             self.human_face_providers = []
             self.human_face_uses_gpu = False
+            self.human_face_device_label = ""
+            self.human_face_detector_name = ""
+            self.human_face_recognizer_name = ""
+            self.human_face_pipeline_id = self.human_face_pipeline_revision(self.config)
             return None
+
+    def _resolve_human_face_detector_path(self, *, download_missing: bool) -> Path | None:
+        explicit_path = Path(self.config.human_face_detector_path).expanduser() if self.config.human_face_detector_path else None
+        if explicit_path and explicit_path.exists():
+            return explicit_path.resolve()
+
+        managed_dir = self._ensure_model_path(
+            self.config.human_face_detector_model_id,
+            download_missing=download_missing,
+        )
+        if managed_dir is not None:
+            detector_path = self._resolve_detector_from_model_path(managed_dir)
+            if detector_path is not None:
+                return detector_path
+
+        recognizer_pack_dir = self._ensure_model_path(
+            self.config.human_face_model_id,
+            download_missing=download_missing,
+        )
+        if recognizer_pack_dir is not None:
+            detector_path = self._resolve_detector_from_model_path(recognizer_pack_dir)
+            if detector_path is not None:
+                return detector_path
+        return None
+
+    def _resolve_human_face_recognizer_path(self, *, download_missing: bool) -> Path | None:
+        managed_dir = self._ensure_model_path(
+            self.config.human_face_model_id,
+            download_missing=download_missing,
+        )
+        if managed_dir is None:
+            return None
+        for candidate_name in ("w600k_mbf.onnx", "glintr100.onnx"):
+            candidate_path = managed_dir / candidate_name
+            if candidate_path.exists():
+                return candidate_path.resolve()
+        return None
+
+    def _ensure_model_path(self, model_id: str, *, download_missing: bool) -> Path | None:
+        resolved_path: Path | None = None
+        if download_missing:
+            managed_path = self.model_manager.ensure_model(model_id)
+            if managed_path:
+                resolved_path = Path(managed_path).expanduser()
+        if resolved_path is not None and resolved_path.exists():
+            return resolved_path.resolve()
+        status = self.model_manager.status(model_id)
+        if status.installed:
+            path = Path(status.local_path).expanduser()
+            if path.exists():
+                return path.resolve()
+        return None
+
+    def _resolve_detector_from_model_path(self, model_path: Path) -> Path | None:
+        if model_path.is_file():
+            return model_path.resolve()
+        for candidate_name in ("scrfd_10g_bnkps.onnx", "det_500m.onnx"):
+            candidate_path = model_path / candidate_name
+            if candidate_path.exists():
+                return candidate_path.resolve()
+        return None
 
     def _load_yolo_model(self, model_id: str, configured_path: str = ""):
         if YOLO is None:
@@ -889,52 +1088,74 @@ class VisionAnalyzer:
         except Exception:
             return None
 
-    def _insightface_pack_name(self) -> str:
-        if self.config.human_face_model_id == "insightface_buffalo_sc":
-            return "buffalo_sc"
-        return "buffalo_sc"
+    @staticmethod
+    def human_face_pipeline_revision(
+        config: AppConfig | None = None,
+        *,
+        detector_name: str = "",
+        recognizer_name: str = "",
+    ) -> str:
+        if detector_name or recognizer_name:
+            detector_token = detector_name or "none"
+            recognizer_token = recognizer_name or "none"
+            return f"{HUMAN_FACE_PIPELINE_VERSION}:{detector_token}:{recognizer_token}"
+        if config is None:
+            return HUMAN_FACE_PIPELINE_VERSION
+        detector_token = (
+            Path(config.human_face_detector_path).expanduser().name
+            if config.human_face_detector_path
+            else config.human_face_detector_model_id
+        )
+        recognizer_token = config.human_face_model_id
+        return f"{HUMAN_FACE_PIPELINE_VERSION}:{detector_token}:{recognizer_token}"
 
     def _detect_human_faces(self, image: Image.Image) -> list[DetectionRegion]:
-        if self.human_face_app is None or cv2 is None:
-            return []
+        return self._detect_human_faces_batch([image])[0]
 
-        bgr = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+    def _detect_human_faces_batch(
+        self,
+        images: list[Image.Image],
+    ) -> list[list[DetectionRegion]]:
+        if not images:
+            return []
+        if self.human_face_backend is None or cv2 is None:
+            return [[] for _ in images]
+
+        bgr_images = [cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR) for image in images]
         try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="`estimate` is deprecated",
-                    category=FutureWarning,
-                )
-                faces = self.human_face_app.get(bgr)
+            candidates_by_image = self.human_face_backend.detect_faces_batch(bgr_images)
+            embeddings_by_image = self.human_face_backend.embed_faces_batch(bgr_images, candidates_by_image)
         except Exception:
-            return []
+            return [[] for _ in images]
 
-        detections: list[DetectionRegion] = []
-        for index, face in enumerate(faces):
-            bbox_float = getattr(face, "bbox", None)
-            if bbox_float is None:
-                continue
-            x1, y1, x2, y2 = [int(value) for value in bbox_float]
-            bbox = [x1, y1, max(0, x2 - x1), max(0, y2 - y1)]
-            embedding_raw = getattr(face, "normed_embedding", None)
-            if embedding_raw is None:
-                embedding_raw = getattr(face, "embedding", None)
-            embedding = []
-            if embedding_raw is not None:
-                embedding = [round(float(value), 6) for value in np.asarray(embedding_raw).tolist()]
-            detections.append(
-                DetectionRegion(
-                    id=f"face-{index}",
-                    kind="face",
-                    label="face",
-                    confidence=float(getattr(face, "det_score", 1.0)),
-                    bbox=bbox,
-                    encoding=embedding,
-                    signature=self.crop_signature(image, bbox),
+        outputs: list[list[DetectionRegion]] = [[] for _ in images]
+        for image_index, image in enumerate(images):
+            candidates = candidates_by_image[image_index] if image_index < len(candidates_by_image) else []
+            embeddings = embeddings_by_image[image_index] if image_index < len(embeddings_by_image) else []
+            detections: list[DetectionRegion] = []
+            for detection_index, candidate in enumerate(candidates):
+                x1, y1, x2, y2 = [int(round(value)) for value in candidate.bbox_xyxy]
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(image.size[0], x2)
+                y2 = min(image.size[1], y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                bbox = [x1, y1, max(0, x2 - x1), max(0, y2 - y1)]
+                embedding = embeddings[detection_index] if detection_index < len(embeddings) else []
+                detections.append(
+                    DetectionRegion(
+                        id=f"face-{detection_index}",
+                        kind="face",
+                        label="face",
+                        confidence=float(candidate.confidence),
+                        bbox=bbox,
+                        encoding=embedding,
+                        signature=self.crop_signature(image, bbox),
+                    )
                 )
-            )
-        return detections
+            outputs[image_index] = detections
+        return outputs
 
     def _detect_objects(self, image: Image.Image) -> tuple[list[DetectionRegion], set[str]]:
         return self._detect_objects_batch([image])[0]
@@ -955,6 +1176,7 @@ class VisionAnalyzer:
                 results = self.object_model.predict(
                     rgb_batch,
                     device=self.yolo_device,
+                    half=isinstance(self.yolo_device, int),
                     verbose=False,
                 )
             except Exception:
@@ -1157,6 +1379,7 @@ class VisionAnalyzer:
                 results = self.pet_face_model.predict(
                     rgb_batch,
                     device=self.yolo_device,
+                    half=isinstance(self.yolo_device, int),
                     verbose=False,
                 )
             except Exception:

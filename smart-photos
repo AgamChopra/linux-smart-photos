@@ -64,6 +64,15 @@ spawn_setup_terminal() {
   return 1
 }
 
+sanitize_electron_env() {
+  unset GTK_PATH
+  unset GTK_MODULES
+  unset GTK_EXE_PREFIX
+  unset GTK_DATA_PREFIX
+  unset GTK2_RC_FILES
+  unset GTK_RC_FILES
+}
+
 while (($#)); do
   case "$1" in
     --gui|gui|--electron|electron)
@@ -162,4 +171,18 @@ if [[ ! -x "$ELECTRON_BINARY" ]]; then
 fi
 
 export SMART_PHOTOS_VENV_PYTHON="$VENV_DIR/bin/python"
-exec "$ELECTRON_BINARY" "$ELECTRON_DIR" "${passthrough[@]}"
+sanitize_electron_env
+set +e
+"$ELECTRON_BINARY" "$ELECTRON_DIR" "${passthrough[@]}"
+electron_status=$?
+set -e
+if [[ "$electron_status" -ne 0 ]]; then
+  echo "Electron UI exited unexpectedly. Falling back to the Qt interface." >&2
+  if [[ -n "${QT_LOGGING_RULES:-}" ]]; then
+    export QT_LOGGING_RULES="${QT_LOGGING_RULES};qt.qpa.services.warning=false"
+  else
+    export QT_LOGGING_RULES="qt.qpa.services.warning=false"
+  fi
+  exec "$VENV_DIR/bin/smart-photos-gui" "${passthrough[@]}"
+fi
+exit 0

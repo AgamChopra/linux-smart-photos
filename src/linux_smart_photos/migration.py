@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .branding import APP_NAME
-from .config import config_file_path, load_config, write_config
+from .config import config_file_path, normalize_config_file, write_config
 from .store import SQLiteLibraryStore
 
 
@@ -24,10 +24,10 @@ def migrate_configured_library(
     delete_legacy: bool = True,
 ) -> MigrationResult:
     resolved_config_path = config_path or config_file_path()
-    config = load_config(resolved_config_path)
+    config, normalized = normalize_config_file(resolved_config_path)
     store = SQLiteLibraryStore(config.database_file)
 
-    config_updated = False
+    config_updated = normalized
     if config.database_file != store.path:
         config.database_path = str(store.path)
         write_config(config, resolved_config_path)
