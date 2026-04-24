@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import monotonic
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, QTimer, QSize, Qt, Signal
@@ -34,6 +35,64 @@ from .widgets import MediaGridWidget
 PAGE_ITEM_PREVIEW_LIMIT = 720
 CLUSTER_RENDER_CHUNK_SIZE = 128
 LIVE_REFRESH_INTERVAL_MS = 600
+
+
+class TaskStatusRow(QWidget):
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self.title_label = QLabel(title)
+        self.title_label.setMinimumWidth(128)
+        self.message_label = QLabel("Idle")
+        self.message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimumWidth(240)
+        self.progress_bar.setMaximumWidth(320)
+        self.progress_bar.setTextVisible(True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.message_label, 1)
+        layout.addWidget(self.progress_bar)
+
+        self.set_idle("Idle")
+
+    def set_idle(self, message: str = "Idle") -> None:
+        self.message_label.setText(message)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("idle")
+
+    def set_active(
+        self,
+        message: str,
+        *,
+        current: int = 0,
+        total: int = 0,
+        indeterminate: bool = True,
+    ) -> None:
+        self.message_label.setText(message)
+        if indeterminate or total <= 0:
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("working")
+            return
+        bounded_current = max(0, min(current, total))
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(bounded_current)
+        self.progress_bar.setFormat(f"{bounded_current}/{total}")
+
+    def set_complete(self, message: str) -> None:
+        self.message_label.setText(message)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.progress_bar.setFormat("done")
+
+    def set_error(self, message: str) -> None:
+        self.message_label.setText(message)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("error")
 
 
 class BackgroundTaskWorker(QObject):
@@ -103,21 +162,56 @@ class UnknownClustersWorker(QObject):
     completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, config: AppConfig, kind: str) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        kind: str,
+        *,
+        allow_stale_cache: bool = False,
+        build_if_missing: bool = True,
+    ) -> None:
         super().__init__()
         self.config = config
         self.kind = kind
+        self.allow_stale_cache = allow_stale_cache
+        self.build_if_missing = build_if_missing
 
     def run(self) -> None:
         try:
             service = LibraryService(self.config)
             clusters = service.list_unknown_persona_clusters(
                 kind=self.kind,
-                allow_stale_cache=False,
+                allow_stale_cache=self.allow_stale_cache,
+                build_if_missing=self.build_if_missing,
             )
             self.completed.emit(clusters)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class UnknownClusterCacheWorker(QObject):
+    progress = Signal(object)
+    completed = Signal(bool)
+    failed = Signal(str)
+
+    def __init__(self, config: AppConfig, *, partial: bool) -> None:
+        super().__init__()
+        self.config = config
+        self.partial = partial
+
+    def run(self) -> None:
+        try:
+            service = LibraryService(self.config)
+            service.rebuild_unknown_cluster_caches(
+                partial=self.partial,
+                progress_callback=self._emit_progress,
+            )
+            self.completed.emit(self.partial)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _emit_progress(self, update: ProgressUpdate) -> None:
+        self.progress.emit(update)
 
 
 class ItemLoadWorker(QObject):
@@ -547,15 +641,24 @@ class UnknownClustersPage(QWidget):
             self._refresh_pending = True
             return
 
+        is_background_analysis_active = self.owner._active_task in {"startup", "sync"}
+
         if self.cluster_list.count():
             self.summary.setText("Refreshing unknown clusters in the background...")
+            self.owner.set_cluster_view_status_loading("Refreshing unknown clusters from cache/background worker")
         else:
             self.summary.setText("Loading unknown clusters...")
             self.cluster_list.setEnabled(False)
+            self.owner.set_cluster_view_status_loading("Loading unknown clusters")
         self.refresh_button.setEnabled(False)
 
         thread = QThread(self)
-        worker = UnknownClustersWorker(self.service.config, self._refresh_kind)
+        worker = UnknownClustersWorker(
+            self.service.config,
+            self._refresh_kind,
+            allow_stale_cache=is_background_analysis_active,
+            build_if_missing=not is_background_analysis_active,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.completed.connect(self._handle_refresh_completed)
@@ -704,18 +807,26 @@ class UnknownClustersPage(QWidget):
             self.summary.setText(
                 "Scanning in background. Unknown clusters will appear automatically as analyzed items accumulate."
             )
+            self.owner.set_cluster_view_status_complete("No unknown clusters yet; waiting for analyzed face/pet detections")
         elif self.owner._active_task in {"startup", "sync"}:
             self.summary.setText(
                 f"Rendering {len(self._pending_render_clusters)} live unknown clusters from analyzed items so far..."
             )
+            self.owner.set_cluster_view_status_loading(
+                f"Rendering {len(self._pending_render_clusters)} live unknown clusters"
+            )
         else:
             self.summary.setText(f"Rendering {len(self._pending_render_clusters)} unknown clusters...")
+            self.owner.set_cluster_view_status_loading(
+                f"Rendering {len(self._pending_render_clusters)} unknown clusters"
+            )
         self._render_timer.start(0)
 
     def _handle_refresh_failed(self, message: str) -> None:
         self.cluster_list.setEnabled(True)
         self.refresh_button.setEnabled(True)
         self.summary.setText(f"Unable to load unknown clusters: {message}")
+        self.owner.set_cluster_view_status_error(f"Unknown clusters failed to load: {message}")
 
     def _clear_refresh_handles(self) -> None:
         self._refresh_thread = None
@@ -731,6 +842,9 @@ class UnknownClustersPage(QWidget):
             if not self.cluster_list.selectedItems() and self.cluster_list.count():
                 self.cluster_list.item(0).setSelected(True)
                 self.cluster_list.setCurrentRow(0)
+            self.owner.set_cluster_view_status_complete(
+                f"Unknown clusters ready: {len(self._pending_render_clusters)} cluster(s)"
+            )
             self._show_selected_clusters()
             return
 
@@ -1112,6 +1226,14 @@ class MainWindow(QMainWindow):
         self.service = service
         self._task_thread: QThread | None = None
         self._task_worker: BackgroundTaskWorker | None = None
+        self._cluster_cache_thread: QThread | None = None
+        self._cluster_cache_worker: UnknownClusterCacheWorker | None = None
+        self._cluster_cache_last_started = 0.0
+        self._cluster_cache_final_pending = False
+        self._main_task_base_message = ""
+        self._main_task_progress: ProgressUpdate | None = None
+        self._cluster_cache_base_message = ""
+        self._cluster_cache_progress: ProgressUpdate | None = None
         self._active_task = ""
         self._live_refresh_pending = False
         self._library_dirty = False
@@ -1140,13 +1262,24 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._handle_tab_changed)
         self.setCentralWidget(self.tabs)
 
-        self.progress_label = QLabel("Ready")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(320)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.hide()
-        self.statusBar().addWidget(self.progress_label, 1)
-        self.statusBar().addPermanentWidget(self.progress_bar)
+        self.status_panel = QWidget()
+        self.status_panel_layout = QVBoxLayout(self.status_panel)
+        self.status_panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.status_panel_layout.setSpacing(2)
+        self.main_task_status = TaskStatusRow("Background Task")
+        self.cluster_cache_status = TaskStatusRow("Cluster Cache")
+        self.cluster_view_status = TaskStatusRow("Cluster View")
+        self.status_panel_layout.addWidget(self.main_task_status)
+        self.status_panel_layout.addWidget(self.cluster_cache_status)
+        self.status_panel_layout.addWidget(self.cluster_view_status)
+        self.statusBar().addPermanentWidget(self.status_panel, 1)
+        self.main_task_status.set_idle("Ready")
+        self.cluster_cache_status.set_idle("Waiting for scan progress")
+        self.cluster_view_status.set_idle("Unknown clusters tab idle")
+        self._status_refresh_timer = QTimer(self)
+        self._status_refresh_timer.setInterval(1000)
+        self._status_refresh_timer.timeout.connect(self._refresh_active_status_rows)
+        self._status_refresh_timer.start()
 
         QTimer.singleShot(0, self._finish_startup)
 
@@ -1229,7 +1362,7 @@ class MainWindow(QMainWindow):
 
     def _start_background_task(self, task_name: str, model_id: str = "") -> bool:
         if self._task_thread is not None:
-            self.progress_label.setText("A background task is already running.")
+            self.main_task_status.set_error("A background task is already running.")
             return False
 
         self._active_task = task_name
@@ -1258,22 +1391,28 @@ class MainWindow(QMainWindow):
         if not isinstance(update, ProgressUpdate):
             return
 
-        if update.indeterminate or update.total <= 0:
-            self.progress_bar.setRange(0, 0)
-        else:
-            self.progress_bar.setRange(0, update.total)
-            self.progress_bar.setValue(min(update.current, update.total))
-
         detail = f": {update.detail}" if update.detail else ""
-        self.progress_label.setText(f"{update.message}{detail}")
+        self._main_task_base_message = f"{update.message}{detail}"
+        self._main_task_progress = update
+        self._apply_progress_to_row(
+            self.main_task_status,
+            self._main_task_base_message,
+            update,
+        )
         if update.snapshot_ready:
             self._schedule_live_refresh()
+            if self._active_task in {"startup", "sync"}:
+                self._maybe_refresh_unknown_cluster_cache()
 
     def _handle_task_completed(self, payload: Any) -> None:
         task_name = str(payload.get("task", self._active_task))
         self.service.reload()
         self.refresh_views()
         self._set_busy(False, self._task_success_message(task_name, payload))
+        self._main_task_progress = None
+        self._main_task_base_message = ""
+        if task_name in {"startup", "sync"}:
+            self._start_unknown_cluster_cache_refresh(partial=False)
         if task_name == "startup" and payload.get("download_error"):
             QMessageBox.warning(
                 self,
@@ -1287,6 +1426,9 @@ class MainWindow(QMainWindow):
         self.service.reload()
         self.refresh_views()
         self._set_busy(False, self._task_failure_message(task_name))
+        self._main_task_progress = None
+        self._main_task_base_message = ""
+        self.main_task_status.set_error(f"{self._task_failure_message(task_name)}: {message}")
         QMessageBox.critical(self, "Background Task Failed", message)
 
     def _handle_tab_changed(self, _index: int) -> None:
@@ -1330,6 +1472,164 @@ class MainWindow(QMainWindow):
         self.service.reload()
         self.refresh_live_views()
 
+    def _maybe_refresh_unknown_cluster_cache(self) -> None:
+        if self._cluster_cache_thread is not None:
+            return
+        if monotonic() - self._cluster_cache_last_started < 5.0:
+            return
+        self._start_unknown_cluster_cache_refresh(partial=True)
+
+    def _start_unknown_cluster_cache_refresh(self, *, partial: bool) -> None:
+        if self._cluster_cache_thread is not None:
+            if not partial:
+                self._cluster_cache_final_pending = True
+            return
+
+        thread = QThread(self)
+        worker = UnknownClusterCacheWorker(self.service.config, partial=partial)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._handle_unknown_cluster_cache_progress)
+        worker.completed.connect(self._handle_unknown_cluster_cache_completed)
+        worker.failed.connect(self._handle_unknown_cluster_cache_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_unknown_cluster_cache_handles)
+
+        self._cluster_cache_thread = thread
+        self._cluster_cache_worker = worker
+        self._cluster_cache_last_started = monotonic()
+        message = (
+            "Building partial unknown-cluster cache from analyzed items"
+            if partial
+            else "Building final unknown-cluster cache"
+        )
+        self.cluster_cache_status.set_active(message, indeterminate=True)
+        thread.start()
+
+    def _handle_unknown_cluster_cache_completed(self, partial: bool) -> None:
+        self._cluster_cache_progress = None
+        self._cluster_cache_base_message = ""
+        if partial:
+            self.cluster_cache_status.set_complete("Partial unknown-cluster cache updated")
+        else:
+            self.cluster_cache_status.set_complete("Final unknown-cluster cache updated")
+        current_widget = self.tabs.currentWidget()
+        if current_widget is self.unknown_clusters_page:
+            self.unknown_clusters_page.refresh()
+            self._unknown_clusters_dirty = False
+        else:
+            self._unknown_clusters_dirty = True
+
+    def _handle_unknown_cluster_cache_failed(self, message: str) -> None:
+        self._cluster_cache_progress = None
+        self._cluster_cache_base_message = ""
+        self.cluster_cache_status.set_error(f"Cluster cache refresh failed: {message}")
+        self._unknown_clusters_dirty = True
+
+    def _handle_unknown_cluster_cache_progress(self, update: Any) -> None:
+        if not isinstance(update, ProgressUpdate):
+            return
+        detail = f": {update.detail}" if update.detail else ""
+        self._cluster_cache_base_message = f"{update.message}{detail}"
+        self._cluster_cache_progress = update
+        self._apply_progress_to_row(
+            self.cluster_cache_status,
+            self._cluster_cache_base_message,
+            update,
+        )
+
+    def _clear_unknown_cluster_cache_handles(self) -> None:
+        self._cluster_cache_thread = None
+        self._cluster_cache_worker = None
+        if self._cluster_cache_final_pending:
+            self._cluster_cache_final_pending = False
+            self._start_unknown_cluster_cache_refresh(partial=False)
+        elif not self._active_task:
+            self._cluster_cache_progress = None
+            self._cluster_cache_base_message = ""
+            self.cluster_cache_status.set_idle("Waiting for scan progress")
+
+    def set_cluster_view_status_loading(self, message: str) -> None:
+        self.cluster_view_status.set_active(message, indeterminate=True)
+
+    def set_cluster_view_status_complete(self, message: str) -> None:
+        self.cluster_view_status.set_complete(message)
+
+    def set_cluster_view_status_error(self, message: str) -> None:
+        self.cluster_view_status.set_error(message)
+
+    def _format_progress_status(self, base_message: str, update: ProgressUpdate) -> str:
+        fragments: list[str] = []
+        step_seconds, elapsed_seconds, eta_seconds = self._effective_progress_timing(update)
+        if step_seconds is not None:
+            fragments.append(f"batch {self._format_duration(step_seconds)}")
+        if elapsed_seconds is not None:
+            fragments.append(f"elapsed {self._format_duration(elapsed_seconds)}")
+        if eta_seconds is not None:
+            fragments.append(f"ETA {self._format_duration(eta_seconds)}")
+        if not fragments:
+            return base_message
+        return f"{base_message}  |  " + "  |  ".join(fragments)
+
+    def _format_duration(self, seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours}h {minutes:02d}m {secs:02d}s"
+        if minutes > 0:
+            return f"{minutes}m {secs:02d}s"
+        return f"{secs}s"
+
+    def _apply_progress_to_row(
+        self,
+        row: TaskStatusRow,
+        base_message: str,
+        update: ProgressUpdate,
+    ) -> None:
+        row.set_active(
+            self._format_progress_status(base_message, update),
+            current=update.current,
+            total=update.total,
+            indeterminate=update.indeterminate,
+        )
+
+    def _effective_progress_timing(
+        self,
+        update: ProgressUpdate,
+    ) -> tuple[float | None, float | None, float | None]:
+        step_seconds = update.step_seconds
+        elapsed_seconds = update.elapsed_seconds
+        eta_seconds = update.eta_seconds
+        if update.timestamp_seconds is None:
+            return step_seconds, elapsed_seconds, eta_seconds
+        delta = max(0.0, monotonic() - update.timestamp_seconds)
+        if step_seconds is not None:
+            step_seconds += delta
+        if elapsed_seconds is not None:
+            elapsed_seconds += delta
+        if eta_seconds is not None:
+            eta_seconds = max(0.0, eta_seconds + delta)
+        return step_seconds, elapsed_seconds, eta_seconds
+
+    def _refresh_active_status_rows(self) -> None:
+        if self._main_task_progress is not None and self._main_task_base_message:
+            self._apply_progress_to_row(
+                self.main_task_status,
+                self._main_task_base_message,
+                self._main_task_progress,
+            )
+        if self._cluster_cache_progress is not None and self._cluster_cache_base_message:
+            self._apply_progress_to_row(
+                self.cluster_cache_status,
+                self._cluster_cache_base_message,
+                self._cluster_cache_progress,
+            )
+
     def _set_busy(self, busy: bool, message: str) -> None:
         for page in (
             self.library_page,
@@ -1342,14 +1642,11 @@ class MainWindow(QMainWindow):
             page.set_busy(busy)
 
         if busy:
-            self.progress_bar.setRange(0, 0)
-            self.progress_bar.show()
+            self.main_task_status.set_active(message, indeterminate=True)
+            if self._active_task in {"startup", "sync"} and self._cluster_cache_thread is None:
+                self.cluster_cache_status.set_idle("Waiting for analyzed batches")
         else:
-            self.progress_bar.hide()
-            self.progress_bar.setRange(0, 1)
-            self.progress_bar.setValue(0)
-
-        self.progress_label.setText(message)
+            self.main_task_status.set_complete(message)
 
     def _task_start_message(self, task_name: str, model_id: str) -> str:
         if task_name == "startup":
@@ -1392,7 +1689,7 @@ class MainWindow(QMainWindow):
         return "Background task failed."
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._task_thread is not None:
+        if self._task_thread is not None or self._cluster_cache_thread is not None:
             QMessageBox.information(
                 self,
                 "Background Task Running",

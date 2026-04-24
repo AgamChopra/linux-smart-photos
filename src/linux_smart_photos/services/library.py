@@ -87,6 +87,10 @@ class ProgressUpdate:
     detail: str = ""
     indeterminate: bool = False
     snapshot_ready: bool = False
+    elapsed_seconds: float | None = None
+    eta_seconds: float | None = None
+    step_seconds: float | None = None
+    timestamp_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -182,6 +186,7 @@ class LibraryService:
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
     ) -> SyncSummary:
         self._ensure_state_loaded()
+        sync_started_at = monotonic()
         assets = build_asset_specs(self.config.media_root_path)
         sorted_assets = self._sorted_asset_entries(assets)
         existing_ids = set(self.state.items)
@@ -195,12 +200,13 @@ class LibraryService:
 
         self._emit_progress(
             progress_callback,
-            ProgressUpdate(
+            self._make_progress_update(
                 phase="sync",
                 message="Checking library for changes",
                 current=completed,
                 total=total_work,
                 detail=str(self.config.media_root_path),
+                overall_started_at=sync_started_at,
             ),
         )
 
@@ -210,12 +216,13 @@ class LibraryService:
             if self._should_emit_scan_progress(completed, total_work):
                 self._emit_progress(
                     progress_callback,
-                    ProgressUpdate(
+                    self._make_progress_update(
                         phase="sync",
                         message="Removing missing items",
                         current=completed,
                         total=total_work,
                         detail=item_id,
+                        overall_started_at=sync_started_at,
                     ),
                 )
         if removed_ids:
@@ -229,12 +236,13 @@ class LibraryService:
                 if self._should_emit_scan_progress(completed, total_work):
                     self._emit_progress(
                         progress_callback,
-                        ProgressUpdate(
+                        self._make_progress_update(
                             phase="sync",
                             message="Scanning library",
                             current=completed,
                             total=total_work,
                             detail=spec.relative_key,
+                            overall_started_at=sync_started_at,
                         ),
                     )
                 continue
@@ -247,32 +255,35 @@ class LibraryService:
         if changed_entries:
             self._emit_progress(
                 progress_callback,
-                ProgressUpdate(
+                self._make_progress_update(
                     phase="sync",
                     message="Initializing AI backends",
                     current=completed,
                     total=total_work,
                     detail="Preparing models for batched analysis",
                     indeterminate=True,
+                    overall_started_at=sync_started_at,
                 ),
             )
             _ = self.vision
             batch_size = self._scan_batch_size()
             max_workers = min(self._prefetch_workers(), max(1, batch_size), len(changed_entries))
-            last_partial_cluster_refresh = 0.0
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 total_batches = (len(changed_entries) + batch_size - 1) // batch_size
                 for batch_index, batch_start in enumerate(range(0, len(changed_entries), batch_size), start=1):
                     batch_entries = changed_entries[batch_start : batch_start + batch_size]
+                    batch_started_at = monotonic()
                     self._emit_progress(
                         progress_callback,
-                        ProgressUpdate(
+                        self._make_progress_update(
                             phase="sync",
                             message=f"Prefetching batch {batch_index}/{total_batches}",
                             current=completed,
                             total=total_work,
                             detail=self._batch_detail(batch_entries),
                             indeterminate=True,
+                            overall_started_at=sync_started_at,
+                            step_started_at=batch_started_at,
                         ),
                     )
                     prepared_batch = self._prepare_batch(batch_entries, executor)
@@ -282,13 +293,15 @@ class LibraryService:
                     }
                     self._emit_progress(
                         progress_callback,
-                        ProgressUpdate(
+                        self._make_progress_update(
                             phase="sync",
                             message=f"Running AI batch {batch_index}/{total_batches}",
                             current=completed,
                             total=total_work,
                             detail=f"{len(prepared_batch)} items",
                             indeterminate=True,
+                            overall_started_at=sync_started_at,
+                            step_started_at=batch_started_at,
                         ),
                     )
                     built_items = self._build_items_batch(prepared_batch)
@@ -303,57 +316,54 @@ class LibraryService:
                     if built_items:
                         self._emit_progress(
                             progress_callback,
-                            ProgressUpdate(
+                            self._make_progress_update(
                                 phase="sync",
                                 message=f"Indexed batch {batch_index}/{total_batches}",
                                 current=completed,
                                 total=total_work,
                                 detail=self._batch_detail(batch_entries),
+                                overall_started_at=sync_started_at,
+                                step_started_at=batch_started_at,
                             ),
                         )
                         self._save_progress_items(built_items)
-                        if self._should_refresh_partial_clusters(
-                            batch_index=batch_index,
-                            total_batches=total_batches,
-                            built_items=built_items,
-                            last_refresh_at=last_partial_cluster_refresh,
-                        ):
-                            self._refresh_unknown_cluster_caches(partial=True)
-                            last_partial_cluster_refresh = monotonic()
                         self._emit_progress(
                             progress_callback,
-                            ProgressUpdate(
+                            self._make_progress_update(
                                 phase="sync",
                                 message=f"Updated live view for batch {batch_index}/{total_batches}",
                                 current=completed,
                                 total=total_work,
                                 detail=f"{len(self.state.items)} indexed items",
                                 snapshot_ready=True,
+                                overall_started_at=sync_started_at,
+                                step_started_at=batch_started_at,
                             ),
                         )
 
         completed += 1
         self._emit_progress(
             progress_callback,
-            ProgressUpdate(
+            self._make_progress_update(
                 phase="sync",
                 message="Refreshing albums and memories",
                 current=completed,
                 total=total_work,
+                overall_started_at=sync_started_at,
             ),
         )
         self._cleanup_collections()
         self.regenerate_memories()
         self.save()
-        self._refresh_unknown_cluster_caches(partial=False)
         completed += 1
         self._emit_progress(
             progress_callback,
-            ProgressUpdate(
+            self._make_progress_update(
                 phase="sync",
                 message="Library sync complete",
                 current=completed,
                 total=total_work,
+                overall_started_at=sync_started_at,
             ),
         )
         return SyncSummary(added=added, updated=updated, removed=len(removed_ids))
@@ -425,27 +435,33 @@ class LibraryService:
         specs = self.model_manager.recommended_specs()
         paths: list[str] = []
         total = len(specs)
+        started_at = monotonic()
         for index, spec in enumerate(specs, start=1):
             installed = self.model_manager.status(spec.id).installed
+            step_started_at = monotonic()
             self._emit_progress(
                 progress_callback,
-                ProgressUpdate(
+                self._make_progress_update(
                     phase="models",
                     message="Checking AI models" if installed else "Downloading AI models",
                     current=index - 1,
                     total=total,
                     detail=spec.title,
+                    overall_started_at=started_at,
+                    step_started_at=step_started_at,
                 ),
             )
             paths.append(self.model_manager.download_model(spec.id))
             self._emit_progress(
                 progress_callback,
-                ProgressUpdate(
+                self._make_progress_update(
                     phase="models",
                     message="AI model ready",
                     current=index,
                     total=total,
                     detail=spec.title,
+                    overall_started_at=started_at,
+                    step_started_at=step_started_at,
                 ),
             )
         self._vision = None
@@ -457,25 +473,30 @@ class LibraryService:
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
     ) -> str:
         status = self.model_manager.status(model_id)
+        started_at = monotonic()
         self._emit_progress(
             progress_callback,
-            ProgressUpdate(
+            self._make_progress_update(
                 phase="models",
                 message="Checking AI models" if status.installed else "Downloading AI models",
                 current=0,
                 total=1,
                 detail=status.title,
+                overall_started_at=started_at,
+                step_started_at=started_at,
             ),
         )
         path = self.model_manager.download_model(model_id)
         self._emit_progress(
             progress_callback,
-            ProgressUpdate(
+            self._make_progress_update(
                 phase="models",
                 message="AI model ready" if status.installed else "Downloaded AI model",
                 current=1,
                 total=1,
                 detail=status.title,
+                overall_started_at=started_at,
+                step_started_at=started_at,
             ),
         )
         self._vision = None
@@ -689,6 +710,7 @@ class LibraryService:
         kind: str = "person",
         *,
         allow_stale_cache: bool = False,
+        build_if_missing: bool = True,
     ) -> list[UnknownPersonaCluster]:
         requested_kinds = (
             ["person", "pet"]
@@ -728,6 +750,8 @@ class LibraryService:
                         for entry in stale_clusters
                     )
                     continue
+            if not build_if_missing:
+                continue
             built_clusters = self._build_unknown_clusters(requested_kind)
             self.store.save_cached_unknown_clusters(
                 requested_kind,
@@ -864,32 +888,32 @@ class LibraryService:
         next_offset = offset + len(page_items) if has_more else None
         return MediaPage(items=page_items, has_more=has_more, next_offset=next_offset)
 
-    def _should_refresh_partial_clusters(
+    def rebuild_unknown_cluster_caches(
         self,
         *,
-        batch_index: int,
-        total_batches: int,
-        built_items: list[MediaItem],
-        last_refresh_at: float,
-    ) -> bool:
-        if not built_items:
-            return False
-        if batch_index == total_batches:
-            return True
-        if monotonic() - last_refresh_at < 1.5:
-            return False
-        return any(
-            any(
-                detection.kind == "face" or self._is_pet_detection(detection)
-                for detection in item.detections
-            )
-            for item in built_items
-        )
-
-    def _refresh_unknown_cluster_caches(self, *, partial: bool) -> None:
+        partial: bool,
+        progress_callback: Callable[[ProgressUpdate], None] | None = None,
+    ) -> None:
         self._ensure_state_loaded()
         revision = self.state.updated_at
-        for kind in ("person", "pet"):
+        started_at = monotonic()
+        kinds = ("person", "pet")
+        total_kinds = len(kinds)
+        for index, kind in enumerate(kinds, start=1):
+            kind_started_at = monotonic()
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="unknown_clusters",
+                    message=f"Rebuilding {'partial' if partial else 'final'} {kind} cluster cache",
+                    current=index - 1,
+                    total=total_kinds,
+                    detail=f"revision {revision}",
+                    indeterminate=True,
+                    overall_started_at=started_at,
+                    step_started_at=kind_started_at,
+                ),
+            )
             built_clusters = self._build_unknown_clusters(kind)
             self.store.save_cached_unknown_clusters(
                 kind,
@@ -899,6 +923,18 @@ class LibraryService:
                     for cluster in built_clusters
                 ],
                 partial=partial,
+            )
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="unknown_clusters",
+                    message=f"Updated {'partial' if partial else 'final'} {kind} cluster cache",
+                    current=index,
+                    total=total_kinds,
+                    detail=f"{len(built_clusters)} cluster(s)",
+                    overall_started_at=started_at,
+                    step_started_at=kind_started_at,
+                ),
             )
 
     def _serialize_unknown_cluster(self, cluster: UnknownPersonaCluster) -> dict[str, object]:
@@ -2766,6 +2802,57 @@ class LibraryService:
     ) -> None:
         if progress_callback is not None:
             progress_callback(update)
+
+    def _make_progress_update(
+        self,
+        *,
+        phase: str,
+        message: str,
+        current: int = 0,
+        total: int = 0,
+        detail: str = "",
+        indeterminate: bool = False,
+        snapshot_ready: bool = False,
+        overall_started_at: float | None = None,
+        step_started_at: float | None = None,
+    ) -> ProgressUpdate:
+        now = monotonic()
+        elapsed_seconds = None if overall_started_at is None else max(0.0, now - overall_started_at)
+        step_seconds = None if step_started_at is None else max(0.0, now - step_started_at)
+        eta_seconds = None
+        if elapsed_seconds is not None:
+            eta_seconds = self._estimate_eta_seconds(
+                elapsed_seconds=elapsed_seconds,
+                current=current,
+                total=total,
+            )
+        return ProgressUpdate(
+            phase=phase,
+            message=message,
+            current=current,
+            total=total,
+            detail=detail,
+            indeterminate=indeterminate,
+            snapshot_ready=snapshot_ready,
+            elapsed_seconds=elapsed_seconds,
+            eta_seconds=eta_seconds,
+            step_seconds=step_seconds,
+            timestamp_seconds=now,
+        )
+
+    def _estimate_eta_seconds(
+        self,
+        *,
+        elapsed_seconds: float,
+        current: int,
+        total: int,
+    ) -> float | None:
+        if total <= 0 or current <= 0 or current >= total:
+            return None
+        work_rate = elapsed_seconds / current
+        if work_rate <= 0:
+            return None
+        return max(0.0, work_rate * (total - current))
 
     def _sorted_asset_entries(
         self,
