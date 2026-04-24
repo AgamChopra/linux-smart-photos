@@ -743,6 +743,7 @@ class UnknownClustersPage(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Assignment Failed", str(exc))
             return
+        self.owner.request_unknown_cluster_cache_refresh(partial=False)
         self.owner.refresh_views()
 
     def _open_corrections(self, *_args) -> None:
@@ -752,6 +753,7 @@ class UnknownClustersPage(QWidget):
             return
         dialog = CorrectionsDialog(self.service, item_id, self)
         dialog.exec()
+        self.owner.request_unknown_cluster_cache_refresh(partial=False)
         self.owner.refresh_views()
 
     def _selected_clusters(self) -> list[UnknownPersonaCluster]:
@@ -1229,6 +1231,7 @@ class MainWindow(QMainWindow):
         self._cluster_cache_thread: QThread | None = None
         self._cluster_cache_worker: UnknownClusterCacheWorker | None = None
         self._cluster_cache_last_started = 0.0
+        self._cluster_cache_partial_pending = False
         self._cluster_cache_final_pending = False
         self._main_task_base_message = ""
         self._main_task_progress: ProgressUpdate | None = None
@@ -1285,6 +1288,7 @@ class MainWindow(QMainWindow):
 
     def _finish_startup(self) -> None:
         self.refresh_views(refresh_unknown=False)
+        self.request_unknown_cluster_cache_refresh(partial=True)
         QTimer.singleShot(0, self._start_startup_tasks)
 
     def refresh_views(
@@ -1402,7 +1406,7 @@ class MainWindow(QMainWindow):
         if update.snapshot_ready:
             self._schedule_live_refresh()
             if self._active_task in {"startup", "sync"}:
-                self._maybe_refresh_unknown_cluster_cache()
+                self.request_unknown_cluster_cache_refresh(partial=True)
 
     def _handle_task_completed(self, payload: Any) -> None:
         task_name = str(payload.get("task", self._active_task))
@@ -1412,7 +1416,7 @@ class MainWindow(QMainWindow):
         self._main_task_progress = None
         self._main_task_base_message = ""
         if task_name in {"startup", "sync"}:
-            self._start_unknown_cluster_cache_refresh(partial=False)
+            self.request_unknown_cluster_cache_refresh(partial=False)
         if task_name == "startup" and payload.get("download_error"):
             QMessageBox.warning(
                 self,
@@ -1472,11 +1476,26 @@ class MainWindow(QMainWindow):
         self.service.reload()
         self.refresh_live_views()
 
-    def _maybe_refresh_unknown_cluster_cache(self) -> None:
+    def request_unknown_cluster_cache_refresh(self, *, partial: bool) -> None:
+        if partial:
+            self._cluster_cache_partial_pending = True
+        else:
+            self._cluster_cache_final_pending = True
+        self._drain_unknown_cluster_cache_queue()
+
+    def _drain_unknown_cluster_cache_queue(self) -> None:
         if self._cluster_cache_thread is not None:
             return
-        if monotonic() - self._cluster_cache_last_started < 5.0:
+        if self._cluster_cache_final_pending:
+            self._cluster_cache_final_pending = False
+            self._start_unknown_cluster_cache_refresh(partial=False)
             return
+        if not self._cluster_cache_partial_pending:
+            return
+        if monotonic() - self._cluster_cache_last_started < 2.0:
+            QTimer.singleShot(500, self._drain_unknown_cluster_cache_queue)
+            return
+        self._cluster_cache_partial_pending = False
         self._start_unknown_cluster_cache_refresh(partial=True)
 
     def _start_unknown_cluster_cache_refresh(self, *, partial: bool) -> None:
@@ -1545,10 +1564,13 @@ class MainWindow(QMainWindow):
     def _clear_unknown_cluster_cache_handles(self) -> None:
         self._cluster_cache_thread = None
         self._cluster_cache_worker = None
-        if self._cluster_cache_final_pending:
-            self._cluster_cache_final_pending = False
-            self._start_unknown_cluster_cache_refresh(partial=False)
-        elif not self._active_task:
+        self._drain_unknown_cluster_cache_queue()
+        if (
+            self._cluster_cache_thread is None
+            and not self._cluster_cache_partial_pending
+            and not self._cluster_cache_final_pending
+            and not self._active_task
+        ):
             self._cluster_cache_progress = None
             self._cluster_cache_base_message = ""
             self.cluster_cache_status.set_idle("Waiting for scan progress")

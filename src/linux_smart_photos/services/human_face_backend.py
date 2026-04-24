@@ -75,10 +75,27 @@ class HumanFaceBackend:
         self.recognizer_session = ort.InferenceSession(str(recognizer_path), providers=recognizer_providers)
         self.detector_providers = list(self.detector_session.get_providers())
         self.recognizer_providers = list(self.recognizer_session.get_providers())
-        self.uses_gpu = any(
+        self.detector_uses_gpu = any(
             provider in {"TensorrtExecutionProvider", "CUDAExecutionProvider"}
-            for provider in [*self.detector_providers, *self.recognizer_providers]
+            for provider in self.detector_providers
         )
+        self.recognizer_uses_gpu = any(
+            provider in {"TensorrtExecutionProvider", "CUDAExecutionProvider"}
+            for provider in self.recognizer_providers
+        )
+        self.uses_gpu = self.detector_uses_gpu or self.recognizer_uses_gpu
+        if "TensorrtExecutionProvider" in self.detector_providers:
+            self.detector_device_label = "tensorrt"
+        elif self.detector_uses_gpu:
+            self.detector_device_label = "cuda"
+        else:
+            self.detector_device_label = "cpu"
+        if "TensorrtExecutionProvider" in self.recognizer_providers:
+            self.recognizer_device_label = "tensorrt"
+        elif self.recognizer_uses_gpu:
+            self.recognizer_device_label = "cuda"
+        else:
+            self.recognizer_device_label = "cpu"
         if "TensorrtExecutionProvider" in self.detector_providers:
             self.device_label = "tensorrt"
         elif self.uses_gpu:

@@ -155,8 +155,13 @@ class VisionAnalyzer:
         self.human_face_providers: list[str] = []
         self.human_face_uses_gpu = False
         self.human_face_device_label = ""
+        self.human_face_detector_device_label = ""
+        self.human_face_recognizer_device_label = ""
+        self.human_face_detector_providers: list[str] = []
+        self.human_face_recognizer_providers: list[str] = []
         self.human_face_detector_name = ""
         self.human_face_recognizer_name = ""
+        self.human_face_backend_error = ""
         self.human_face_pipeline_id = self.human_face_pipeline_revision(config)
         self.yolo_device = self._preferred_yolo_device()
         self.cat_face_detector = self._load_cat_face_detector()
@@ -252,8 +257,13 @@ class VisionAnalyzer:
             "human_face_pipeline": self.human_face_pipeline_id if self.human_face_backend else "",
             "human_face_providers": list(self.human_face_providers),
             "human_face_device": self.human_face_device_label if self.human_face_backend else "",
+            "human_face_detector_providers": list(self.human_face_detector_providers),
+            "human_face_recognizer_providers": list(self.human_face_recognizer_providers),
+            "human_face_detector_device": self.human_face_detector_device_label if self.human_face_backend else "",
+            "human_face_recognizer_device": self.human_face_recognizer_device_label if self.human_face_backend else "",
             "human_face_detector_model": self.human_face_detector_name if self.human_face_backend else "",
             "human_face_recognizer_model": self.human_face_recognizer_name if self.human_face_backend else "",
+            "human_face_backend_error": self.human_face_backend_error,
             "object_model": self.config.object_model_id if self.object_model else "",
             "object_device": self._yolo_device_label() if self.object_model else "",
             "pet_face_model": self.config.pet_detector_model_id if self.pet_face_model else "",
@@ -792,7 +802,7 @@ class VisionAnalyzer:
                 available = []
         return available
 
-    def _preferred_recognizer_provider_specs(self) -> list[Any]:
+    def _preferred_recognizer_provider_specs(self, *, include_cpu_fallback: bool = True) -> list[Any]:
         available = self._available_onnx_providers()
         providers: list[Any] = []
         if "CUDAExecutionProvider" in available:
@@ -808,7 +818,7 @@ class VisionAnalyzer:
                     },
                 )
             )
-        if "CPUExecutionProvider" in available:
+        if include_cpu_fallback and "CPUExecutionProvider" in available:
             providers.append("CPUExecutionProvider")
         if not providers:
             providers = ["CPUExecutionProvider"]
@@ -819,6 +829,7 @@ class VisionAnalyzer:
         detector_path: Path,
         *,
         detection_input_size: tuple[int, int],
+        include_cpu_fallback: bool = True,
     ) -> list[Any]:
         available = self._available_onnx_providers()
         providers: list[Any] = []
@@ -856,7 +867,7 @@ class VisionAnalyzer:
                     },
                 )
             )
-        if "CPUExecutionProvider" in available:
+        if include_cpu_fallback and "CPUExecutionProvider" in available:
             providers.append("CPUExecutionProvider")
         if not providers:
             providers = ["CPUExecutionProvider"]
@@ -962,13 +973,19 @@ class VisionAnalyzer:
         if detector_path is None or recognizer_path is None:
             return None
 
+        self.human_face_backend_error = ""
         try:
             detection_input_size = (640, 640)
+            available = self._available_onnx_providers()
+            gpu_provider_available = "CUDAExecutionProvider" in available
             detector_providers = self._preferred_detector_provider_specs(
                 detector_path,
                 detection_input_size=detection_input_size,
+                include_cpu_fallback=not gpu_provider_available,
             )
-            recognizer_providers = self._preferred_recognizer_provider_specs()
+            recognizer_providers = self._preferred_recognizer_provider_specs(
+                include_cpu_fallback=not gpu_provider_available,
+            )
             backend = HumanFaceBackend(
                 detector_path=detector_path,
                 recognizer_path=recognizer_path,
@@ -976,12 +993,18 @@ class VisionAnalyzer:
                 recognizer_providers=recognizer_providers,
                 detection_input_size=detection_input_size,
             )
+            if gpu_provider_available and not backend.uses_gpu:
+                raise RuntimeError(
+                    "Human face backend initialized without CUDA/TensorRT despite CUDAExecutionProvider being available."
+                )
             self.human_face_detector_name = detector_path.name
             self.human_face_recognizer_name = recognizer_path.name
             self.human_face_pipeline_id = self.human_face_pipeline_revision(
                 detector_name=self.human_face_detector_name,
                 recognizer_name=self.human_face_recognizer_name,
             )
+            self.human_face_detector_providers = list(backend.detector_providers)
+            self.human_face_recognizer_providers = list(backend.recognizer_providers)
             provider_order = list(backend.detector_providers)
             for provider in backend.recognizer_providers:
                 if provider not in provider_order:
@@ -989,11 +1012,46 @@ class VisionAnalyzer:
             self.human_face_providers = provider_order
             self.human_face_uses_gpu = backend.uses_gpu
             self.human_face_device_label = backend.device_label
+            self.human_face_detector_device_label = backend.detector_device_label
+            self.human_face_recognizer_device_label = backend.recognizer_device_label
             return backend
-        except Exception:
+        except Exception as gpu_exc:
+            self.human_face_backend_error = str(gpu_exc)
+            try:
+                backend = HumanFaceBackend(
+                    detector_path=detector_path,
+                    recognizer_path=recognizer_path,
+                    detector_providers=["CPUExecutionProvider"],
+                    recognizer_providers=["CPUExecutionProvider"],
+                    detection_input_size=(640, 640),
+                )
+                self.human_face_detector_name = detector_path.name
+                self.human_face_recognizer_name = recognizer_path.name
+                self.human_face_pipeline_id = self.human_face_pipeline_revision(
+                    detector_name=self.human_face_detector_name,
+                    recognizer_name=self.human_face_recognizer_name,
+                )
+                self.human_face_detector_providers = list(backend.detector_providers)
+                self.human_face_recognizer_providers = list(backend.recognizer_providers)
+                provider_order = list(backend.detector_providers)
+                for provider in backend.recognizer_providers:
+                    if provider not in provider_order:
+                        provider_order.append(provider)
+                self.human_face_providers = provider_order
+                self.human_face_uses_gpu = backend.uses_gpu
+                self.human_face_device_label = backend.device_label
+                self.human_face_detector_device_label = backend.detector_device_label
+                self.human_face_recognizer_device_label = backend.recognizer_device_label
+                return backend
+            except Exception:
+                pass
             self.human_face_providers = []
             self.human_face_uses_gpu = False
             self.human_face_device_label = ""
+            self.human_face_detector_device_label = ""
+            self.human_face_recognizer_device_label = ""
+            self.human_face_detector_providers = []
+            self.human_face_recognizer_providers = []
             self.human_face_detector_name = ""
             self.human_face_recognizer_name = ""
             self.human_face_pipeline_id = self.human_face_pipeline_revision(self.config)

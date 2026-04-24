@@ -830,6 +830,9 @@ class LibraryService:
         human_face_detector_model = item.metadata.get("human_face_detector_model")
         human_face_recognizer_model = item.metadata.get("human_face_recognizer_model")
         human_face_device = item.metadata.get("human_face_device")
+        human_face_detector_device = item.metadata.get("human_face_detector_device")
+        human_face_recognizer_device = item.metadata.get("human_face_recognizer_device")
+        human_face_backend_error = item.metadata.get("human_face_backend_error")
         object_device = item.metadata.get("object_device")
         pet_face_device = item.metadata.get("pet_face_device")
         pet_embedding_device = item.metadata.get("pet_embedding_device")
@@ -839,12 +842,18 @@ class LibraryService:
             lines.append(f"Human Face Recognizer: {human_face_recognizer_model}")
         if human_face_device:
             lines.append(f"Human Face Device: {human_face_device}")
+        if human_face_detector_device:
+            lines.append(f"Human Face Detector Device: {human_face_detector_device}")
+        if human_face_recognizer_device:
+            lines.append(f"Human Face Recognizer Device: {human_face_recognizer_device}")
         if object_device:
             lines.append(f"Object Device: {object_device}")
         if pet_face_device:
             lines.append(f"Pet Face Device: {pet_face_device}")
         if pet_embedding_device:
             lines.append(f"Pet Embedding Device: {pet_embedding_device}")
+        if human_face_backend_error:
+            lines.append(f"Human Face Backend Warning: {human_face_backend_error}")
         if item.component_paths and len(item.component_paths) > 1:
             lines.append(f"Components: {len(item.component_paths)}")
         return "\n".join(lines)
@@ -2101,15 +2110,20 @@ class LibraryService:
                 None,
             )
 
+        cluster_key = "|".join(f"{item_id}:{region_id}" for item_id, region_id in member_ids)
+        cluster_id = stable_id(f"unknown-cluster:{cluster.kind}:{cluster_key}")
         preview_path = ""
         if representative_item is not None and representative_detection is not None:
-            preview_path = self._ensure_cluster_preview(representative_item, representative_detection)
+            preview_path = self._ensure_cluster_preview(
+                cluster_id,
+                representative_item,
+                representative_detection,
+            )
 
         average_confidence = sum(member.confidence for member in cluster.members) / max(1, len(cluster.members))
         label = cluster.labels.most_common(1)[0][0] if cluster.labels else ("face" if cluster.kind == "person" else "pet")
-        cluster_key = "|".join(f"{item_id}:{region_id}" for item_id, region_id in member_ids)
         return UnknownPersonaCluster(
-            id=stable_id(f"unknown-cluster:{cluster.kind}:{cluster_key}"),
+            id=cluster_id,
             kind=cluster.kind,
             label=label,
             member_count=len(member_ids),
@@ -2160,19 +2174,19 @@ class LibraryService:
 
     def _ensure_cluster_preview(
         self,
+        cluster_id: str,
         item: MediaItem,
         detection: DetectionRegion,
     ) -> str:
         preview_root = self._cluster_previews_root()
         preview_root.mkdir(parents=True, exist_ok=True)
-        preview_path = preview_root / f"{stable_id(f'{item.id}:{detection.id}')}.jpg"
-        if not preview_path.exists():
-            crop = self._extract_reference_crop(item, detection)
-            if crop is None:
-                return item.thumbnail_path
-            image = crop.convert("RGB")
-            image.thumbnail((256, 256))
-            image.save(preview_path, format="JPEG", quality=90)
+        preview_path = preview_root / f"{cluster_id}.jpg"
+        crop = self._extract_reference_crop(item, detection)
+        if crop is None:
+            return item.thumbnail_path
+        image = crop.convert("RGB")
+        image.thumbnail((256, 256))
+        image.save(preview_path, format="JPEG", quality=90)
         return str(preview_path)
 
     def _cleanup_collections(self) -> bool:
