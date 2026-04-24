@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 from threading import Lock
+from time import monotonic
 from typing import Callable, Iterable
 
 try:
@@ -68,6 +69,13 @@ class SyncSummary:
     added: int
     updated: int
     removed: int
+
+
+@dataclass(slots=True)
+class MediaPage:
+    items: list[MediaItem]
+    has_more: bool
+    next_offset: int | None
 
 
 @dataclass(slots=True)
@@ -251,6 +259,7 @@ class LibraryService:
             _ = self.vision
             batch_size = self._scan_batch_size()
             max_workers = min(self._prefetch_workers(), max(1, batch_size), len(changed_entries))
+            last_partial_cluster_refresh = 0.0
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 total_batches = (len(changed_entries) + batch_size - 1) // batch_size
                 for batch_index, batch_start in enumerate(range(0, len(changed_entries), batch_size), start=1):
@@ -303,6 +312,14 @@ class LibraryService:
                             ),
                         )
                         self._save_progress_items(built_items)
+                        if self._should_refresh_partial_clusters(
+                            batch_index=batch_index,
+                            total_batches=total_batches,
+                            built_items=built_items,
+                            last_refresh_at=last_partial_cluster_refresh,
+                        ):
+                            self._refresh_unknown_cluster_caches(partial=True)
+                            last_partial_cluster_refresh = monotonic()
                         self._emit_progress(
                             progress_callback,
                             ProgressUpdate(
@@ -328,6 +345,7 @@ class LibraryService:
         self._cleanup_collections()
         self.regenerate_memories()
         self.save()
+        self._refresh_unknown_cluster_caches(partial=False)
         completed += 1
         self._emit_progress(
             progress_callback,
@@ -472,6 +490,16 @@ class LibraryService:
         favorites_only: bool = False,
         limit: int | None = None,
     ) -> list[MediaItem]:
+        if limit is not None:
+            return self.search_items_page(
+                query=query,
+                media_kind=media_kind,
+                persona_kind=persona_kind,
+                persona_id=persona_id,
+                favorites_only=favorites_only,
+                offset=0,
+                limit=limit,
+            ).items
         if not self._state_loaded:
             return self._search_items_from_store(
                 query=query,
@@ -515,9 +543,32 @@ class LibraryService:
             reverse=True,
         )
         ranked_items = [item for _, item in scored_items]
-        return ranked_items if limit is None else ranked_items[:limit]
+        return ranked_items
+
+    def search_items_page(
+        self,
+        query: str = "",
+        media_kind: str = "all",
+        persona_kind: str = "all",
+        persona_id: str = "",
+        favorites_only: bool = False,
+        *,
+        offset: int = 0,
+        limit: int = 180,
+    ) -> MediaPage:
+        return self._search_items_page_from_store(
+            query=query,
+            media_kind=media_kind,
+            persona_kind=persona_kind,
+            persona_id=persona_id,
+            favorites_only=favorites_only,
+            offset=offset,
+            limit=limit,
+        )
 
     def items_for_persona(self, persona_id: str, limit: int | None = None) -> list[MediaItem]:
+        if limit is not None:
+            return self.items_for_persona_page(persona_id, offset=0, limit=limit).items
         if not self._state_loaded:
             return self.store.query_items(persona_ids=[persona_id], limit=limit)
         items = [
@@ -525,33 +576,83 @@ class LibraryService:
             for item in self.list_items()
             if persona_id in self.item_persona_ids(item)
         ]
-        return items if limit is None else items[:limit]
+        return items
+
+    def items_for_persona_page(
+        self,
+        persona_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 180,
+    ) -> MediaPage:
+        if not persona_id:
+            return MediaPage(items=[], has_more=False, next_offset=None)
+        items = self.store.query_items(
+            persona_ids=[persona_id],
+            offset=offset,
+            limit=limit + 1,
+        )
+        return self._page_from_items(items, offset=offset, limit=limit, pretrimmed=True)
 
     def items_for_album(self, album_id: str, limit: int | None = None) -> list[MediaItem]:
+        if limit is not None:
+            return self.items_for_album_page(album_id, offset=0, limit=limit).items
         if not self._state_loaded:
             album = self.store.load_album(album_id)
             if not album:
                 return []
-            item_ids = album.item_ids if limit is None else album.item_ids[:limit]
+            item_ids = album.item_ids
             return self.store.load_items_by_ids(item_ids)
         album = self.state.albums.get(album_id)
         if not album:
             return []
-        item_ids = album.item_ids if limit is None else album.item_ids[:limit]
+        item_ids = album.item_ids
         return [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
 
+    def items_for_album_page(
+        self,
+        album_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 180,
+    ) -> MediaPage:
+        if not album_id:
+            return MediaPage(items=[], has_more=False, next_offset=None)
+        album = self.store.load_album(album_id)
+        if not album:
+            return MediaPage(items=[], has_more=False, next_offset=None)
+        items = self.store.load_items_by_ids(album.item_ids[offset : offset + limit + 1])
+        return self._page_from_items(items, offset=offset, limit=limit, pretrimmed=True)
+
     def items_for_memory(self, memory_id: str, limit: int | None = None) -> list[MediaItem]:
+        if limit is not None:
+            return self.items_for_memory_page(memory_id, offset=0, limit=limit).items
         if not self._state_loaded:
             memory = self.store.load_memory(memory_id)
             if not memory:
                 return []
-            item_ids = memory.item_ids if limit is None else memory.item_ids[:limit]
+            item_ids = memory.item_ids
             return self.store.load_items_by_ids(item_ids)
         memory = self.state.memories.get(memory_id)
         if not memory:
             return []
-        item_ids = memory.item_ids if limit is None else memory.item_ids[:limit]
+        item_ids = memory.item_ids
         return [self.state.items[item_id] for item_id in item_ids if item_id in self.state.items]
+
+    def items_for_memory_page(
+        self,
+        memory_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 180,
+    ) -> MediaPage:
+        if not memory_id:
+            return MediaPage(items=[], has_more=False, next_offset=None)
+        memory = self.store.load_memory(memory_id)
+        if not memory:
+            return MediaPage(items=[], has_more=False, next_offset=None)
+        items = self.store.load_items_by_ids(memory.item_ids[offset : offset + limit + 1])
+        return self._page_from_items(items, offset=offset, limit=limit, pretrimmed=True)
 
     def item_persona_ids(self, item: MediaItem) -> list[str]:
         persona_ids = set(item.manual_persona_ids)
@@ -598,6 +699,7 @@ class LibraryService:
         for requested_kind in requested_kinds:
             if requested_kind not in {"person", "pet"}:
                 continue
+            self._ensure_state_loaded()
             cached_clusters = self.store.load_cached_unknown_clusters(
                 requested_kind,
                 revision=self.state.updated_at,
@@ -608,6 +710,16 @@ class LibraryService:
                     for entry in cached_clusters
                 )
                 continue
+            partial_clusters = self.store.load_latest_cached_unknown_clusters(
+                requested_kind,
+                partial=True,
+            )
+            if partial_clusters is not None:
+                clusters.extend(
+                    self._deserialize_unknown_cluster(entry)
+                    for entry in partial_clusters
+                )
+                continue
             if allow_stale_cache:
                 stale_clusters = self.store.load_latest_cached_unknown_clusters(requested_kind)
                 if stale_clusters is not None:
@@ -616,7 +728,6 @@ class LibraryService:
                         for entry in stale_clusters
                     )
                     continue
-            self._ensure_state_loaded()
             built_clusters = self._build_unknown_clusters(requested_kind)
             self.store.save_cached_unknown_clusters(
                 requested_kind,
@@ -638,6 +749,8 @@ class LibraryService:
         clusters: Iterable[UnknownPersonaCluster],
         limit: int | None = None,
     ) -> list[MediaItem]:
+        if limit is not None:
+            return self.items_for_unknown_clusters_page(clusters, offset=0, limit=limit).items
         item_ids: set[str] = set()
         for cluster in clusters:
             item_ids.update(cluster.item_ids)
@@ -650,7 +763,26 @@ class LibraryService:
             key=lambda item: (self._item_datetime(item), item.modified_ts),
             reverse=True,
         )
-        return ranked_items if limit is None else ranked_items[:limit]
+        return ranked_items
+
+    def items_for_unknown_clusters_page(
+        self,
+        clusters: Iterable[UnknownPersonaCluster],
+        *,
+        offset: int = 0,
+        limit: int = 180,
+    ) -> MediaPage:
+        item_ids: set[str] = set()
+        for cluster in clusters:
+            item_ids.update(cluster.item_ids)
+        if not item_ids:
+            return MediaPage(items=[], has_more=False, next_offset=None)
+        items = self.store.query_items_by_ids(
+            sorted(item_ids),
+            offset=offset,
+            limit=limit + 1,
+        )
+        return self._page_from_items(items, offset=offset, limit=limit, pretrimmed=True)
 
     def build_item_details(self, item: MediaItem) -> str:
         personas = ", ".join(persona.name for persona in self.personas_for_item(item)) or "None"
@@ -715,6 +847,59 @@ class LibraryService:
             f"{label} x{count}" if count > 1 else label
             for label, count in ordered
         )
+
+    def _page_from_items(
+        self,
+        items: list[MediaItem],
+        *,
+        offset: int,
+        limit: int,
+        pretrimmed: bool = False,
+    ) -> MediaPage:
+        if limit <= 0:
+            return MediaPage(items=[], has_more=False, next_offset=None)
+        visible_items = items if pretrimmed else items[offset : offset + limit + 1]
+        page_items = visible_items[:limit]
+        has_more = len(visible_items) > limit
+        next_offset = offset + len(page_items) if has_more else None
+        return MediaPage(items=page_items, has_more=has_more, next_offset=next_offset)
+
+    def _should_refresh_partial_clusters(
+        self,
+        *,
+        batch_index: int,
+        total_batches: int,
+        built_items: list[MediaItem],
+        last_refresh_at: float,
+    ) -> bool:
+        if not built_items:
+            return False
+        if batch_index == total_batches:
+            return True
+        if monotonic() - last_refresh_at < 1.5:
+            return False
+        return any(
+            any(
+                detection.kind == "face" or self._is_pet_detection(detection)
+                for detection in item.detections
+            )
+            for item in built_items
+        )
+
+    def _refresh_unknown_cluster_caches(self, *, partial: bool) -> None:
+        self._ensure_state_loaded()
+        revision = self.state.updated_at
+        for kind in ("person", "pet"):
+            built_clusters = self._build_unknown_clusters(kind)
+            self.store.save_cached_unknown_clusters(
+                kind,
+                revision=revision,
+                clusters=[
+                    self._serialize_unknown_cluster(cluster)
+                    for cluster in built_clusters
+                ],
+                partial=partial,
+            )
 
     def _serialize_unknown_cluster(self, cluster: UnknownPersonaCluster) -> dict[str, object]:
         return {
@@ -2333,6 +2518,83 @@ class LibraryService:
         )
         ranked_items = [item for _, item in scored_items]
         return ranked_items if limit is None else ranked_items[:limit]
+
+    def _search_items_page_from_store(
+        self,
+        *,
+        query: str,
+        media_kind: str,
+        persona_kind: str,
+        persona_id: str,
+        favorites_only: bool,
+        offset: int,
+        limit: int,
+    ) -> MediaPage:
+        field_filters, free_text = self._parse_query(query)
+        resolved_media_kind = field_filters.get("type", media_kind)
+        resolved_tag = field_filters.get("tag", "").lower()
+        resolved_year = field_filters.get("year", "")
+
+        persona_ids: list[str] = []
+        if persona_id:
+            persona_ids = [persona_id]
+
+        person_filter = field_filters.get("person", "").strip()
+        pet_filter = field_filters.get("pet", "").strip()
+        if person_filter:
+            candidate_ids = self.store.find_persona_ids_by_name("person", person_filter)
+            if not candidate_ids:
+                return MediaPage(items=[], has_more=False, next_offset=None)
+            persona_ids = candidate_ids if not persona_ids else [value for value in persona_ids if value in candidate_ids]
+            if not persona_ids:
+                return MediaPage(items=[], has_more=False, next_offset=None)
+            persona_kind = "person"
+        if pet_filter:
+            candidate_ids = self.store.find_persona_ids_by_name("pet", pet_filter)
+            if not candidate_ids:
+                return MediaPage(items=[], has_more=False, next_offset=None)
+            persona_ids = candidate_ids if not persona_ids else [value for value in persona_ids if value in candidate_ids]
+            if not persona_ids:
+                return MediaPage(items=[], has_more=False, next_offset=None)
+            persona_kind = "pet"
+
+        if not free_text:
+            candidate_items = self.store.query_items(
+                media_kind=resolved_media_kind,
+                favorites_only=favorites_only,
+                persona_ids=persona_ids or None,
+                persona_kind=persona_kind,
+                year=resolved_year,
+                tag=resolved_tag,
+                search_text="",
+                offset=offset,
+                limit=limit + 1,
+            )
+            return self._page_from_items(candidate_items, offset=offset, limit=limit, pretrimmed=True)
+
+        candidate_limit = max(SEARCH_CANDIDATE_LIMIT, offset + limit + 1)
+        candidate_items = self.store.query_items(
+            media_kind=resolved_media_kind,
+            favorites_only=favorites_only,
+            persona_ids=persona_ids or None,
+            persona_kind=persona_kind,
+            year=resolved_year,
+            tag=resolved_tag,
+            search_text=free_text,
+            limit=candidate_limit,
+        )
+
+        scored_items: list[tuple[int, MediaItem]] = []
+        for item in candidate_items:
+            score = self._score_item(item, free_text)
+            if score >= 35:
+                scored_items.append((score, item))
+        scored_items.sort(
+            key=lambda entry: (entry[0], self._item_datetime(entry[1]), entry[1].modified_ts),
+            reverse=True,
+        )
+        ranked_items = [item for _, item in scored_items]
+        return self._page_from_items(ranked_items, offset=offset, limit=limit)
 
     def _apply_field_filters(
         self,

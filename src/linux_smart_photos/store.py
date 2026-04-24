@@ -206,6 +206,7 @@ class SQLiteLibraryStore:
         self,
         item_ids: Sequence[str],
         *,
+        offset: int = 0,
         limit: int | None = None,
     ) -> list[MediaItem]:
         filtered_ids = [item_id for item_id in item_ids if item_id]
@@ -220,6 +221,12 @@ class SQLiteLibraryStore:
         if limit is not None and limit > 0:
             sql += " LIMIT ?"
             params.append(limit)
+            if offset > 0:
+                sql += " OFFSET ?"
+                params.append(offset)
+        elif offset > 0:
+            sql += " LIMIT -1 OFFSET ?"
+            params.append(offset)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [MediaItem.from_dict(json.loads(row["payload"])) for row in rows]
@@ -306,6 +313,7 @@ class SQLiteLibraryStore:
         year: str = "",
         tag: str = "",
         search_text: str = "",
+        offset: int = 0,
         limit: int | None = None,
     ) -> list[MediaItem]:
         joins: list[str] = []
@@ -353,6 +361,13 @@ class SQLiteLibraryStore:
         if limit is not None and limit > 0:
             sql += " LIMIT ?"
             params.append(limit)
+        if limit is not None and limit > 0:
+            if offset > 0:
+                sql += " OFFSET ?"
+                params.append(offset)
+        elif offset > 0:
+            sql += " LIMIT -1 OFFSET ?"
+            params.append(offset)
 
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -364,8 +379,9 @@ class SQLiteLibraryStore:
         kind: str,
         *,
         revision: str,
+        partial: bool = False,
     ) -> list[dict[str, Any]] | None:
-        cache_key = self._unknown_clusters_cache_key(kind)
+        cache_key = self._unknown_clusters_cache_key(kind, partial=partial)
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT payload FROM cache_entries WHERE cache_key = ? AND revision = ?",
@@ -378,8 +394,13 @@ class SQLiteLibraryStore:
             return [entry for entry in payload if isinstance(entry, dict)]
         return None
 
-    def load_latest_cached_unknown_clusters(self, kind: str) -> list[dict[str, Any]] | None:
-        cache_key = self._unknown_clusters_cache_key(kind)
+    def load_latest_cached_unknown_clusters(
+        self,
+        kind: str,
+        *,
+        partial: bool = False,
+    ) -> list[dict[str, Any]] | None:
+        cache_key = self._unknown_clusters_cache_key(kind, partial=partial)
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT payload FROM cache_entries WHERE cache_key = ?",
@@ -398,8 +419,9 @@ class SQLiteLibraryStore:
         *,
         revision: str,
         clusters: list[dict[str, Any]],
+        partial: bool = False,
     ) -> None:
-        cache_key = self._unknown_clusters_cache_key(kind)
+        cache_key = self._unknown_clusters_cache_key(kind, partial=partial)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -720,8 +742,9 @@ class SQLiteLibraryStore:
                 (entity_id,),
             ).fetchone()
 
-    def _unknown_clusters_cache_key(self, kind: str) -> str:
-        return f"unknown_clusters:{kind}"
+    def _unknown_clusters_cache_key(self, kind: str, *, partial: bool = False) -> str:
+        suffix = "partial" if partial else "final"
+        return f"unknown_clusters:{kind}:{suffix}"
 
     def _sqlite_path_for(self, path: Path) -> Path:
         if path.suffix.lower() in SQLITE_SUFFIXES:

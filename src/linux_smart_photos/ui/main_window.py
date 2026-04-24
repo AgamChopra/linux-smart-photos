@@ -31,7 +31,6 @@ from .dialogs import AlbumDialog, AssignPersonaDialog, CorrectionsDialog
 from .widgets import MediaGridWidget
 
 
-LIVE_LIBRARY_ITEM_LIMIT = 480
 PAGE_ITEM_PREVIEW_LIMIT = 720
 CLUSTER_RENDER_CHUNK_SIZE = 128
 LIVE_REFRESH_INTERVAL_MS = 600
@@ -232,15 +231,18 @@ class LibraryPage(QWidget):
         self.persona_filter.blockSignals(False)
 
     def refresh(self, *_args, limit: int | None = None) -> None:
-        items = self.service.search_items(
-            query=self.search_box.text(),
-            media_kind=str(self.type_filter.currentData()),
-            persona_kind=str(self.kind_filter.currentData()),
-            persona_id=str(self.persona_filter.currentData()),
-            favorites_only=self.favorites_only.isChecked(),
-            limit=limit,
+        self.grid.set_page_loader(
+            lambda offset, page_limit: self.service.search_items_page(
+                query=self.search_box.text(),
+                media_kind=str(self.type_filter.currentData()),
+                persona_kind=str(self.kind_filter.currentData()),
+                persona_id=str(self.persona_filter.currentData()),
+                favorites_only=self.favorites_only.isChecked(),
+                offset=offset,
+                limit=page_limit,
+            ),
+            empty_message="No media items match the current view",
         )
-        self.grid.set_items(items)
 
     def open_corrections(self, *_args) -> None:
         item_id = self.grid.current_item_id()
@@ -365,7 +367,14 @@ class PeoplePage(QWidget):
         if not persona_id:
             self.grid.set_items([])
             return
-        self._queue_item_load(persona_id)
+        self.grid.set_page_loader(
+            lambda offset, page_limit, persona_id=persona_id: self.service.items_for_persona_page(
+                persona_id,
+                offset=offset,
+                limit=page_limit,
+            ),
+            empty_message="No media items belong to this persona yet.",
+        )
 
     def _show_reference_images(self, persona_id: str) -> None:
         references = self.service.persona_reference_images(persona_id) if persona_id else []
@@ -565,7 +574,12 @@ class UnknownClustersPage(QWidget):
     def _show_selected_clusters(self, *_args) -> None:
         clusters = self._selected_clusters()
         if not self._clusters_by_id:
-            self.summary.setText("No unknown people or pet clusters are waiting for assignment.")
+            if self.owner._active_task in {"startup", "sync"}:
+                self.summary.setText(
+                    "Background analysis is still running. Unknown face and pet clusters will appear automatically."
+                )
+            else:
+                self.summary.setText("No unknown people or pet clusters are waiting for assignment.")
             self.grid.set_items([])
             return
         if not clusters:
@@ -584,15 +598,13 @@ class UnknownClustersPage(QWidget):
             f"Items: {total_items}\n"
             f"Types: {cluster_names or 'unknown'}"
         )
-        self._queue_item_load(
-            clusters,
-            summary_text=(
-                f"Selected clusters: {len(clusters)}\n"
-                f"Detections: {total_members}\n"
-                f"Items: {total_items}\n"
-                f"Types: {cluster_names or 'unknown'}"
+        self.grid.set_page_loader(
+            lambda offset, page_limit, clusters=clusters: self.service.items_for_unknown_clusters_page(
+                clusters,
+                offset=offset,
+                limit=page_limit,
             ),
-            total_items=total_items,
+            empty_message="No media items are available for the selected unknown clusters.",
         )
 
     def _assign_selected_clusters(self, *_args) -> None:
@@ -688,7 +700,16 @@ class UnknownClustersPage(QWidget):
         self.cluster_list.blockSignals(True)
         self.cluster_list.clear()
         self.cluster_list.blockSignals(False)
-        self.summary.setText(f"Rendering {len(self._pending_render_clusters)} unknown clusters...")
+        if not self._pending_render_clusters and self.owner._active_task in {"startup", "sync"}:
+            self.summary.setText(
+                "Scanning in background. Unknown clusters will appear automatically as analyzed items accumulate."
+            )
+        elif self.owner._active_task in {"startup", "sync"}:
+            self.summary.setText(
+                f"Rendering {len(self._pending_render_clusters)} live unknown clusters from analyzed items so far..."
+            )
+        else:
+            self.summary.setText(f"Rendering {len(self._pending_render_clusters)} unknown clusters...")
         self._render_timer.start(0)
 
     def _handle_refresh_failed(self, message: str) -> None:
@@ -863,7 +884,17 @@ class AlbumsPage(QWidget):
 
     def _show_album_items(self, *_args) -> None:
         album_id = self._current_album_id()
-        self.grid.set_items(self.service.items_for_album(album_id) if album_id else [])
+        if not album_id:
+            self.grid.set_items([])
+            return
+        self.grid.set_page_loader(
+            lambda offset, page_limit, album_id=album_id: self.service.items_for_album_page(
+                album_id,
+                offset=offset,
+                limit=page_limit,
+            ),
+            empty_message="This album does not contain any media yet.",
+        )
 
     def _new_album(self, *_args) -> None:
         name, ok = QInputDialog.getText(self, "New Album", "Album name")
@@ -943,13 +974,20 @@ class MemoriesPage(QWidget):
 
     def _show_memory_items(self, *_args) -> None:
         memory_id = self._current_memory_id()
-        memory = self.service.state.memories.get(memory_id)
+        memory = next((entry for entry in self.service.list_memories() if entry.id == memory_id), None)
         if not memory:
             self.summary.setText("Select a memory")
             self.grid.set_items([])
             return
         self.summary.setText(f"{memory.title}\n{memory.subtitle}\n{memory.summary}")
-        self.grid.set_items(self.service.items_for_memory(memory_id))
+        self.grid.set_page_loader(
+            lambda offset, page_limit, memory_id=memory_id: self.service.items_for_memory_page(
+                memory_id,
+                offset=offset,
+                limit=page_limit,
+            ),
+            empty_message="This memory does not contain any media yet.",
+        )
 
     def _rebuild_memories(self, *_args) -> None:
         self.service.regenerate_memories()
@@ -1113,7 +1151,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._finish_startup)
 
     def _finish_startup(self) -> None:
-        self.refresh_views(refresh_unknown=False, library_limit=LIVE_LIBRARY_ITEM_LIMIT)
+        self.refresh_views(refresh_unknown=False)
         QTimer.singleShot(0, self._start_startup_tasks)
 
     def refresh_views(
@@ -1124,7 +1162,7 @@ class MainWindow(QMainWindow):
         current_widget = self.tabs.currentWidget()
         self.library_page._refresh_persona_filter()
         if current_widget is self.library_page:
-            self.library_page.refresh(limit=library_limit)
+            self.library_page.refresh()
             self._library_dirty = False
         else:
             self._library_dirty = True
@@ -1156,7 +1194,7 @@ class MainWindow(QMainWindow):
 
         if current_widget is self.library_page:
             self.library_page._refresh_persona_filter()
-            self.library_page.refresh(limit=LIVE_LIBRARY_ITEM_LIMIT)
+            self.library_page.refresh()
             self._library_dirty = False
         else:
             self._library_dirty = True

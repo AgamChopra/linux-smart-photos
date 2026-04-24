@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QIcon, QMovie, QPixmap
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+from PIL import Image, ImageOps
+
+try:
+    from pillow_heif import register_heif_opener
+except Exception:
+    register_heif_opener = None
+else:
+    register_heif_opener()
+
+from PySide6.QtCore import QObject, QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QMovie, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
+    QSlider,
     QSplitter,
     QStackedWidget,
     QStyle,
@@ -19,9 +37,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..media import VIDEO_EXTENSIONS
+from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from ..models import MediaItem
-from ..services.library import LibraryService
+from ..services.library import LibraryService, MediaPage
 
 
 QAudioOutput = None
@@ -49,131 +67,728 @@ def _load_multimedia_backend():
     return QAudioOutput, QMediaPlayer, QVideoWidget
 
 
+def _resample_lanczos():
+    return Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+
+
+def _qimage_from_pil(image: Image.Image) -> QImage:
+    converted = image.convert("RGBA")
+    raw = converted.tobytes("raw", "RGBA")
+    qimage = QImage(
+        raw,
+        converted.width,
+        converted.height,
+        converted.width * 4,
+        QImage.Format_RGBA8888,
+    )
+    return qimage.copy()
+
+
+@dataclass(slots=True)
+class _TimelineHeader:
+    title: str
+    top: int
+    height: int
+
+
+@dataclass(slots=True)
+class _TimelineTile:
+    item_id: str
+    index: int
+    rect: QRect
+
+
+class PreviewLoadWorker(QObject):
+    finished = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, request_id: int, mode: str, source_path: str, target_size: QSize) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.mode = mode
+        self.source_path = source_path
+        self.target_size = target_size
+
+    def run(self) -> None:
+        try:
+            if self.mode == "image":
+                payload = self._load_image_payload()
+            elif self.mode == "video_frame":
+                payload = self._load_video_frame_payload()
+            else:
+                raise ValueError(f"Unsupported preview load mode: {self.mode}")
+            self.finished.emit(self.request_id, payload)
+        except Exception as exc:
+            self.failed.emit(self.request_id, str(exc))
+
+    def _load_image_payload(self) -> dict[str, object]:
+        source = Path(self.source_path)
+        if not source.exists():
+            raise FileNotFoundError(str(source))
+        with Image.open(source) as image:
+            prepared = ImageOps.exif_transpose(image)
+            if prepared.mode not in {"RGB", "RGBA"}:
+                prepared = prepared.convert("RGBA")
+            prepared.thumbnail(
+                (
+                    max(1, self.target_size.width()),
+                    max(1, self.target_size.height()),
+                ),
+                _resample_lanczos(),
+            )
+            return {"kind": "image", "image": _qimage_from_pil(prepared)}
+
+    def _load_video_frame_payload(self) -> dict[str, object]:
+        if cv2 is None:
+            raise RuntimeError("OpenCV video preview support is unavailable.")
+        capture = cv2.VideoCapture(self.source_path)
+        if not capture.isOpened():
+            capture.release()
+            raise RuntimeError(f"Unable to read video preview: {self.source_path}")
+        try:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                raise RuntimeError(f"Unable to decode video preview: {self.source_path}")
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(rgb_frame)
+            image.thumbnail(
+                (
+                    max(1, self.target_size.width()),
+                    max(1, self.target_size.height()),
+                ),
+                _resample_lanczos(),
+            )
+            return {"kind": "video_frame", "image": _qimage_from_pil(image)}
+        finally:
+            capture.release()
+
+
+class TimelineViewport(QAbstractScrollArea):
+    currentItemChanged = Signal(str)
+    selectionChanged = Signal(list)
+    requestMore = Signal()
+    zoomChanged = Signal(int)
+
+    MIN_ZOOM = 0
+    MAX_ZOOM = 100
+    MIN_TILE_SIZE = 96
+    MAX_TILE_SIZE = 240
+    TILE_CORNER_RADIUS = 14
+    CACHE_LIMIT = 1024
+    THUMBNAIL_BATCH_SIZE = 18
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._items: list[MediaItem] = []
+        self._item_ids: list[str] = []
+        self._item_index_by_id: dict[str, int] = {}
+        self._headers: list[_TimelineHeader] = []
+        self._tiles: list[_TimelineTile] = []
+        self._selected_ids: set[str] = set()
+        self._current_item_id = ""
+        self._anchor_item_id = ""
+        self._zoom_level = 58
+        self._status_text = "No media items match the current view"
+        self._has_more = False
+        self._request_more_pending = False
+        self._thumbnail_cache: OrderedDict[str, QPixmap] = OrderedDict()
+        self._thumbnail_queue: list[str] = []
+        self._queued_thumbnail_ids: set[str] = set()
+        self._placeholder_icon = self.style().standardIcon(QStyle.SP_FileIcon)
+        self._thumbnail_timer = QTimer(self)
+        self._thumbnail_timer.setSingleShot(True)
+        self._thumbnail_timer.timeout.connect(self._load_next_thumbnail_batch)
+        self.viewport().setMouseTracking(True)
+        self.verticalScrollBar().valueChanged.connect(self._handle_viewport_changed)
+        self.horizontalScrollBar().valueChanged.connect(self._handle_viewport_changed)
+
+    def clear(self, status_text: str = "No media items match the current view") -> None:
+        self._items = []
+        self._item_ids = []
+        self._item_index_by_id = {}
+        self._headers = []
+        self._tiles = []
+        self._selected_ids.clear()
+        self._current_item_id = ""
+        self._anchor_item_id = ""
+        self._has_more = False
+        self._request_more_pending = False
+        self._thumbnail_queue = []
+        self._queued_thumbnail_ids.clear()
+        self._status_text = status_text
+        self.verticalScrollBar().setRange(0, 0)
+        self.viewport().update()
+        self.selectionChanged.emit([])
+        self.currentItemChanged.emit("")
+
+    def set_items(
+        self,
+        items: list[MediaItem],
+        *,
+        append: bool,
+        has_more: bool,
+        status_text: str,
+    ) -> None:
+        previous_current = self._current_item_id
+        previous_selection = self.selected_item_ids()
+
+        if append:
+            existing_ids = set(self._item_ids)
+            merged_items = list(self._items)
+            for item in items:
+                if item.id in existing_ids:
+                    continue
+                merged_items.append(item)
+                existing_ids.add(item.id)
+            self._items = merged_items
+        else:
+            self._items = list(items)
+            self._thumbnail_queue = []
+            self._queued_thumbnail_ids.clear()
+
+        self._item_ids = [item.id for item in self._items]
+        self._item_index_by_id = {
+            item_id: index
+            for index, item_id in enumerate(self._item_ids)
+        }
+        self._has_more = has_more
+        self._request_more_pending = False
+        self._status_text = status_text
+
+        retained_selection = {
+            item_id
+            for item_id in previous_selection
+            if item_id in self._item_index_by_id
+        }
+        self._selected_ids = retained_selection
+        if previous_current in self._item_index_by_id:
+            self._current_item_id = previous_current
+        elif self._items:
+            self._current_item_id = self._items[0].id
+            self._selected_ids = {self._current_item_id}
+        else:
+            self._current_item_id = ""
+            self._selected_ids.clear()
+        if self._current_item_id:
+            self._anchor_item_id = self._current_item_id
+
+        self._rebuild_layout()
+        current_selection = self.selected_item_ids()
+        if current_selection != previous_selection:
+            self.selectionChanged.emit(current_selection)
+        if self._current_item_id != previous_current:
+            self.currentItemChanged.emit(self._current_item_id)
+
+    def current_item_id(self) -> str:
+        return self._current_item_id
+
+    def selected_item_ids(self) -> list[str]:
+        if not self._selected_ids:
+            return []
+        return [
+            item_id
+            for item_id in self._item_ids
+            if item_id in self._selected_ids
+        ]
+
+    def zoom_level(self) -> int:
+        return self._zoom_level
+
+    def set_zoom_level(self, zoom_level: int) -> None:
+        bounded = max(self.MIN_ZOOM, min(self.MAX_ZOOM, zoom_level))
+        if bounded == self._zoom_level:
+            return
+        current_ratio = self._scroll_ratio()
+        self._zoom_level = bounded
+        self._rebuild_layout(scroll_ratio=current_ratio)
+        self.zoomChanged.emit(self._zoom_level)
+
+    def header_granularity(self) -> str:
+        if self._zoom_level <= 28:
+            return "year"
+        if self._zoom_level <= 62:
+            return "month"
+        return "day"
+
+    def viewportEvent(self, event) -> bool:
+        if event.type() == QEvent.Paint:
+            self._paint_viewport()
+            return True
+        if event.type() == QEvent.MouseButtonPress:
+            self._handle_mouse_press(event)
+            return True
+        if event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            step = 8 if delta > 0 else -8
+            self.set_zoom_level(self._zoom_level + step)
+            return True
+        return super().viewportEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._rebuild_layout(scroll_ratio=self._scroll_ratio())
+
+    def _paint_viewport(self) -> None:
+        painter = QPainter(self.viewport())
+        painter.fillRect(self.viewport().rect(), QColor("#fbf9f5"))
+        if not self._items:
+            painter.setPen(QColor("#6d6458"))
+            painter.drawText(
+                self.viewport().rect().adjusted(24, 24, -24, -24),
+                Qt.AlignCenter | Qt.TextWordWrap,
+                self._status_text,
+            )
+            return
+
+        scroll_y = self.verticalScrollBar().value()
+        view_height = self.viewport().height()
+        visible_top = scroll_y
+        visible_bottom = scroll_y + view_height
+        header_background = QColor("#f7f2ea")
+        header_text = QColor("#54473b")
+        for header in self._headers:
+            if header.top + header.height < visible_top or header.top > visible_bottom:
+                continue
+            rect = QRect(0, header.top - scroll_y, self.viewport().width(), header.height)
+            painter.fillRect(rect, header_background)
+            painter.setPen(header_text)
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSizeF(max(10.0, self._tile_size() / 12.0))
+            painter.setFont(font)
+            painter.drawText(rect.adjusted(20, 0, -20, 0), Qt.AlignVCenter | Qt.AlignLeft, header.title)
+
+        for tile in self._tiles:
+            if tile.rect.bottom() < visible_top or tile.rect.top() > visible_bottom:
+                continue
+            draw_rect = QRect(tile.rect)
+            draw_rect.translate(0, -scroll_y)
+            item = self._items[tile.index]
+            is_current = item.id == self._current_item_id
+            is_selected = item.id in self._selected_ids
+            border_color = QColor("#0d3b66") if is_current else QColor("#d8d1c6")
+            fill_color = QColor("#e7e1d7") if is_selected else QColor("#f3eee6")
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            path = QPainterPath()
+            path.addRoundedRect(draw_rect, self.TILE_CORNER_RADIUS, self.TILE_CORNER_RADIUS)
+            painter.fillPath(path, fill_color)
+            painter.setPen(border_color)
+            painter.drawPath(path)
+
+            pixmap = self._thumbnail_cache.get(item.id)
+            if pixmap is None or pixmap.isNull():
+                self._draw_placeholder_tile(painter, draw_rect)
+                continue
+
+            scaled = pixmap.scaled(
+                draw_rect.size(),
+                Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation,
+            )
+            source_x = max(0, (scaled.width() - draw_rect.width()) // 2)
+            source_y = max(0, (scaled.height() - draw_rect.height()) // 2)
+            painter.setClipPath(path)
+            painter.drawPixmap(
+                draw_rect,
+                scaled,
+                QRect(source_x, source_y, draw_rect.width(), draw_rect.height()),
+            )
+            painter.setClipping(False)
+
+    def _draw_placeholder_tile(self, painter: QPainter, draw_rect: QRect) -> None:
+        painter.fillRect(draw_rect.adjusted(2, 2, -2, -2), QColor("#ece6db"))
+        placeholder = self._placeholder_icon.pixmap(min(draw_rect.width() // 2, 64), min(draw_rect.height() // 2, 64))
+        x = draw_rect.center().x() - placeholder.width() // 2
+        y = draw_rect.center().y() - placeholder.height() // 2
+        painter.drawPixmap(x, y, placeholder)
+
+    def _handle_mouse_press(self, event) -> None:
+        hit_item_id = self._item_id_at(event.position().toPoint())
+        if not hit_item_id:
+            return
+        modifiers = event.modifiers()
+        if modifiers & Qt.ShiftModifier and self._anchor_item_id in self._item_index_by_id:
+            self._select_range(hit_item_id)
+        elif modifiers & Qt.ControlModifier:
+            if hit_item_id in self._selected_ids:
+                self._selected_ids.remove(hit_item_id)
+            else:
+                self._selected_ids.add(hit_item_id)
+            self._current_item_id = hit_item_id
+            self._anchor_item_id = hit_item_id
+        else:
+            self._selected_ids = {hit_item_id}
+            self._current_item_id = hit_item_id
+            self._anchor_item_id = hit_item_id
+        self._ensure_current_visible()
+        self.viewport().update()
+        self.selectionChanged.emit(self.selected_item_ids())
+        self.currentItemChanged.emit(self._current_item_id)
+
+    def _select_range(self, hit_item_id: str) -> None:
+        anchor_index = self._item_index_by_id.get(self._anchor_item_id, 0)
+        hit_index = self._item_index_by_id.get(hit_item_id, anchor_index)
+        start_index = min(anchor_index, hit_index)
+        end_index = max(anchor_index, hit_index)
+        self._selected_ids = set(self._item_ids[start_index : end_index + 1])
+        self._current_item_id = hit_item_id
+
+    def _item_id_at(self, position: QPoint) -> str:
+        scroll_y = self.verticalScrollBar().value()
+        absolute = QPoint(position.x(), position.y() + scroll_y)
+        for tile in self._tiles:
+            if tile.rect.contains(absolute):
+                return tile.item_id
+        return ""
+
+    def _rebuild_layout(self, *, scroll_ratio: float | None = None) -> None:
+        if not self._items:
+            self._headers = []
+            self._tiles = []
+            self.verticalScrollBar().setRange(0, 0)
+            self.viewport().update()
+            return
+
+        tile_size = self._tile_size()
+        spacing = max(10, tile_size // 12)
+        top_margin = max(12, tile_size // 10)
+        left_margin = max(12, tile_size // 10)
+        header_height = max(36, tile_size // 3)
+        section_gap = max(14, spacing)
+        available_width = max(1, self.viewport().width() - (left_margin * 2))
+        columns = max(1, (available_width + spacing) // (tile_size + spacing))
+        total_row_width = columns * tile_size + (columns - 1) * spacing
+        x_offset = max(left_margin, (self.viewport().width() - total_row_width) // 2)
+
+        headers: list[_TimelineHeader] = []
+        tiles: list[_TimelineTile] = []
+        y = top_margin
+        grouped_items = self._group_item_indexes(columns)
+        for title, indexes in grouped_items:
+            headers.append(_TimelineHeader(title=title, top=y, height=header_height))
+            y += header_height + spacing
+            for start in range(0, len(indexes), columns):
+                row_indexes = indexes[start : start + columns]
+                for column, item_index in enumerate(row_indexes):
+                    x = x_offset + column * (tile_size + spacing)
+                    rect = QRect(x, y, tile_size, tile_size)
+                    tiles.append(
+                        _TimelineTile(
+                            item_id=self._items[item_index].id,
+                            index=item_index,
+                            rect=rect,
+                        )
+                    )
+                y += tile_size + spacing
+            y += section_gap
+
+        content_height = max(0, y)
+        self._headers = headers
+        self._tiles = tiles
+        scrollbar = self.verticalScrollBar()
+        maximum = max(0, content_height - self.viewport().height())
+        scrollbar.setRange(0, maximum)
+        scrollbar.setPageStep(self.viewport().height())
+        if scroll_ratio is not None and maximum > 0:
+            scrollbar.setValue(int(maximum * scroll_ratio))
+        self._schedule_visible_asset_work()
+        self.viewport().update()
+
+    def _group_item_indexes(self, _columns: int) -> list[tuple[str, list[int]]]:
+        groups: list[tuple[str, list[int]]] = []
+        current_title = ""
+        current_indexes: list[int] = []
+        for index, item in enumerate(self._items):
+            title = self._header_title(item)
+            if current_title and title != current_title:
+                groups.append((current_title, current_indexes))
+                current_indexes = []
+            current_title = title
+            current_indexes.append(index)
+        if current_indexes:
+            groups.append((current_title, current_indexes))
+        return groups
+
+    def _header_title(self, item: MediaItem) -> str:
+        captured = self._item_datetime(item)
+        granularity = self.header_granularity()
+        if granularity == "year":
+            return captured.strftime("%Y")
+        if granularity == "month":
+            return captured.strftime("%B %Y")
+        return captured.strftime("%B %d, %Y")
+
+    def _item_datetime(self, item: MediaItem) -> datetime:
+        try:
+            return datetime.fromisoformat(item.captured_at.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.fromtimestamp(max(item.modified_ts, 0))
+
+    def _tile_size(self) -> int:
+        ratio = (self._zoom_level - self.MIN_ZOOM) / max(1, self.MAX_ZOOM - self.MIN_ZOOM)
+        return int(self.MIN_TILE_SIZE + ratio * (self.MAX_TILE_SIZE - self.MIN_TILE_SIZE))
+
+    def _schedule_visible_asset_work(self) -> None:
+        self._queue_visible_thumbnails()
+        self._maybe_request_more()
+
+    def _handle_viewport_changed(self, *_args) -> None:
+        self._schedule_visible_asset_work()
+        self.viewport().update()
+
+    def _queue_visible_thumbnails(self) -> None:
+        if not self._items:
+            return
+        scroll_y = self.verticalScrollBar().value()
+        overscan = self._tile_size() * 2
+        visible_top = max(0, scroll_y - overscan)
+        visible_bottom = scroll_y + self.viewport().height() + overscan
+        for tile in self._tiles:
+            if tile.rect.bottom() < visible_top or tile.rect.top() > visible_bottom:
+                continue
+            if tile.item_id in self._thumbnail_cache or tile.item_id in self._queued_thumbnail_ids:
+                continue
+            item = self._items[tile.index]
+            if not item.thumbnail_path or not Path(item.thumbnail_path).exists():
+                continue
+            self._thumbnail_queue.append(tile.item_id)
+            self._queued_thumbnail_ids.add(tile.item_id)
+        if self._thumbnail_queue and not self._thumbnail_timer.isActive():
+            self._thumbnail_timer.start(0)
+
+    def _load_next_thumbnail_batch(self) -> None:
+        loaded_any = False
+        for _ in range(min(self.THUMBNAIL_BATCH_SIZE, len(self._thumbnail_queue))):
+            if not self._thumbnail_queue:
+                break
+            item_id = self._thumbnail_queue.pop(0)
+            self._queued_thumbnail_ids.discard(item_id)
+            item_index = self._item_index_by_id.get(item_id)
+            if item_index is None:
+                continue
+            item = self._items[item_index]
+            thumbnail_path = Path(item.thumbnail_path)
+            if not item.thumbnail_path or not thumbnail_path.exists():
+                continue
+            pixmap = QPixmap(str(thumbnail_path))
+            if pixmap.isNull():
+                continue
+            self._thumbnail_cache[item_id] = pixmap
+            self._thumbnail_cache.move_to_end(item_id)
+            loaded_any = True
+            while len(self._thumbnail_cache) > self.CACHE_LIMIT:
+                self._thumbnail_cache.popitem(last=False)
+        if loaded_any:
+            self.viewport().update()
+        if self._thumbnail_queue:
+            self._thumbnail_timer.start(0)
+
+    def _maybe_request_more(self) -> None:
+        if not self._has_more or self._request_more_pending:
+            return
+        scrollbar = self.verticalScrollBar()
+        remaining = scrollbar.maximum() - scrollbar.value()
+        if remaining > max(self.viewport().height(), self._tile_size() * 3):
+            return
+        self._request_more_pending = True
+        self.requestMore.emit()
+
+    def acknowledge_more_items(self) -> None:
+        self._request_more_pending = False
+
+    def _ensure_current_visible(self) -> None:
+        if not self._current_item_id:
+            return
+        current_index = self._item_index_by_id.get(self._current_item_id)
+        if current_index is None:
+            return
+        for tile in self._tiles:
+            if tile.index != current_index:
+                continue
+            scrollbar = self.verticalScrollBar()
+            top = scrollbar.value()
+            bottom = top + self.viewport().height()
+            if tile.rect.top() < top:
+                scrollbar.setValue(tile.rect.top())
+            elif tile.rect.bottom() > bottom:
+                scrollbar.setValue(tile.rect.bottom() - self.viewport().height())
+            return
+
+    def _scroll_ratio(self) -> float:
+        scrollbar = self.verticalScrollBar()
+        if scrollbar.maximum() <= 0:
+            return 0.0
+        return scrollbar.value() / scrollbar.maximum()
+
+
 class MediaGridWidget(QWidget):
-    POPULATE_CHUNK_SIZE = 96
+    PAGE_SIZE = 180
 
     selectionChanged = Signal(list)
 
     def __init__(self, service: LibraryService, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.service = service
-        self._items: dict[str, MediaItem] = {}
+        self._page_loader: Callable[[int, int], MediaPage] | None = None
+        self._static_items: list[MediaItem] | None = None
+        self._next_offset: int | None = 0
+        self._has_more = False
+        self._loading_page = False
+        self._empty_message = "No media items match the current view"
         self._movie: QMovie | None = None
         self._preview_video_path = ""
+        self._preview_request_id = 0
+        self._preview_thread: QThread | None = None
+        self._preview_worker: PreviewLoadWorker | None = None
+        self._pending_preview_request: tuple[int, str, str] | None = None
 
-        self.list_widget = QListWidget()
-        self.list_widget.setViewMode(QListWidget.IconMode)
-        self.list_widget.setResizeMode(QListWidget.Adjust)
-        self.list_widget.setMovement(QListWidget.Static)
-        self.list_widget.setSpacing(12)
-        self.list_widget.setIconSize(QSize(180, 180))
-        self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list_widget.currentItemChanged.connect(self._update_preview)
-        self.list_widget.itemSelectionChanged.connect(self._emit_selection)
-        self._placeholder_icon = self.style().standardIcon(QStyle.SP_FileIcon)
-        self._pending_items: list[MediaItem] = []
-        self._populate_cursor = 0
-        self._pending_previous_item_id = ""
-        self._populate_timer = QTimer(self)
-        self._populate_timer.setSingleShot(True)
-        self._populate_timer.timeout.connect(self._populate_next_chunk)
+        self.timeline_view = TimelineViewport()
+        self.timeline_view.selectionChanged.connect(self.selectionChanged.emit)
+        self.timeline_view.currentItemChanged.connect(self._handle_current_item_changed)
+        self.timeline_view.requestMore.connect(self._load_next_page)
+        self.timeline_view.zoomChanged.connect(self._sync_zoom_controls)
+
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_out_button.clicked.connect(lambda: self.timeline_view.set_zoom_level(self.timeline_view.zoom_level() - 8))
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(self.timeline_view.MIN_ZOOM, self.timeline_view.MAX_ZOOM)
+        self.zoom_slider.setValue(self.timeline_view.zoom_level())
+        self.zoom_slider.valueChanged.connect(self.timeline_view.set_zoom_level)
+        self.zoom_in_button = QPushButton("+")
+        self.zoom_in_button.clicked.connect(lambda: self.timeline_view.set_zoom_level(self.timeline_view.zoom_level() + 8))
+
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom"))
+        zoom_row.addWidget(self.zoom_out_button)
+        zoom_row.addWidget(self.zoom_slider, 1)
+        zoom_row.addWidget(self.zoom_in_button)
+
+        gallery_panel = QWidget()
+        gallery_layout = QVBoxLayout(gallery_panel)
+        gallery_layout.addLayout(zoom_row)
+        gallery_layout.addWidget(self.timeline_view, 1)
 
         self.preview_label = QLabel("Select a media item")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumWidth(360)
-        self.preview_label.setMinimumHeight(360)
+        self.preview_label.setMinimumWidth(420)
+        self.preview_label.setMinimumHeight(420)
         self.preview_label.setStyleSheet(
             "background: #f3f1ec; border: 1px solid #ddd3c7; border-radius: 12px;"
         )
+        self.preview_label.setWordWrap(True)
 
         self.preview_stack = QStackedWidget()
         self.preview_stack.addWidget(self.preview_label)
 
         self.video_status_label = QLabel("Video playback is unavailable in this environment.")
         self.video_status_label.setAlignment(Qt.AlignCenter)
-        self.video_status_label.setMinimumWidth(360)
-        self.video_status_label.setMinimumHeight(360)
+        self.video_status_label.setMinimumWidth(420)
+        self.video_status_label.setMinimumHeight(420)
         self.video_status_label.setStyleSheet(
             "background: #f3f1ec; border: 1px solid #ddd3c7; border-radius: 12px;"
         )
+        self.video_status_label.setWordWrap(True)
+        self.preview_stack.addWidget(self.video_status_label)
 
         self.video_widget = None
         self.media_player = None
         self.audio_output = None
-        self.preview_stack.addWidget(self.video_status_label)
 
         self.video_toggle_button = QPushButton("Play Preview")
         self.video_toggle_button.clicked.connect(self._toggle_video)
         self.video_toggle_button.setVisible(False)
 
-        preview_controls = QHBoxLayout()
-        preview_controls.addStretch(1)
-        preview_controls.addWidget(self.video_toggle_button)
+        self.info_toggle_button = QPushButton("Show Info")
+        self.info_toggle_button.clicked.connect(self._toggle_details)
+
+        controls_row = QHBoxLayout()
+        controls_row.addStretch(1)
+        controls_row.addWidget(self.video_toggle_button)
+        controls_row.addWidget(self.info_toggle_button)
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
-        self.details.setMinimumWidth(360)
+        self.details.setMinimumWidth(420)
+        self.details.setVisible(False)
 
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.addWidget(self.preview_stack)
-        right_layout.addLayout(preview_controls)
-        right_layout.addWidget(self.details)
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.addWidget(self.preview_stack)
+        preview_layout.addLayout(controls_row)
+        preview_layout.addWidget(self.details)
 
         splitter = QSplitter()
-        splitter.addWidget(self.list_widget)
-        splitter.addWidget(right_panel)
+        splitter.addWidget(gallery_panel)
+        splitter.addWidget(preview_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
 
         layout = QVBoxLayout(self)
         layout.addWidget(splitter)
 
+    def set_page_loader(
+        self,
+        loader: Callable[[int, int], MediaPage],
+        *,
+        empty_message: str = "No media items match the current view",
+    ) -> None:
+        self._page_loader = loader
+        self._static_items = None
+        self._empty_message = empty_message
+        self._next_offset = 0
+        self._has_more = False
+        self._loading_page = False
+        self.timeline_view.clear(status_text="Loading media items...")
+        self._load_next_page(reset=True)
+
     def set_items(self, items: list[MediaItem]) -> None:
-        previous_item_id = self.current_item_id()
-        self._items = {item.id: item for item in items}
-        self._clear_preview_media()
-        self._populate_timer.stop()
-        self.list_widget.clear()
-        self._pending_items = list(items)
-        self._populate_cursor = 0
-        self._pending_previous_item_id = previous_item_id
-
-        if not items:
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("No media items match the current view")
-            self.preview_stack.setCurrentWidget(self.preview_label)
-            self.video_toggle_button.setVisible(False)
-            self.details.setText("")
-            return
-
-        self.preview_label.setPixmap(QPixmap())
-        self.preview_label.setText(f"Loading {len(items)} media items...")
-        self.preview_stack.setCurrentWidget(self.preview_label)
-        self.video_toggle_button.setVisible(False)
-        self.details.setText("")
-        self._populate_timer.start(0)
+        self._static_items = list(items)
+        self.set_page_loader(
+            lambda offset, limit: self._page_from_static_items(offset, limit),
+            empty_message="No media items match the current view",
+        )
 
     def current_item_id(self) -> str:
-        current = self.list_widget.currentItem()
-        if not current:
-            return ""
-        return str(current.data(Qt.UserRole))
+        return self.timeline_view.current_item_id()
 
     def selected_item_ids(self) -> list[str]:
-        return [
-            str(item.data(Qt.UserRole))
-            for item in self.list_widget.selectedItems()
-        ]
+        return self.timeline_view.selected_item_ids()
 
-    def _emit_selection(self) -> None:
-        self.selectionChanged.emit(self.selected_item_ids())
+    def _page_from_static_items(self, offset: int, limit: int) -> MediaPage:
+        items = self._static_items or []
+        visible = items[offset : offset + limit]
+        next_offset = offset + len(visible)
+        has_more = next_offset < len(items)
+        return MediaPage(items=visible, has_more=has_more, next_offset=next_offset if has_more else None)
 
-    def _update_preview(self, *_args) -> None:
+    def _load_next_page(self, *, reset: bool = False) -> None:
+        if self._page_loader is None or self._loading_page:
+            return
+        offset = 0 if reset or self._next_offset is None else self._next_offset
+        self._loading_page = True
+        try:
+            page = self._page_loader(offset, self.PAGE_SIZE)
+        finally:
+            self._loading_page = False
+        self._next_offset = page.next_offset
+        self._has_more = page.has_more
+        self.timeline_view.set_items(
+            page.items,
+            append=not reset and offset > 0,
+            has_more=page.has_more,
+            status_text=self._empty_message,
+        )
+        self.timeline_view.acknowledge_more_items()
+
+    def _sync_zoom_controls(self, zoom_level: int) -> None:
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(zoom_level)
+        self.zoom_slider.blockSignals(False)
+
+    def _handle_current_item_changed(self, item_id: str) -> None:
         self._clear_preview_media()
-        item_id = self.current_item_id()
-        item = self._items.get(item_id)
-        if not item:
+        item = self._item_for_id(item_id)
+        if item is None:
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("Select a media item")
             self.preview_stack.setCurrentWidget(self.preview_label)
@@ -181,37 +796,46 @@ class MediaGridWidget(QWidget):
             self.details.setText("")
             return
 
-        if item.media_kind in {"video", "live_photo"}:
-            self._show_video_preview(item)
-        elif item.media_kind == "gif":
-            self._show_gif_preview(item)
-        else:
-            self._show_image_preview(item)
         self.details.setText(self.service.build_item_details(item))
+        if item.media_kind == "gif":
+            self._show_gif_preview(item)
+            return
+        if item.media_kind in {"video", "live_photo"}:
+            self._show_motion_preview(item)
+            return
+        self._show_image_preview(item)
+
+    def _item_for_id(self, item_id: str) -> MediaItem | None:
+        if not item_id:
+            return None
+        if self._static_items is not None:
+            for item in self._static_items:
+                if item.id == item_id:
+                    return item
+        for item in self.timeline_view._items:
+            if item.id == item_id:
+                return item
+        return None
 
     def _show_image_preview(self, item: MediaItem) -> None:
-        pixmap = QPixmap(item.thumbnail_path) if item.thumbnail_path else QPixmap()
-        if not pixmap.isNull():
-            self.preview_label.setPixmap(
-                pixmap.scaled(
-                    420,
-                    420,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-            )
-            self.preview_label.setText("")
-        else:
+        image_source = self._image_source_for_item(item)
+        if not image_source:
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText(item.title)
+            self.preview_stack.setCurrentWidget(self.preview_label)
+            self.video_toggle_button.setVisible(False)
+            return
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText("Loading full-resolution preview…")
         self.preview_stack.setCurrentWidget(self.preview_label)
         self.video_toggle_button.setVisible(False)
+        self._queue_preview_request("image", image_source)
 
     def _show_gif_preview(self, item: MediaItem) -> None:
         if Path(item.path).exists():
             movie = QMovie(item.path)
             if movie.isValid():
-                movie.setScaledSize(QSize(420, 420))
+                movie.setScaledSize(self._preview_target_size())
                 self.preview_label.setMovie(movie)
                 movie.start()
                 self._movie = movie
@@ -221,18 +845,38 @@ class MediaGridWidget(QWidget):
                 return
         self._show_image_preview(item)
 
-    def _show_video_preview(self, item: MediaItem) -> None:
-        video_path = self._video_path_for_item(item)
-        if not video_path:
-            self._show_image_preview(item)
-            return
+    def _show_motion_preview(self, item: MediaItem) -> None:
+        self._preview_video_path = self._video_path_for_item(item)
+        image_source = self._image_source_for_item(item)
+        if image_source:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Loading full-resolution preview…")
+            self.preview_stack.setCurrentWidget(self.preview_label)
+            self._queue_preview_request("image", image_source)
+        elif self._preview_video_path:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Loading video preview…")
+            self.preview_stack.setCurrentWidget(self.preview_label)
+            self._queue_preview_request("video_frame", self._preview_video_path)
+        else:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText(item.title)
+            self.preview_stack.setCurrentWidget(self.preview_label)
+        self.video_toggle_button.setVisible(bool(self._preview_video_path))
+        if self._preview_video_path:
+            self.video_toggle_button.setText("Play Preview")
 
-        self._preview_video_path = video_path
-        self._show_image_preview(item)
-        self.video_toggle_button.setText("Play Preview")
-        self.video_toggle_button.setVisible(True)
+    def _image_source_for_item(self, item: MediaItem) -> str:
+        if Path(item.path).suffix.lower() in IMAGE_EXTENSIONS and Path(item.path).exists():
+            return item.path
+        for component in item.component_paths:
+            component_path = Path(component)
+            if component_path.suffix.lower() in IMAGE_EXTENSIONS and component_path.exists():
+                return component
+        return ""
 
     def _clear_preview_media(self) -> None:
+        self._preview_request_id += 1
         self._preview_video_path = ""
         if self._movie is not None:
             self._movie.stop()
@@ -241,6 +885,75 @@ class MediaGridWidget(QWidget):
         if self.media_player is not None:
             self.media_player.stop()
             self.media_player.setSource(QUrl())
+
+    def _queue_preview_request(self, mode: str, source_path: str) -> None:
+        self._preview_request_id += 1
+        request = (self._preview_request_id, mode, source_path)
+        if self._preview_thread is not None:
+            self._pending_preview_request = request
+            return
+        self._start_preview_request(request)
+
+    def _start_preview_request(self, request: tuple[int, str, str]) -> None:
+        request_id, mode, source_path = request
+        thread = QThread(self)
+        worker = PreviewLoadWorker(request_id, mode, source_path, self._preview_target_size())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._handle_preview_loaded)
+        worker.failed.connect(self._handle_preview_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_preview_handles)
+
+        self._preview_thread = thread
+        self._preview_worker = worker
+        thread.start()
+
+    def _handle_preview_loaded(self, request_id: int, payload: object) -> None:
+        if request_id != self._preview_request_id:
+            return
+        if not isinstance(payload, dict):
+            return
+        qimage = payload.get("image")
+        if not isinstance(qimage, QImage):
+            return
+        pixmap = QPixmap.fromImage(qimage)
+        self.preview_label.setPixmap(
+            pixmap.scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+        self.preview_label.setText("")
+        self.preview_stack.setCurrentWidget(self.preview_label)
+
+    def _handle_preview_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._preview_request_id:
+            return
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText(f"Unable to load preview.\n\n{message}")
+        self.preview_stack.setCurrentWidget(self.preview_label)
+
+    def _clear_preview_handles(self) -> None:
+        self._preview_thread = None
+        self._preview_worker = None
+        if self._pending_preview_request is not None:
+            request = self._pending_preview_request
+            self._pending_preview_request = None
+            QTimer.singleShot(0, lambda request=request: self._start_preview_request(request))
+
+    def _preview_target_size(self) -> QSize:
+        size = self.preview_stack.size()
+        return QSize(max(720, size.width()), max(720, size.height()))
+
+    def _toggle_details(self) -> None:
+        self.details.setVisible(not self.details.isVisible())
+        self.info_toggle_button.setText("Hide Info" if self.details.isVisible() else "Show Info")
 
     def _toggle_video(self) -> None:
         if not self._preview_video_path:
@@ -299,40 +1012,3 @@ class MediaGridWidget(QWidget):
             self.media_player = None
             self.audio_output = None
             return False
-
-    def _populate_next_chunk(self) -> None:
-        end_index = min(
-            len(self._pending_items),
-            self._populate_cursor + self.POPULATE_CHUNK_SIZE,
-        )
-        for item in self._pending_items[self._populate_cursor:end_index]:
-            icon = self._placeholder_icon
-            thumbnail_path = Path(item.thumbnail_path)
-            if item.thumbnail_path and thumbnail_path.exists():
-                icon = QIcon(str(thumbnail_path))
-            list_item = QListWidgetItem(icon, item.title)
-            list_item.setData(Qt.UserRole, item.id)
-            list_item.setToolTip(item.path)
-            self.list_widget.addItem(list_item)
-
-        self._populate_cursor = end_index
-        if self._populate_cursor < len(self._pending_items):
-            self.preview_label.setText(
-                f"Loading {self._populate_cursor} / {len(self._pending_items)} media items..."
-            )
-            self._populate_timer.start(0)
-            return
-
-        if self._pending_previous_item_id:
-            for index in range(self.list_widget.count()):
-                list_item = self.list_widget.item(index)
-                if str(list_item.data(Qt.UserRole)) == self._pending_previous_item_id:
-                    self.list_widget.setCurrentItem(list_item)
-                    break
-
-        if not self.list_widget.currentItem():
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("Select a media item")
-            self.preview_stack.setCurrentWidget(self.preview_label)
-            self.video_toggle_button.setVisible(False)
-            self.details.setText("")
