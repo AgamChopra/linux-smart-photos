@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+from typing import Callable
 
 
 IMAGE_EXTENSIONS = {
@@ -79,24 +80,39 @@ def build_signature(
     return digest.hexdigest()
 
 
-def build_asset_specs(root: Path) -> dict[str, MediaAssetSpec]:
+def build_asset_specs(
+    root: Path,
+    *,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_interval: int = 1024,
+) -> dict[str, MediaAssetSpec]:
     root = root.expanduser().resolve()
     if not root.exists():
         return {}
 
     files: list[Path] = []
     stat_cache: dict[Path, os.stat_result] = {}
+    scanned_entries = 0
+    discovered_media = 0
     for dirpath, _, filenames in os.walk(root):
         directory = Path(dirpath)
+        if progress_callback is not None:
+            progress_callback(str(directory), scanned_entries, discovered_media)
         for filename in filenames:
             path = directory / filename
+            scanned_entries += 1
             if not is_supported(path):
+                if progress_callback is not None and scanned_entries % max(1, progress_interval) == 0:
+                    progress_callback(str(path), scanned_entries, discovered_media)
                 continue
             try:
                 stat_cache[path] = path.stat()
             except OSError:
                 continue
             files.append(path)
+            discovered_media += 1
+            if progress_callback is not None and scanned_entries % max(1, progress_interval) == 0:
+                progress_callback(str(path), scanned_entries, discovered_media)
     files.sort()
     grouped: dict[tuple[Path, str], list[Path]] = {}
     for path in files:

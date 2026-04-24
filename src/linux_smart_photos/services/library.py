@@ -187,7 +187,43 @@ class LibraryService:
     ) -> SyncSummary:
         self._ensure_state_loaded()
         sync_started_at = monotonic()
-        assets = build_asset_specs(self.config.media_root_path)
+        discovery_started_at = monotonic()
+        self._emit_progress(
+            progress_callback,
+            self._make_progress_update(
+                phase="sync",
+                message="Discovering media files",
+                detail=str(self.config.media_root_path),
+                indeterminate=True,
+                overall_started_at=sync_started_at,
+                step_started_at=discovery_started_at,
+            ),
+        )
+
+        last_discovery_emit_at = discovery_started_at
+
+        def emit_discovery_progress(path_text: str, scanned_entries: int, discovered_media: int) -> None:
+            nonlocal last_discovery_emit_at
+            now = monotonic()
+            if now - last_discovery_emit_at < 0.75:
+                return
+            last_discovery_emit_at = now
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="sync",
+                    message="Discovering media files",
+                    detail=f"{discovered_media} candidate files found after scanning {scanned_entries} paths — {path_text}",
+                    indeterminate=True,
+                    overall_started_at=sync_started_at,
+                    step_started_at=discovery_started_at,
+                ),
+            )
+
+        assets = build_asset_specs(
+            self.config.media_root_path,
+            progress_callback=emit_discovery_progress,
+        )
         sorted_assets = self._sorted_asset_entries(assets)
         existing_ids = set(self.state.items)
         current_ids = set(assets)
@@ -205,8 +241,9 @@ class LibraryService:
                 message="Checking library for changes",
                 current=completed,
                 total=total_work,
-                detail=str(self.config.media_root_path),
+                detail=f"{len(sorted_assets)} media items discovered in {self.config.media_root_path}",
                 overall_started_at=sync_started_at,
+                step_started_at=discovery_started_at,
             ),
         )
 
