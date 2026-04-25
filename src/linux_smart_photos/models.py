@@ -47,6 +47,37 @@ class DetectionRegion:
 
 
 @dataclass(slots=True)
+class DetectionRecord:
+    item_id: str
+    detection_id: str
+    kind: str
+    label: str
+    confidence: float
+    bbox: list[int]
+    persona_id: str | None = None
+    encoding: list[float] = field(default_factory=list)
+    signature: str | None = None
+    source_frame_token: str = ""
+    captured_at: str = ""
+    pipeline_revision: str = ""
+    cluster_dirty: bool = True
+    cluster_dirty_revision: str = ""
+    updated_at: str = field(default_factory=utc_now)
+
+    def to_region(self) -> DetectionRegion:
+        return DetectionRegion(
+            id=self.detection_id,
+            kind=self.kind,
+            label=self.label,
+            confidence=self.confidence,
+            bbox=list(self.bbox),
+            persona_id=self.persona_id,
+            encoding=list(self.encoding),
+            signature=self.signature,
+        )
+
+
+@dataclass(slots=True)
 class MediaItem:
     id: str
     path: str

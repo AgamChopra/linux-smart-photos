@@ -693,13 +693,14 @@ class UnknownClustersPage(QWidget):
         total_members = sum(cluster.member_count for cluster in clusters)
         total_items = len({item_id for cluster in clusters for item_id in cluster.item_ids})
         cluster_names = ", ".join(self._cluster_kind_name(cluster) for cluster in clusters[:4])
+        partial_suffix = " (live partial results)" if any(cluster.is_partial for cluster in clusters) else ""
         if len(clusters) > 4:
             cluster_names = f"{cluster_names}, ..."
         self.summary.setText(
             f"Selected clusters: {len(clusters)}\n"
             f"Detections: {total_members}\n"
             f"Items: {total_items}\n"
-            f"Types: {cluster_names or 'unknown'}"
+            f"Types: {cluster_names or 'unknown'}{partial_suffix}"
         )
         self.grid.set_page_loader(
             lambda offset, page_limit, clusters=clusters: self.service.items_for_unknown_clusters_page(
@@ -770,7 +771,8 @@ class UnknownClustersPage(QWidget):
             base = f"Unknown person {index}"
         else:
             base = f"Unknown {cluster.label or 'pet'} {index}"
-        return f"{base}  •  {cluster.member_count} detections / {cluster.item_count} items"
+        suffix = "  •  live" if cluster.is_partial else ""
+        return f"{base}  •  {cluster.member_count} detections / {cluster.item_count} items{suffix}"
 
     def _cluster_tooltip(self, cluster: UnknownPersonaCluster) -> str:
         return "\n".join(
@@ -780,6 +782,8 @@ class UnknownClustersPage(QWidget):
                 f"Detections: {cluster.member_count}",
                 f"Items: {cluster.item_count}",
                 f"Average confidence: {cluster.average_confidence:.2f}",
+                f"Status: {'partial' if cluster.is_partial else 'stable'}",
+                f"Revision: {cluster.revision or 'unknown'}",
             ]
         )
 
@@ -810,6 +814,13 @@ class UnknownClustersPage(QWidget):
                 "Scanning in background. Unknown clusters will appear automatically as analyzed items accumulate."
             )
             self.owner.set_cluster_view_status_complete("No unknown clusters yet; waiting for analyzed face/pet detections")
+        elif any(cluster.is_partial for cluster in self._pending_render_clusters):
+            self.summary.setText(
+                f"Rendering {len(self._pending_render_clusters)} live partial unknown clusters..."
+            )
+            self.owner.set_cluster_view_status_loading(
+                f"Rendering {len(self._pending_render_clusters)} live partial unknown clusters"
+            )
         elif self.owner._active_task in {"startup", "sync"}:
             self.summary.setText(
                 f"Rendering {len(self._pending_render_clusters)} live unknown clusters from analyzed items so far..."
@@ -844,8 +855,9 @@ class UnknownClustersPage(QWidget):
             if not self.cluster_list.selectedItems() and self.cluster_list.count():
                 self.cluster_list.item(0).setSelected(True)
                 self.cluster_list.setCurrentRow(0)
+            status_label = "partial" if any(cluster.is_partial for cluster in self._pending_render_clusters) else "stable"
             self.owner.set_cluster_view_status_complete(
-                f"Unknown clusters ready: {len(self._pending_render_clusters)} cluster(s)"
+                f"Unknown clusters ready: {len(self._pending_render_clusters)} cluster(s), {status_label}"
             )
             self._show_selected_clusters()
             return
@@ -1270,14 +1282,14 @@ class MainWindow(QMainWindow):
         self.status_panel_layout.setContentsMargins(0, 0, 0, 0)
         self.status_panel_layout.setSpacing(2)
         self.main_task_status = TaskStatusRow("Background Task")
-        self.cluster_cache_status = TaskStatusRow("Cluster Cache")
+        self.cluster_cache_status = TaskStatusRow("Cluster Task")
         self.cluster_view_status = TaskStatusRow("Cluster View")
         self.status_panel_layout.addWidget(self.main_task_status)
         self.status_panel_layout.addWidget(self.cluster_cache_status)
         self.status_panel_layout.addWidget(self.cluster_view_status)
         self.statusBar().addPermanentWidget(self.status_panel, 1)
         self.main_task_status.set_idle("Ready")
-        self.cluster_cache_status.set_idle("Waiting for scan progress")
+        self.cluster_cache_status.set_idle("Waiting for analyzed detections")
         self.cluster_view_status.set_idle("Unknown clusters tab idle")
         self._status_refresh_timer = QTimer(self)
         self._status_refresh_timer.setInterval(1000)
@@ -1522,9 +1534,9 @@ class MainWindow(QMainWindow):
         self._cluster_cache_worker = worker
         self._cluster_cache_last_started = monotonic()
         message = (
-            "Building partial unknown-cluster cache from analyzed items"
+            "Building live unknown clusters from analyzed detections"
             if partial
-            else "Building final unknown-cluster cache"
+            else "Building final unknown clusters"
         )
         self.cluster_cache_status.set_active(message, indeterminate=True)
         thread.start()
@@ -1533,9 +1545,9 @@ class MainWindow(QMainWindow):
         self._cluster_cache_progress = None
         self._cluster_cache_base_message = ""
         if partial:
-            self.cluster_cache_status.set_complete("Partial unknown-cluster cache updated")
+            self.cluster_cache_status.set_complete("Live unknown clusters updated")
         else:
-            self.cluster_cache_status.set_complete("Final unknown-cluster cache updated")
+            self.cluster_cache_status.set_complete("Final unknown clusters updated")
         current_widget = self.tabs.currentWidget()
         if current_widget is self.unknown_clusters_page:
             self.unknown_clusters_page.refresh()
@@ -1546,7 +1558,7 @@ class MainWindow(QMainWindow):
     def _handle_unknown_cluster_cache_failed(self, message: str) -> None:
         self._cluster_cache_progress = None
         self._cluster_cache_base_message = ""
-        self.cluster_cache_status.set_error(f"Cluster cache refresh failed: {message}")
+        self.cluster_cache_status.set_error(f"Unknown cluster update failed: {message}")
         self._unknown_clusters_dirty = True
 
     def _handle_unknown_cluster_cache_progress(self, update: Any) -> None:
@@ -1573,7 +1585,7 @@ class MainWindow(QMainWindow):
         ):
             self._cluster_cache_progress = None
             self._cluster_cache_base_message = ""
-            self.cluster_cache_status.set_idle("Waiting for scan progress")
+            self.cluster_cache_status.set_idle("Waiting for analyzed detections")
 
     def set_cluster_view_status_loading(self, message: str) -> None:
         self.cluster_view_status.set_active(message, indeterminate=True)
@@ -1666,7 +1678,7 @@ class MainWindow(QMainWindow):
         if busy:
             self.main_task_status.set_active(message, indeterminate=True)
             if self._active_task in {"startup", "sync"} and self._cluster_cache_thread is None:
-                self.cluster_cache_status.set_idle("Waiting for analyzed batches")
+                self.cluster_cache_status.set_idle("Waiting for analyzed detections")
         else:
             self.main_task_status.set_complete(message)
 
