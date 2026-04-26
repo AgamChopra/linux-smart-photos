@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/smart-photos.svg" alt="Smart Photos icon" width="128" height="128">
+  <img src="assets/smart-photos.svg" alt="Smart Photos icon" width="256" height="256">
 </p>
 
 <h1 align="center">Smart Photos</h1>

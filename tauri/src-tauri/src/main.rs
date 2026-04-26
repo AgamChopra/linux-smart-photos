@@ -5,6 +5,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::Mutex,
 };
+use tauri::Manager;
 
 #[derive(Default)]
 struct ApiState {
@@ -69,9 +70,7 @@ fn start_api_locked(process: &mut ApiProcess) -> Result<String, String> {
         .ok_or_else(|| "Smart Photos API stdout was unavailable.".to_string())?;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    let mut port = String::new();
-
-    loop {
+    let port = loop {
         line.clear();
         let bytes = reader
             .read_line(&mut line)
@@ -80,10 +79,9 @@ fn start_api_locked(process: &mut ApiProcess) -> Result<String, String> {
             return Err("Smart Photos API exited before reporting its port.".to_string());
         }
         if let Some(value) = line.strip_prefix("SMART_PHOTOS_API_PORT=") {
-            port = value.trim().to_string();
-            break;
+            break value.trim().to_string();
         }
-    }
+    };
 
     let base_url = format!("http://127.0.0.1:{port}");
     process.base_url = Some(base_url.clone());
