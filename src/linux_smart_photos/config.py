@@ -27,6 +27,9 @@ class AppConfig:
     analysis_batch_size: int = 24
     pet_embedding_batch_size: int = 64
     prefetch_workers: int = 4
+    gallery_thumbnail_cache_mb: int = 2048
+    gallery_prefetch_all_thumbnails: bool = True
+    gallery_prefetch_page_delay_ms: int = 75
     face_match_threshold: float = 0.42
     face_embedding_similarity_threshold: float = 0.57
     pet_embedding_similarity_threshold: float = 0.70

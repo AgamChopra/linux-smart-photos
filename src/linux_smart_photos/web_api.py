@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import mimetypes
 from pathlib import Path
 import threading
 import traceback
@@ -279,6 +280,21 @@ class SmartPhotosApi:
             selected = [cluster_map[cluster_id] for cluster_id in cluster_ids if cluster_id in cluster_map]
             items = self.service.items_for_unknown_clusters(selected)
             return [self._serialize_item_summary(item) for item in items]
+
+    def unknown_cluster_suggestions(self, cluster_id: str, params: dict[str, list[str]]) -> list[dict[str, Any]]:
+        limit = self._int_param(params, "limit", 6)
+        with self.service_lock:
+            return [
+                {
+                    "persona": self._serialize_persona(suggestion.persona),
+                    "score": suggestion.score,
+                    "method": suggestion.method,
+                }
+                for suggestion in self.service.unknown_cluster_persona_suggestions(
+                    cluster_id,
+                    limit=limit,
+                )
+            ]
 
     def create_persona(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.service_lock:
@@ -594,6 +610,12 @@ class SmartPhotosApiHandler(BaseHTTPRequestHandler):
         if segments == ["api", "unknown-clusters"]:
             self._send_json(HTTPStatus.OK, {"clusters": api.list_unknown_clusters(params)})
             return
+        if len(segments) == 4 and segments[:2] == ["api", "unknown-clusters"] and segments[3] == "suggestions":
+            self._send_json(HTTPStatus.OK, {"suggestions": api.unknown_cluster_suggestions(segments[2], params)})
+            return
+        if segments == ["api", "file"]:
+            self._send_file(params)
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Route not found"})
 
     def _dispatch_post(self) -> None:
@@ -685,6 +707,64 @@ class SmartPhotosApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _send_file(self, params: dict[str, list[str]]) -> None:
+        requested = self.server.api._single(params, "path")
+        if not requested:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Missing path"})
+            return
+        path = Path(requested).expanduser().resolve()
+        if not self._is_allowed_file_path(path) or not path.is_file():
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "File not found"})
+            return
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        size = path.stat().st_size
+        start = 0
+        end = size - 1
+        status = HTTPStatus.OK
+        range_header = self.headers.get("Range", "")
+        if range_header.startswith("bytes="):
+            range_value = range_header.removeprefix("bytes=").split(",", 1)[0]
+            start_text, _, end_text = range_value.partition("-")
+            try:
+                if start_text:
+                    start = max(0, int(start_text))
+                if end_text:
+                    end = min(size - 1, int(end_text))
+                if start > end:
+                    raise ValueError
+                status = HTTPStatus.PARTIAL_CONTENT
+            except ValueError:
+                self._send_json(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, {"error": "Invalid range"})
+                return
+
+        content_length = max(0, end - start + 1)
+        self.send_response(status)
+        self._send_cors_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(content_length))
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        with path.open("rb") as handle:
+            handle.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
+    def _is_allowed_file_path(self, path: Path) -> bool:
+        allowed_roots = [
+            self.server.api.config.media_root_path,
+            self.server.api.config.cache_path,
+            self.server.api.config.cache_path.parent,
+        ]
+        return any(path == root or root in path.parents for root in allowed_roots)
 
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")

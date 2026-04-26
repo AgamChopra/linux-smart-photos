@@ -62,6 +62,7 @@ UNKNOWN_PET_CLUSTER_MERGE_MARGIN = 0.04
 UNKNOWN_CLUSTER_SIGNATURE_MERGE_SLACK = 2.0
 SCAN_PROGRESS_EMIT_INTERVAL = 48
 SEARCH_CANDIDATE_LIMIT = 600
+CLUSTER_DIRTY_CHUNK_SIZE = 512
 
 
 @dataclass(slots=True)
@@ -131,6 +132,13 @@ class UnknownPersonaCluster:
     revision: str = ""
     is_partial: bool = False
     updated_at: str = ""
+
+
+@dataclass(slots=True)
+class UnknownClusterPersonaSuggestion:
+    persona: Persona
+    score: float
+    method: str
 
 
 @dataclass(slots=True)
@@ -833,6 +841,31 @@ class LibraryService:
             limit=limit + 1,
         )
         return self._page_from_items(items, offset=offset, limit=limit, pretrimmed=True)
+
+    def unknown_cluster_persona_suggestions(
+        self,
+        cluster_id: str,
+        *,
+        limit: int = 6,
+    ) -> list[UnknownClusterPersonaSuggestion]:
+        cluster_state = self._unknown_cluster_state_by_id(cluster_id)
+        if cluster_state is None:
+            return []
+
+        suggestions: list[UnknownClusterPersonaSuggestion] = []
+        for persona in self.list_personas(kind=cluster_state.kind):
+            score, method = self._score_unknown_cluster_for_persona(cluster_state, persona)
+            if not method:
+                continue
+            suggestions.append(
+                UnknownClusterPersonaSuggestion(
+                    persona=persona,
+                    score=score,
+                    method=method,
+                )
+            )
+        suggestions.sort(key=lambda entry: entry.score, reverse=True)
+        return suggestions[: max(1, limit)]
 
     def build_item_details(self, item: MediaItem) -> str:
         personas = ", ".join(persona.name for persona in self.personas_for_item(item)) or "None"
@@ -1974,12 +2007,24 @@ class LibraryService:
             overall_started_at=overall_started_at,
             step_started_at=step_started_at,
         )
+        previous_clusters = self._previous_unknown_clusters_by_id(kind)
         clusters = [
-            self._finalize_unknown_cluster(cluster_state, revision=revision, is_partial=False)
+            self._finalize_unknown_cluster(
+                cluster_state,
+                revision=revision,
+                is_partial=False,
+                previous_cluster=previous_clusters.get(cluster_state.cluster_id),
+            )
             for cluster_state in cluster_states
             if cluster_state.members
         ]
-        self._persist_unknown_clusters(kind, clusters, revision=revision, partial=False)
+        self._persist_unknown_clusters(
+            kind,
+            clusters,
+            revision=revision,
+            partial=False,
+            previous_clusters=previous_clusters,
+        )
         self.store.mark_detections_cluster_clean(
             [(record.item_id, record.detection_id) for record in records],
             cleaned_revision=revision,
@@ -1996,6 +2041,11 @@ class LibraryService:
         step_started_at: float,
     ) -> list[UnknownPersonaCluster]:
         dirty_records = self.store.query_detections(cluster_kind=kind, dirty_only=True)
+        if not dirty_records:
+            return [
+                self._deserialize_unknown_cluster(entry)
+                for entry in self.store.list_unknown_clusters(kind)
+            ]
         states_by_id = {
             cluster_state.cluster_id: cluster_state
             for cluster_state in self._load_persisted_unknown_cluster_states(kind)
@@ -2006,6 +2056,8 @@ class LibraryService:
                 detection_to_cluster[(member.item_id, member.region_id)] = cluster_state.cluster_id
 
         total_records = len(dirty_records)
+        processed_records: list[DetectionRecord] = []
+        latest_clusters: list[UnknownPersonaCluster] = []
         for index, record in enumerate(dirty_records, start=1):
             detection_key = (record.item_id, record.detection_id)
             existing_cluster_id = detection_to_cluster.pop(detection_key, "")
@@ -2016,7 +2068,7 @@ class LibraryService:
 
             if self._is_unknown_cluster_candidate_record(kind, record):
                 matched_cluster = self._best_unknown_cluster_match(
-                    list(states_by_id.values()),
+                    states_by_id.values(),
                     kind,
                     record.to_region(),
                 )
@@ -2029,6 +2081,7 @@ class LibraryService:
                 self._append_unknown_cluster_member_from_record(matched_cluster, record)
                 detection_to_cluster[detection_key] = matched_cluster.cluster_id
 
+            processed_records.append(record)
             if (
                 progress_callback is not None
                 and total_records > 0
@@ -2046,17 +2099,57 @@ class LibraryService:
                         step_started_at=step_started_at,
                     ),
                 )
+            if index % CLUSTER_DIRTY_CHUNK_SIZE == 0:
+                latest_clusters = self._persist_incremental_unknown_cluster_checkpoint(
+                    kind,
+                    states_by_id,
+                    processed_records,
+                    revision=revision,
+                    partial=True,
+                )
+                processed_records = []
 
+        latest_clusters = self._persist_incremental_unknown_cluster_checkpoint(
+            kind,
+            states_by_id,
+            processed_records,
+            revision=revision,
+            partial=True,
+        )
+        return latest_clusters
+
+    def _persist_incremental_unknown_cluster_checkpoint(
+        self,
+        kind: str,
+        states_by_id: dict[str, _UnknownClusterState],
+        processed_records: list[DetectionRecord],
+        *,
+        revision: str,
+        partial: bool,
+    ) -> list[UnknownPersonaCluster]:
         cluster_states = [state for state in states_by_id.values() if state.members]
+        previous_clusters = self._previous_unknown_clusters_by_id(kind)
         clusters = [
-            self._finalize_unknown_cluster(cluster_state, revision=revision, is_partial=True)
+            self._finalize_unknown_cluster(
+                cluster_state,
+                revision=revision,
+                is_partial=partial,
+                previous_cluster=previous_clusters.get(cluster_state.cluster_id),
+            )
             for cluster_state in cluster_states
         ]
-        self._persist_unknown_clusters(kind, clusters, revision=revision, partial=True)
-        self.store.mark_detections_cluster_clean(
-            [(record.item_id, record.detection_id) for record in dirty_records],
-            cleaned_revision=revision,
+        self._persist_unknown_clusters(
+            kind,
+            clusters,
+            revision=revision,
+            partial=partial,
+            previous_clusters=previous_clusters,
         )
+        if processed_records:
+            self.store.mark_detections_cluster_clean(
+                [(record.item_id, record.detection_id) for record in processed_records],
+                cleaned_revision=revision,
+            )
         return clusters
 
     def _build_unknown_cluster_states_from_detection_records(
@@ -2111,6 +2204,48 @@ class LibraryService:
                 cluster_states.append(cluster_state)
         return cluster_states
 
+    def _unknown_cluster_state_by_id(self, cluster_id: str) -> _UnknownClusterState | None:
+        if not cluster_id:
+            return None
+        for kind in ("person", "pet"):
+            for cluster_state in self._load_persisted_unknown_cluster_states(kind):
+                if cluster_state.cluster_id == cluster_id:
+                    return cluster_state
+        return None
+
+    def _score_unknown_cluster_for_persona(
+        self,
+        cluster: _UnknownClusterState,
+        persona: Persona,
+    ) -> tuple[float, str]:
+        best_embedding_similarity = -1.0
+        if cluster.embeddings and persona.reference_encodings:
+            best_embedding_similarity = max(
+                self._cosine_similarity(cluster_embedding, reference_embedding)
+                for cluster_embedding in cluster.embeddings
+                for reference_embedding in persona.reference_encodings
+            )
+            threshold = (
+                self.config.face_embedding_similarity_threshold
+                if cluster.kind == "person"
+                else self.config.pet_embedding_similarity_threshold
+            )
+            if best_embedding_similarity >= threshold:
+                return best_embedding_similarity, "embedding"
+
+        if cluster.kind != "pet" or not cluster.signatures or not persona.reference_signatures:
+            return 0.0, ""
+
+        best_signature_distance = min(
+            self._signature_distance(cluster_signature, reference_signature)
+            for cluster_signature in cluster.signatures
+            for reference_signature in persona.reference_signatures
+        )
+        if best_signature_distance > self.config.pet_hash_distance_threshold:
+            return 0.0, ""
+        score = 1.0 - (best_signature_distance / max(1, self.config.pet_hash_distance_threshold))
+        return max(score, 0.0), "signature"
+
     def _is_unknown_cluster_candidate(self, kind: str, detection: DetectionRegion) -> bool:
         if kind == "person":
             return detection.kind == "face" and bool(detection.encoding or detection.signature)
@@ -2140,13 +2275,10 @@ class LibraryService:
 
     def _best_unknown_cluster_match(
         self,
-        clusters: list[_UnknownClusterState],
+        clusters: Iterable[_UnknownClusterState],
         kind: str,
         detection: DetectionRegion,
     ) -> _UnknownClusterState | None:
-        if not clusters:
-            return None
-
         embedding_match: _UnknownClusterState | None = None
         best_similarity = -1.0
         signature_match: _UnknownClusterState | None = None
@@ -2362,6 +2494,7 @@ class LibraryService:
         *,
         revision: str,
         is_partial: bool,
+        previous_cluster: dict[str, object] | None = None,
     ) -> UnknownPersonaCluster:
         member_ids = sorted(
             {(member.item_id, member.region_id) for member in cluster.members},
@@ -2377,10 +2510,11 @@ class LibraryService:
 
         preview_path = ""
         if representative_item is not None and representative_detection is not None:
-            preview_path = self._ensure_cluster_preview(
+            preview_path = self._cluster_preview_path_for_representative(
                 cluster.cluster_id,
                 representative_item,
                 representative_detection,
+                previous_cluster=previous_cluster,
             )
 
         average_confidence = sum(member.confidence for member in cluster.members) / max(1, len(cluster.members))
@@ -2410,11 +2544,9 @@ class LibraryService:
         *,
         revision: str,
         partial: bool,
+        previous_clusters: dict[str, dict[str, object]] | None = None,
     ) -> None:
-        previous_clusters = {
-            cluster["id"]: cluster
-            for cluster in self.store.list_unknown_clusters(kind)
-        }
+        previous_clusters = previous_clusters or self._previous_unknown_clusters_by_id(kind)
         serialized_clusters = [self._serialize_unknown_cluster(cluster) for cluster in clusters]
         self.store.replace_unknown_clusters(
             kind,
@@ -2429,6 +2561,12 @@ class LibraryService:
             if cluster_id not in retained_cluster_ids
         ]
         self._cleanup_orphaned_cluster_previews(removed_preview_paths)
+
+    def _previous_unknown_clusters_by_id(self, kind: str) -> dict[str, dict[str, object]]:
+        return {
+            str(cluster["id"]): cluster
+            for cluster in self.store.list_unknown_clusters(kind)
+        }
 
     def _cleanup_orphaned_cluster_previews(self, preview_paths: Iterable[str]) -> None:
         for preview_path in preview_paths:
@@ -2475,6 +2613,24 @@ class LibraryService:
     def _unknown_cluster_merge_signature_threshold(self, kind: str) -> float:
         base = self._unknown_cluster_signature_threshold(kind)
         return base + UNKNOWN_CLUSTER_SIGNATURE_MERGE_SLACK
+
+    def _cluster_preview_path_for_representative(
+        self,
+        cluster_id: str,
+        item: MediaItem,
+        detection: DetectionRegion,
+        *,
+        previous_cluster: dict[str, object] | None,
+    ) -> str:
+        if previous_cluster:
+            previous_preview = str(previous_cluster.get("preview_path", ""))
+            same_representative = (
+                str(previous_cluster.get("representative_item_id", "")) == item.id
+                and str(previous_cluster.get("representative_detection_id", "")) == detection.id
+            )
+            if same_representative and previous_preview and Path(previous_preview).exists():
+                return previous_preview
+        return self._ensure_cluster_preview(cluster_id, item, detection)
 
     def _ensure_cluster_preview(
         self,

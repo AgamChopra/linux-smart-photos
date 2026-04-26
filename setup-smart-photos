@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$ROOT_DIR/.venv"
 STAMP_FILE="$VENV_DIR/.smart-photos-setup.stamp"
+TAURI_DIR="$ROOT_DIR/tauri"
+TAURI_BINARY="$TAURI_DIR/src-tauri/target/release/smart-photos-tauri"
 ELECTRON_DIR="$ROOT_DIR/electron"
 ELECTRON_BINARY="$ELECTRON_DIR/node_modules/.bin/electron"
 ICON_SOURCE="$ROOT_DIR/assets/smart-photos.svg"
@@ -67,7 +69,14 @@ tracked = [
     root / "setup-smart-photos",
     root / "smart-photos",
     root / "assets" / "smart-photos.svg",
-    root / "electron" / "package.json",
+    root / "tauri" / "package.json",
+    root / "tauri" / "src-tauri" / "Cargo.toml",
+    root / "tauri" / "src-tauri" / "tauri.conf.json",
+    root / "tauri" / "src-tauri" / "build.rs",
+    root / "tauri" / "src-tauri" / "src" / "main.rs",
+    root / "tauri" / "renderer" / "index.html",
+    root / "tauri" / "renderer" / "styles.css",
+    root / "tauri" / "renderer" / "app.js",
 ]
 digest = hashlib.sha256()
 for path in tracked:
@@ -85,9 +94,11 @@ if [[ -x "$VENV_DIR/bin/python" && -f "$STAMP_FILE" ]]; then
   fi
 fi
 
-if [[ "$setup_current" == "1" && -f "$ELECTRON_DIR/package.json" && -x "$(command -v npm 2>/dev/null || true)" ]]; then
-  if [[ ! -x "$ELECTRON_BINARY" ]]; then
-    setup_current="0"
+if [[ "$setup_current" == "1" && -f "$TAURI_DIR/package.json" ]]; then
+  if command -v npm >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+    if [[ ! -x "$TAURI_BINARY" ]]; then
+      setup_current="0"
+    fi
   fi
 fi
 
@@ -115,16 +126,25 @@ echo "Installing Python dependencies"
   "$VENV_DIR/bin/pip" install -e ".[ai]"
 )
 
-if [[ -f "$ELECTRON_DIR/package.json" ]]; then
-  if command -v npm >/dev/null 2>&1; then
-    echo "Installing Electron UI dependencies"
-    (
-      cd "$ELECTRON_DIR"
+if [[ -f "$TAURI_DIR/package.json" ]]; then
+  if command -v npm >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+    echo "Installing and building Tauri UI"
+    if (
+      cd "$TAURI_DIR"
       npm install --no-fund --no-audit
-    )
+      npm run build
+    ); then
+      :
+    else
+      echo "Tauri UI build failed. The Qt diagnostics fallback will remain available." >&2
+    fi
   else
-    echo "npm was not found. Electron UI will be skipped and the Qt fallback will remain available." >&2
+    echo "npm and cargo are required to build the Tauri UI. The Qt diagnostics fallback will remain available." >&2
   fi
+fi
+
+if [[ ! -x "$TAURI_BINARY" && -f "$ELECTRON_DIR/package.json" ]]; then
+  echo "Electron UI is deprecated and is no longer installed by default." >&2
 fi
 
 echo "Initializing local configuration"

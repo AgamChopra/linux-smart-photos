@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Smart Photos</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <aside class="rail">
+        <div class="brand">
+          <div class="brand-mark"></div>
+          <div>
+            <div class="brand-title">Smart Photos</div>
+            <div class="brand-copy">Private local gallery</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="nav-item active" data-view="library">Library</button>
+          <button class="nav-item" data-view="people">People & Pets</button>
+          <button class="nav-item" data-view="review">Review Matches</button>
+          <button class="nav-item" data-view="albums">Albums</button>
+          <button class="nav-item" data-view="memories">Memories</button>
+          <button class="nav-item" data-view="models">AI Models</button>
+        </nav>
+        <div class="quiet-card">
+          <div class="tiny-label">Library</div>
+          <div class="stat-row"><span>Photos & videos</span><strong id="stat-items">0</strong></div>
+          <div class="stat-row"><span>People & pets</span><strong id="stat-personas">0</strong></div>
+          <div class="stat-row"><span>Albums</span><strong id="stat-albums">0</strong></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="hero">
+          <div>
+            <div class="eyebrow" id="view-eyebrow">Library</div>
+            <h1 id="view-title">Your photos, organized locally.</h1>
+            <p id="view-copy">Browse, search, and lightly curate without exposing your library to a cloud service.</p>
+          </div>
+          <div class="hero-actions">
+            <button id="sync-button" class="ghost-button">Sync</button>
+            <button id="open-root-button" class="solid-button">Open Folder</button>
+          </div>
+        </header>
+
+        <section class="soft-status" id="status-card">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status-text">Starting Smart Photos...</span>
+          <div class="status-track"><div id="status-progress" class="status-progress"></div></div>
+        </section>
+
+        <section class="view active" data-view="library">
+          <div class="toolbar glass">
+            <input id="library-search" class="input grow" placeholder="Search cats, birthdays, Paris, person:maya..." />
+            <select id="library-type" class="input">
+              <option value="all">All media</option>
+              <option value="image">Photos</option>
+              <option value="video">Videos</option>
+              <option value="gif">GIFs</option>
+              <option value="live_photo">Live photos</option>
+            </select>
+            <select id="library-kind" class="input">
+              <option value="all">People & pets</option>
+              <option value="person">People</option>
+              <option value="pet">Pets</option>
+            </select>
+            <select id="library-persona" class="input">
+              <option value="">Any persona</option>
+            </select>
+            <label class="toggle"><input id="library-favorites" type="checkbox" /> Favorites</label>
+          </div>
+          <div class="library-layout">
+            <div id="library-grid" class="photo-grid"></div>
+            <aside class="inspector">
+              <div id="preview-stage" class="preview-stage">Select a photo or video</div>
+              <div class="inspector-actions">
+                <button id="favorite-button" class="ghost-button small">Favorite</button>
+                <button id="open-file-button" class="ghost-button small">Open</button>
+                <button id="show-folder-button" class="ghost-button small">Folder</button>
+              </div>
+              <div id="selected-personas" class="pill-row"></div>
+              <details class="details">
+                <summary>Details and corrections</summary>
+                <pre id="item-details"></pre>
+                <div id="detection-list" class="detection-list"></div>
+                <div class="form-grid">
+                  <select id="assign-kind" class="input">
+                    <option value="person">Person</option>
+                    <option value="pet">Pet</option>
+                  </select>
+                  <select id="assign-persona" class="input"></select>
+                  <input id="assign-new-name" class="input" placeholder="Or new name" />
+                </div>
+                <div class="button-row">
+                  <button id="assign-region-button" class="solid-button small">Assign region</button>
+                  <button id="clear-region-button" class="ghost-button small">Clear region</button>
+                  <button id="assign-item-button" class="solid-button small">Assign item</button>
+                  <button id="clear-item-button" class="ghost-button small">Clear item</button>
+                </div>
+              </details>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" data-view="people">
+          <div class="toolbar glass">
+            <select id="people-kind" class="input">
+              <option value="all">All</option>
+              <option value="person">People</option>
+              <option value="pet">Pets</option>
+            </select>
+            <input id="new-persona-name" class="input grow" placeholder="Create a new person or pet" />
+            <select id="new-persona-kind" class="input">
+              <option value="person">Person</option>
+              <option value="pet">Pet</option>
+            </select>
+            <button id="new-persona-button" class="solid-button">Create</button>
+          </div>
+          <div id="persona-cards" class="persona-grid"></div>
+          <div class="section-card">
+            <h2 id="persona-title">Select a persona</h2>
+            <div id="persona-references" class="reference-strip"></div>
+            <div id="persona-items" class="photo-grid compact-grid"></div>
+          </div>
+        </section>
+
+        <section class="view" data-view="review">
+          <div class="toolbar glass">
+            <select id="review-kind" class="input">
+              <option value="all">All unknown</option>
+              <option value="person">People</option>
+              <option value="pet">Pets</option>
+            </select>
+            <button id="reload-review-button" class="ghost-button">Refresh</button>
+          </div>
+          <div class="review-layout">
+            <div id="match-card" class="match-card">
+              <div class="empty-state">Loading possible matches...</div>
+            </div>
+            <div class="section-card">
+              <h2>Why this matters</h2>
+              <p class="muted">Review one visual cluster at a time. Confirming a match assigns the whole cluster to that persona. Rejecting moves to the next plausible persona; if none remain, create or choose one manually.</p>
+              <div id="review-items" class="photo-grid compact-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" data-view="albums">
+          <div class="toolbar glass">
+            <input id="new-album-name" class="input grow" placeholder="New album name" />
+            <button id="new-album-button" class="solid-button">Create album</button>
+            <button id="delete-album-button" class="ghost-button">Delete selected</button>
+          </div>
+          <div class="split-list">
+            <div id="album-list" class="collection-list"></div>
+            <div id="album-items" class="photo-grid"></div>
+          </div>
+        </section>
+
+        <section class="view" data-view="memories">
+          <div class="split-list">
+            <div id="memory-list" class="collection-list"></div>
+            <div>
+              <div id="memory-summary" class="section-card muted">Select a memory.</div>
+              <div id="memory-items" class="photo-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" data-view="models">
+          <div class="toolbar glass">
+            <button id="download-models-button" class="solid-button">Download recommended models</button>
+          </div>
+          <div id="model-list" class="model-list"></div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -4,10 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_SCRIPT="$ROOT_DIR/setup-smart-photos"
 VENV_DIR="$ROOT_DIR/.venv"
+TAURI_DIR="$ROOT_DIR/tauri"
+TAURI_BINARY="$TAURI_DIR/src-tauri/target/release/smart-photos-tauri"
 ELECTRON_DIR="$ROOT_DIR/electron"
 ELECTRON_BINARY="$ELECTRON_DIR/node_modules/.bin/electron"
 
-mode="electron"
+mode="tauri"
 skip_setup="0"
 force_setup="0"
 setup_only="0"
@@ -18,9 +20,10 @@ print_usage() {
 Usage: ./smart-photos [--gui] [--cli] [--setup] [--setup-only] [--help] [-- ...]
 
 Modes:
-  --gui          Launch the primary Electron app (default)
-  --electron     Launch the primary Electron app
-  --qt           Launch the Qt fallback UI
+  --gui          Launch the primary Tauri app (default)
+  --tauri        Launch the primary Tauri app
+  --qt           Launch the Qt diagnostics/fallback UI
+  --electron     Launch the deprecated Electron UI if installed
   --cli          Launch the command-line interface
 
 Setup:
@@ -34,6 +37,15 @@ Examples:
   ./smart-photos --qt
   ./smart-photos --setup-only
 EOF
+}
+
+launch_qt() {
+  if [[ -n "${QT_LOGGING_RULES:-}" ]]; then
+    export QT_LOGGING_RULES="${QT_LOGGING_RULES};qt.qpa.services.warning=false"
+  else
+    export QT_LOGGING_RULES="qt.qpa.services.warning=false"
+  fi
+  exec "$VENV_DIR/bin/smart-photos-gui" "${passthrough[@]}"
 }
 
 spawn_setup_terminal() {
@@ -84,7 +96,11 @@ sanitize_electron_env() {
 
 while (($#)); do
   case "$1" in
-    --gui|gui|--electron|electron)
+    --gui|gui|--tauri|tauri)
+      mode="tauri"
+      shift
+      ;;
+    --electron|electron)
       mode="electron"
       shift
       ;;
@@ -161,22 +177,22 @@ if [[ "$mode" == "cli" ]]; then
 fi
 
 if [[ "$mode" == "qt" ]]; then
-  if [[ -n "${QT_LOGGING_RULES:-}" ]]; then
-    export QT_LOGGING_RULES="${QT_LOGGING_RULES};qt.qpa.services.warning=false"
-  else
-    export QT_LOGGING_RULES="qt.qpa.services.warning=false"
+  launch_qt
+fi
+
+if [[ "$mode" == "tauri" ]]; then
+  if [[ ! -x "$TAURI_BINARY" ]]; then
+    echo "Tauri UI is not built. Falling back to the Qt diagnostics interface." >&2
+    launch_qt
   fi
-  exec "$VENV_DIR/bin/smart-photos-gui" "${passthrough[@]}"
+  export SMART_PHOTOS_PROJECT_ROOT="$ROOT_DIR"
+  export SMART_PHOTOS_VENV_PYTHON="$VENV_DIR/bin/python"
+  exec "$TAURI_BINARY" "${passthrough[@]}"
 fi
 
 if [[ ! -x "$ELECTRON_BINARY" ]]; then
-  echo "Electron UI is not installed. Falling back to the Qt interface." >&2
-  if [[ -n "${QT_LOGGING_RULES:-}" ]]; then
-    export QT_LOGGING_RULES="${QT_LOGGING_RULES};qt.qpa.services.warning=false"
-  else
-    export QT_LOGGING_RULES="qt.qpa.services.warning=false"
-  fi
-  exec "$VENV_DIR/bin/smart-photos-gui" "${passthrough[@]}"
+  echo "Electron UI is not installed. Falling back to the Qt diagnostics interface." >&2
+  launch_qt
 fi
 
 export SMART_PHOTOS_VENV_PYTHON="$VENV_DIR/bin/python"
@@ -186,12 +202,7 @@ set +e
 electron_status=$?
 set -e
 if [[ "$electron_status" -ne 0 ]]; then
-  echo "Electron UI exited unexpectedly. Falling back to the Qt interface." >&2
-  if [[ -n "${QT_LOGGING_RULES:-}" ]]; then
-    export QT_LOGGING_RULES="${QT_LOGGING_RULES};qt.qpa.services.warning=false"
-  else
-    export QT_LOGGING_RULES="qt.qpa.services.warning=false"
-  fi
-  exec "$VENV_DIR/bin/smart-photos-gui" "${passthrough[@]}"
+  echo "Electron UI exited unexpectedly. Falling back to the Qt diagnostics interface." >&2
+  launch_qt
 fi
 exit 0

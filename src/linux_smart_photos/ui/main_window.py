@@ -34,7 +34,7 @@ from .widgets import MediaGridWidget
 
 PAGE_ITEM_PREVIEW_LIMIT = 720
 CLUSTER_RENDER_CHUNK_SIZE = 128
-LIVE_REFRESH_INTERVAL_MS = 600
+LIVE_REFRESH_INTERVAL_MS = 2500
 
 
 class TaskStatusRow(QWidget):
@@ -1342,21 +1342,31 @@ class MainWindow(QMainWindow):
         current_widget = self.tabs.currentWidget()
 
         if current_widget is self.library_page:
-            self.library_page._refresh_persona_filter()
-            self.library_page.refresh()
-            self._library_dirty = False
+            if self.library_page.grid.is_interacting():
+                self._library_dirty = True
+            else:
+                self.library_page._refresh_persona_filter()
+                self.library_page.refresh()
+                self._library_dirty = False
         else:
             self._library_dirty = True
 
         if current_widget is self.people_page:
-            self.people_page.refresh()
-            self._people_dirty = False
+            if self.people_page.grid.is_interacting():
+                self._people_dirty = True
+            else:
+                self.people_page.refresh()
+                self._people_dirty = False
         else:
             self._people_dirty = True
 
         if current_widget is self.unknown_clusters_page:
-            self.unknown_clusters_page.refresh()
-            self._unknown_clusters_dirty = False
+            if self.unknown_clusters_page.grid.is_interacting():
+                self._unknown_clusters_dirty = True
+                QTimer.singleShot(1500, self._refresh_unknown_clusters_when_idle)
+            else:
+                self.unknown_clusters_page.refresh()
+                self._unknown_clusters_dirty = False
         else:
             self._unknown_clusters_dirty = True
 
@@ -1550,8 +1560,12 @@ class MainWindow(QMainWindow):
             self.cluster_cache_status.set_complete("Final unknown clusters updated")
         current_widget = self.tabs.currentWidget()
         if current_widget is self.unknown_clusters_page:
-            self.unknown_clusters_page.refresh()
-            self._unknown_clusters_dirty = False
+            if self.unknown_clusters_page.grid.is_interacting():
+                self._unknown_clusters_dirty = True
+                QTimer.singleShot(1500, self._refresh_unknown_clusters_when_idle)
+            else:
+                self.unknown_clusters_page.refresh()
+                self._unknown_clusters_dirty = False
         else:
             self._unknown_clusters_dirty = True
 
@@ -1560,6 +1574,17 @@ class MainWindow(QMainWindow):
         self._cluster_cache_base_message = ""
         self.cluster_cache_status.set_error(f"Unknown cluster update failed: {message}")
         self._unknown_clusters_dirty = True
+
+    def _refresh_unknown_clusters_when_idle(self) -> None:
+        if self.tabs.currentWidget() is not self.unknown_clusters_page:
+            return
+        if not self._unknown_clusters_dirty:
+            return
+        if self.unknown_clusters_page.grid.is_interacting():
+            QTimer.singleShot(1500, self._refresh_unknown_clusters_when_idle)
+            return
+        self.unknown_clusters_page.refresh()
+        self._unknown_clusters_dirty = False
 
     def _handle_unknown_cluster_cache_progress(self, update: Any) -> None:
         if not isinstance(update, ProgressUpdate):
