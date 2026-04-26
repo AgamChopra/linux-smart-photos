@@ -70,11 +70,89 @@ Required:
 
 Recommended for the default Tauri interface:
 
-- `npm`
+- Node.js with `npm`
 - Rust/Cargo
-- WebKitGTK development/runtime packages required by Tauri on your distribution
+- WebKitGTK 4.1 and native build packages required by Tauri
 
 If the Tauri UI cannot be built, Smart Photos automatically falls back to the Qt diagnostics UI.
+
+### Tauri Prerequisites
+
+Smart Photos vendors the Tauri project in `tauri/`, so you do not need to install a global Tauri CLI. You do need the system build dependencies, Node/npm, and Rust/Cargo before the default UI can be built.
+
+These package names follow the current [Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
+
+Debian / Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y nodejs npm \
+  libwebkit2gtk-4.1-dev \
+  build-essential \
+  curl \
+  wget \
+  file \
+  libxdo-dev \
+  libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+Fedora:
+
+```bash
+sudo dnf install -y nodejs npm \
+  webkit2gtk4.1-devel \
+  openssl-devel \
+  curl \
+  wget \
+  file \
+  libappindicator-gtk3-devel \
+  librsvg2-devel \
+  libxdo-devel
+sudo dnf group install -y "c-development"
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+Arch:
+
+```bash
+sudo pacman -Syu
+sudo pacman -S --needed nodejs npm rustup \
+  webkit2gtk-4.1 \
+  base-devel \
+  curl \
+  wget \
+  file \
+  openssl \
+  appmenu-gtk-module \
+  libappindicator-gtk3 \
+  librsvg \
+  xdotool
+rustup default stable
+```
+
+Confirm the tools are visible in your terminal:
+
+```bash
+node --version
+npm --version
+cargo --version
+```
+
+Then rebuild the app setup:
+
+```bash
+./setup-smart-photos --force
+./smart-photos
+```
+
+If your distribution packages an old Node.js release and the Tauri build fails, install the current Node.js LTS release using your preferred Node version manager or distro-supported NodeSource package.
 
 Optional for AI acceleration:
 
