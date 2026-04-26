@@ -94,6 +94,14 @@ sanitize_electron_env() {
   unset QT_PLUGIN_PATH
 }
 
+prepare_tauri_env() {
+  # WebKitGTK can hit Wayland dmabuf protocol errors on some NVIDIA/Wayland stacks.
+  export WEBKIT_DISABLE_DMABUF_RENDERER="${WEBKIT_DISABLE_DMABUF_RENDERER:-1}"
+  if [[ "${SMART_PHOTOS_FORCE_X11:-0}" == "1" ]]; then
+    export GDK_BACKEND="x11"
+  fi
+}
+
 while (($#)); do
   case "$1" in
     --gui|gui|--tauri|tauri)
@@ -187,6 +195,7 @@ if [[ "$mode" == "tauri" ]]; then
   fi
   export SMART_PHOTOS_PROJECT_ROOT="$ROOT_DIR"
   export SMART_PHOTOS_VENV_PYTHON="$VENV_DIR/bin/python"
+  prepare_tauri_env
   exec "$TAURI_BINARY" "${passthrough[@]}"
 fi
 

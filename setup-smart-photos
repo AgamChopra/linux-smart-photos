@@ -128,13 +128,15 @@ echo "Installing Python dependencies"
 
 if [[ -f "$TAURI_DIR/package.json" ]]; then
   if command -v npm >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
-    echo "Installing and building Tauri UI"
+    echo "Installing and building Tauri UI binary"
     if (
       cd "$TAURI_DIR"
       npm install --no-fund --no-audit
       npm run build
     ); then
       :
+    elif [[ -x "$TAURI_BINARY" ]]; then
+      echo "Tauri binary exists, continuing despite a packaging/build warning." >&2
     else
       echo "Tauri UI build failed. The Qt diagnostics fallback will remain available." >&2
     fi

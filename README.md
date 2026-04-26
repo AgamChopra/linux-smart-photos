@@ -154,6 +154,21 @@ Then rebuild the app setup:
 
 If your distribution packages an old Node.js release and the Tauri build fails, install the current Node.js LTS release using your preferred Node version manager or distro-supported NodeSource package.
 
+Setup builds the runnable Tauri binary only. Distribution packages are optional release artifacts:
+
+```bash
+cd tauri
+npm run bundle -- --bundles deb rpm
+```
+
+AppImage bundling may require extra distro-specific `linuxdeploy`/FUSE support. If AppImage packaging fails after the binary is built, the app can still run normally.
+
+If the Tauri window crashes with a Wayland protocol error, the launcher already disables the WebKitGTK dmabuf renderer by default. If your compositor still has issues, force X11 for one run:
+
+```bash
+SMART_PHOTOS_FORCE_X11=1 ./smart-photos
+```
+
 Optional for AI acceleration:
 
 - NVIDIA GPU with working CUDA runtime
