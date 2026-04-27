@@ -62,21 +62,21 @@ fn start_api_locked(process: &mut ApiProcess) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|error| format!("Unable to start Smart Photos API: {error}"))?;
+        .map_err(|error| format!("Unable to start LSP API: {error}"))?;
 
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "Smart Photos API stdout was unavailable.".to_string())?;
+        .ok_or_else(|| "LSP API stdout was unavailable.".to_string())?;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     let port = loop {
         line.clear();
         let bytes = reader
             .read_line(&mut line)
-            .map_err(|error| format!("Unable to read Smart Photos API startup output: {error}"))?;
+            .map_err(|error| format!("Unable to read LSP API startup output: {error}"))?;
         if bytes == 0 {
-            return Err("Smart Photos API exited before reporting its port.".to_string());
+            return Err("LSP API exited before reporting its port.".to_string());
         }
         if let Some(value) = line.strip_prefix("SMART_PHOTOS_API_PORT=") {
             break value.trim().to_string();
@@ -94,7 +94,7 @@ fn api_base_url(state: tauri::State<ApiState>) -> Result<String, String> {
     let mut process = state
         .inner
         .lock()
-        .map_err(|_| "Smart Photos API state lock failed.".to_string())?;
+        .map_err(|_| "LSP API state lock failed.".to_string())?;
     start_api_locked(&mut process)
 }
 
@@ -142,7 +142,7 @@ fn main() {
             show_item_in_folder
         ])
         .build(tauri::generate_context!())
-        .expect("failed to build Smart Photos Tauri app")
+        .expect("failed to build Linux Smart Photos Tauri app")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<ApiState>() {

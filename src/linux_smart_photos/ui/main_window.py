@@ -1798,7 +1798,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Background Task Running",
-                "Wait for the current background task to finish before closing Smart Photos.",
+                "Wait for the current background task to finish before closing Linux Smart Photos.",
             )
             event.ignore()
             return

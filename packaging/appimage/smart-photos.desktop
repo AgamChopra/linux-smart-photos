@@ -1,7 +1,7 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Smart Photos
+Name=Linux Smart Photos
 Comment=Browse, search, and organize your local photo library
 Exec=smart-photos
 Icon=smart-photos

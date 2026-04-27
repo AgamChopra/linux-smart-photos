@@ -138,11 +138,11 @@ install -m 0644 "$ROOT_DIR/assets/smart-photos.svg" "$APPDIR/smart-photos.svg"
 install -m 0644 "$ROOT_DIR/assets/smart-photos.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/smart-photos.svg"
 
 APPIMAGETOOL_BIN="$(download_appimagetool)"
-OUTPUT_FILE="$ROOT_DIR/dist/Smart-Photos-$project_version-$ARCH.AppImage"
+OUTPUT_FILE="$ROOT_DIR/dist/Linux-Smart-Photos-$project_version-$ARCH.AppImage"
 
 echo "Creating AppImage"
 APPIMAGE_EXTRACT_AND_RUN=1 \
-APPIMAGETOOL_APP_NAME="Smart Photos" \
+APPIMAGETOOL_APP_NAME="Linux Smart Photos" \
 VERSION="$project_version" \
 ARCH="$ARCH" \
   "$APPIMAGETOOL_BIN" "$APPDIR" "$OUTPUT_FILE"

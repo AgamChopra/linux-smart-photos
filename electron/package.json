@@ -2,7 +2,7 @@
   "name": "smart-photos-electron",
   "version": "0.1.0",
   "private": true,
-  "description": "Electron shell for Smart Photos",
+  "description": "Electron shell for Linux Smart Photos",
   "main": "main.js",
   "scripts": {
     "start": "electron ."

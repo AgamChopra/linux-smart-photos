@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 
 
-APP_NAME = "Smart Photos"
-APP_DESCRIPTION = "Browse, search, and organize your local photo library."
+APP_NAME = "Linux Smart Photos"
+APP_DESCRIPTION = "Browse, search, and organize your local photo library with LSP."
 APP_DESKTOP_ID = "smart-photos"
 APP_ICON_NAME = "smart-photos"
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Smart Photos",
+  "productName": "Linux Smart Photos",
   "version": "0.1.0",
   "identifier": "app.linux-smart-photos.desktop",
   "build": {
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Smart Photos",
+        "title": "Linux Smart Photos",
         "width": 1440,
         "height": 940,
         "minWidth": 1040,

@@ -52,7 +52,7 @@ while (($#)); do
 done
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required to set up Smart Photos." >&2
+  echo "python3 is required to set up Linux Smart Photos." >&2
   exit 1
 fi
 
@@ -110,13 +110,13 @@ if [[ "$check_only" == "1" ]]; then
 fi
 
 if [[ "$force_setup" != "1" && "$setup_current" == "1" ]]; then
-  echo "Smart Photos setup is already up to date."
+  echo "LSP setup is already up to date."
   echo "Checking for legacy library migrations"
   "$VENV_DIR/bin/smart-photos-migrate"
   exit 0
 fi
 
-echo "Setting up Smart Photos in $ROOT_DIR"
+echo "Setting up Linux Smart Photos in $ROOT_DIR"
 python3 -m venv "$VENV_DIR"
 
 echo "Installing Python dependencies"
@@ -164,7 +164,7 @@ cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Smart Photos
+Name=Linux Smart Photos
 Comment=Browse, search, and organize your local photo library
 TryExec=$BIN_LINK
 Exec=$BIN_LINK --gui
@@ -172,7 +172,7 @@ Icon=smart-photos
 Terminal=false
 Categories=Graphics;Photography;
 StartupNotify=true
-StartupWMClass=Smart Photos
+StartupWMClass=Linux Smart Photos
 EOF
 
 if command -v update-desktop-database >/dev/null 2>&1; then
@@ -180,4 +180,4 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 printf '%s\n' "$manifest_hash" > "$STAMP_FILE"
-echo "Smart Photos is ready."
+echo "Linux Smart Photos is ready."

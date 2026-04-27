@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/smart-photos.svg" alt="Smart Photos icon" width="256" height="256">
+  <img src="assets/smart-photos.svg" alt="Linux Smart Photos icon" width="256" height="256">
 </p>
 
-<h1 align="center">Smart Photos</h1>
+<h1 align="center">Linux Smart Photos</h1>
 
 <p align="center">
   A private, local-first photo library for Linux with people, pets, search, albums, and memories.
@@ -14,7 +14,7 @@
 
 ---
 
-Smart Photos helps you browse and organize personal photo libraries without sending your images to a cloud service. It indexes your media into a local SQLite database, generates thumbnails, detects people and pets, and gives you a clean everyday interface for reviewing matches and curating albums.
+Linux Smart Photos (LSP) helps you browse and organize personal photo libraries without sending your images to a cloud service. It indexes your media into a local SQLite database, generates thumbnails, detects people and pets, and gives you a clean everyday interface for reviewing matches and curating albums.
 
 The default interface is a lightweight **Tauri** desktop app. The older **Qt Widgets** interface remains available as a diagnostics and fallback UI.
 
@@ -74,11 +74,11 @@ Recommended for the default Tauri interface:
 - Rust/Cargo
 - WebKitGTK 4.1 and native build packages required by Tauri
 
-If the Tauri UI cannot be built, Smart Photos automatically falls back to the Qt diagnostics UI.
+If the Tauri UI cannot be built, LSP automatically falls back to the Qt diagnostics UI.
 
 ### Tauri Prerequisites
 
-Smart Photos vendors the Tauri project in `tauri/`, so you do not need to install a global Tauri CLI. You do need the system build dependencies, Node/npm, and Rust/Cargo before the default UI can be built.
+LSP vendors the Tauri project in `tauri/`, so you do not need to install a global Tauri CLI. You do need the system build dependencies, Node/npm, and Rust/Cargo before the default UI can be built.
 
 These package names follow the current [Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
 
@@ -176,7 +176,7 @@ Optional for AI acceleration:
 
 ## AI Features
 
-With the AI extras installed, Smart Photos can:
+With the AI extras installed, LSP can:
 
 - detect human faces, pets, pet faces, and common objects
 - extract face and pet embeddings for grouping
@@ -188,7 +188,7 @@ Recommended models can be installed from the **AI Models** view or via the CLI. 
 
 ## Everyday Workflow
 
-1. Open Smart Photos.
+1. Open Linux Smart Photos.
 2. Let the library sync in the background.
 3. Browse the Library view while thumbnails and AI results appear.
 4. Open **Review Matches** to confirm or reject suggested face/pet clusters.
@@ -222,7 +222,7 @@ year:2026 tag:dog
 
 ## Data Locations
 
-Smart Photos stores app data in standard user directories.
+LSP stores app data in standard user directories.
 
 | Data | Default Location |
 | --- | --- |
@@ -246,7 +246,7 @@ You can use [config.example.json](config.example.json) as a template for custom 
 
 ## Recommended Models
 
-Smart Photos can use these models:
+LSP can use these models:
 
 - Object detection: [Ultralytics YOLO11n](https://docs.ultralytics.com/models/yolo11/)
 - Human face detector: [InsightFace SCRFD](https://github.com/deepinsight/insightface/blob/master/detection/scrfd/README.md)
@@ -254,7 +254,7 @@ Smart Photos can use these models:
 - Pet personas: [AvitoTech DINOv2-Small Animal Identification](https://huggingface.co/AvitoTech/DINO-v2-small-for-animal-identification)
 - Pet face detector: [LostPetInitiative yolov7-pet-face.pt](https://zenodo.org/records/7607110)
 
-On systems where ONNX Runtime exposes `TensorrtExecutionProvider`, Smart Photos prefers TensorRT for the human face detector and falls back to CUDA or CPU if TensorRT is unavailable.
+On systems where ONNX Runtime exposes `TensorrtExecutionProvider`, LSP prefers TensorRT for the human face detector and falls back to CUDA or CPU if TensorRT is unavailable.
 
 ## Current Limits
 
@@ -267,4 +267,4 @@ On systems where ONNX Runtime exposes `TensorrtExecutionProvider`, Smart Photos 
 
 ## License
 
-Smart Photos is released under the [MIT License](LICENSE).
+Linux Smart Photos is released under the [MIT License](LICENSE).

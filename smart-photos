@@ -173,7 +173,7 @@ if [[ "$setup_only" == "1" ]]; then
 fi
 
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-  echo "The Smart Photos virtual environment is missing. Run ./setup-smart-photos first." >&2
+  echo "The Linux Smart Photos virtual environment is missing. Run ./setup-smart-photos first." >&2
   exit 1
 fi
 

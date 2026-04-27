@@ -76,7 +76,7 @@ function startApiServer() {
       if (resolved) {
         return;
       }
-      reject(new Error(`Smart Photos API exited before startup (code=${code}, signal=${signal})`));
+      reject(new Error(`LSP API exited before startup (code=${code}, signal=${signal})`));
     });
   });
 
@@ -90,7 +90,7 @@ function createWindow() {
     minWidth: 1200,
     minHeight: 760,
     backgroundColor: "#f4ede5",
-    title: "Smart Photos",
+    title: "Linux Smart Photos",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -150,7 +150,7 @@ app.whenReady().then(async () => {
     await startApiServer();
     createWindow();
   } catch (error) {
-    dialog.showErrorBox("Smart Photos", `${error}`);
+    dialog.showErrorBox("Linux Smart Photos", `${error}`);
     app.quit();
     return;
   }

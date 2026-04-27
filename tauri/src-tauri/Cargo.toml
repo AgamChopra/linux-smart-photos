@@ -1,8 +1,8 @@
 [package]
 name = "smart-photos-tauri"
 version = "0.1.0"
-description = "Smart Photos"
-authors = ["Smart Photos"]
+description = "Linux Smart Photos"
+authors = ["Linux Smart Photos"]
 edition = "2021"
 
 [build-dependencies]
@@ -12,4 +12,3 @@ tauri-build = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
-
