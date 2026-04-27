@@ -1109,6 +1109,47 @@ class LibraryService:
         self.regenerate_memories()
         self.save()
 
+    def _resolve_persona_for_live_assignment(
+        self,
+        persona_id: str,
+        new_name: str,
+        kind: str,
+    ) -> Persona:
+        if persona_id:
+            persona = (
+                self.state.personas.get(persona_id)
+                if self._state_loaded
+                else self.store.load_persona(persona_id)
+            )
+            if not persona:
+                raise ValueError("Persona not found.")
+            if persona.kind != kind:
+                raise ValueError("Selected persona does not match the selected cluster type.")
+            if self._state_loaded:
+                self.state.personas[persona.id] = persona
+            return persona
+
+        normalized = new_name.strip()
+        if not normalized:
+            raise ValueError("Persona name is required.")
+        for persona in self.list_personas(kind=kind):
+            if persona.name.lower() == normalized.lower():
+                if self._state_loaded:
+                    self.state.personas[persona.id] = persona
+                return persona
+
+        persona_count = len(self.state.personas) if self._state_loaded else self.store.count_personas()
+        persona = Persona(
+            id=stable_id(f"persona:{kind}:{normalized.lower()}:{utc_now()}"),
+            name=normalized,
+            kind=kind,
+            created_at=utc_now(),
+            color=PERSONA_COLORS[persona_count % len(PERSONA_COLORS)],
+        )
+        if self._state_loaded:
+            self.state.personas[persona.id] = persona
+        return persona
+
     def assign_unknown_clusters_to_persona(
         self,
         clusters: Iterable[UnknownPersonaCluster],
@@ -1116,7 +1157,6 @@ class LibraryService:
         new_name: str = "",
         kind: str = "person",
     ) -> Persona:
-        self._ensure_state_loaded()
         cluster_list = list(clusters)
         if not cluster_list:
             raise ValueError("Select at least one cluster.")
@@ -1128,15 +1168,21 @@ class LibraryService:
         if kind and kind != resolved_kind:
             raise ValueError("Selected clusters do not match the chosen persona kind.")
 
-        persona = self._resolve_persona(persona_id, new_name, resolved_kind)
+        persona = self._resolve_persona_for_live_assignment(persona_id, new_name, resolved_kind)
         touched = False
         seen_regions: set[tuple[str, str]] = set()
+        item_ids = sorted({item_id for cluster in cluster_list for item_id in cluster.item_ids})
+        items_by_id = {
+            item.id: item
+            for item in self.store.load_items_by_ids(item_ids)
+        }
+        updated_items: dict[str, MediaItem] = {}
         for cluster in cluster_list:
             for item_id, region_id in cluster.member_ids:
                 if (item_id, region_id) in seen_regions:
                     continue
                 seen_regions.add((item_id, region_id))
-                item = self.state.items.get(item_id)
+                item = items_by_id.get(item_id)
                 if item is None:
                     continue
                 detection = next((entry for entry in item.detections if entry.id == region_id), None)
@@ -1148,14 +1194,25 @@ class LibraryService:
                 self._remember_detection_reference(persona, item, detection)
                 if not persona.avatar_item_id:
                     persona.avatar_item_id = item.id
+                updated_items[item.id] = item
                 touched = True
 
         if not touched:
             raise ValueError("The selected clusters no longer contain assignable detections.")
 
-        self._cleanup_collections()
-        self.regenerate_memories()
-        self.save()
+        updated_at = utc_now()
+        self.store.save_persona_assignment(
+            persona,
+            updated_items.values(),
+            updated_at=updated_at,
+            schema_version=self.state.schema_version,
+            personas=self.state.personas if self._state_loaded else {persona.id: persona},
+        )
+        if self._state_loaded:
+            self.state.updated_at = updated_at
+            self.state.personas[persona.id] = persona
+            for item in updated_items.values():
+                self.state.items[item.id] = item
         return persona
 
     def create_album(self, name: str, item_ids: Iterable[str] = ()) -> Album:

@@ -590,6 +590,7 @@ class UnknownClustersPage(QWidget):
         self._items_worker: ItemLoadWorker | None = None
         self._pending_item_request: tuple[int, list[UnknownPersonaCluster], str, int] | None = None
         self._latest_item_request_id = 0
+        self._busy = False
 
         self.kind_filter = QComboBox()
         self.kind_filter.addItem("All Unknown", "all")
@@ -606,8 +607,10 @@ class UnknownClustersPage(QWidget):
         self.refresh_button.clicked.connect(self.refresh)
         self.assign_button = QPushButton("Assign Selected Clusters")
         self.assign_button.clicked.connect(self._assign_selected_clusters)
+        self.assign_button.setEnabled(False)
         self.review_button = QPushButton("Review Current Item")
         self.review_button.clicked.connect(self._open_corrections)
+        self.review_button.setEnabled(False)
 
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.kind_filter)
@@ -651,6 +654,7 @@ class UnknownClustersPage(QWidget):
             self.cluster_list.setEnabled(False)
             self.owner.set_cluster_view_status_loading("Loading unknown clusters")
         self.refresh_button.setEnabled(False)
+        self._update_action_buttons()
 
         thread = QThread(self)
         worker = UnknownClustersWorker(
@@ -675,6 +679,7 @@ class UnknownClustersPage(QWidget):
         thread.start()
 
     def _show_selected_clusters(self, *_args) -> None:
+        self._update_action_buttons()
         clusters = self._selected_clusters()
         if not self._clusters_by_id:
             if self.owner._active_task in {"startup", "sync"}:
@@ -735,7 +740,7 @@ class UnknownClustersPage(QWidget):
             return
         choice = dialog.selection()
         try:
-            self.service.assign_unknown_clusters_to_persona(
+            persona = self.service.assign_unknown_clusters_to_persona(
                 clusters,
                 persona_id=choice["persona_id"],
                 new_name=choice["new_name"],
@@ -744,8 +749,13 @@ class UnknownClustersPage(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Assignment Failed", str(exc))
             return
-        self.owner.request_unknown_cluster_cache_refresh(partial=False)
-        self.owner.refresh_views()
+        assigned_ids = {cluster.id for cluster in clusters}
+        self._remove_assigned_clusters_from_view(
+            assigned_ids,
+            message=f"Assigned {len(assigned_ids)} cluster(s) to {persona.name}.",
+        )
+        self.owner.request_unknown_cluster_cache_refresh(partial=self.owner.is_live_processing())
+        self.owner.refresh_views(refresh_unknown=False)
 
     def _open_corrections(self, *_args) -> None:
         item_id = self.grid.current_item_id()
@@ -765,6 +775,32 @@ class UnknownClustersPage(QWidget):
             if cluster is not None:
                 clusters.append(cluster)
         return clusters
+
+    def _remove_assigned_clusters_from_view(self, cluster_ids: set[str], *, message: str) -> None:
+        if not cluster_ids:
+            return
+        self.cluster_list.blockSignals(True)
+        for row in range(self.cluster_list.count() - 1, -1, -1):
+            item = self.cluster_list.item(row)
+            if str(item.data(Qt.UserRole)) in cluster_ids:
+                self.cluster_list.takeItem(row)
+        self.cluster_list.blockSignals(False)
+        for cluster_id in cluster_ids:
+            self._clusters_by_id.pop(cluster_id, None)
+        self.grid.set_items([])
+        if self.cluster_list.count():
+            next_row = self.cluster_list.currentRow()
+            if next_row < 0:
+                next_row = 0
+            self.cluster_list.setCurrentRow(min(next_row, self.cluster_list.count() - 1))
+        self.summary.setText(message)
+        self.owner.set_cluster_view_status_complete(message)
+        self._show_selected_clusters()
+
+    def _update_action_buttons(self) -> None:
+        has_clusters = bool(self.cluster_list.selectedItems())
+        self.assign_button.setEnabled(has_clusters)
+        self.review_button.setEnabled(has_clusters and not self._busy)
 
     def _cluster_title(self, cluster: UnknownPersonaCluster, index: int) -> str:
         if cluster.kind == "person":
@@ -793,9 +829,9 @@ class UnknownClustersPage(QWidget):
         return cluster.label or "pet"
 
     def set_busy(self, busy: bool) -> None:
+        self._busy = busy
         self.refresh_button.setEnabled(self._refresh_thread is None)
-        self.assign_button.setEnabled(not busy)
-        self.review_button.setEnabled(not busy)
+        self._update_action_buttons()
 
     def _handle_refresh_completed(self, payload: Any) -> None:
         clusters = payload if isinstance(payload, list) else []
@@ -838,6 +874,7 @@ class UnknownClustersPage(QWidget):
     def _handle_refresh_failed(self, message: str) -> None:
         self.cluster_list.setEnabled(True)
         self.refresh_button.setEnabled(True)
+        self._update_action_buttons()
         self.summary.setText(f"Unable to load unknown clusters: {message}")
         self.owner.set_cluster_view_status_error(f"Unknown clusters failed to load: {message}")
 
@@ -860,6 +897,7 @@ class UnknownClustersPage(QWidget):
                 f"Unknown clusters ready: {len(self._pending_render_clusters)} cluster(s), {status_label}"
             )
             self._show_selected_clusters()
+            self._update_action_buttons()
             return
 
         batch = self._pending_render_clusters[
@@ -1376,6 +1414,14 @@ class MainWindow(QMainWindow):
 
     def _start_startup_tasks(self) -> None:
         self._start_background_task("startup")
+
+    def is_live_processing(self) -> bool:
+        return bool(
+            self._active_task in {"startup", "sync"}
+            or self._cluster_cache_thread is not None
+            or self._cluster_cache_partial_pending
+            or self._cluster_cache_final_pending
+        )
 
     def sync_library(self, *_args) -> None:
         self._start_background_task("sync")

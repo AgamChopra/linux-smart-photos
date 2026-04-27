@@ -187,6 +187,79 @@ class SQLiteLibraryStore:
                 self._replace_item_detection_rows(conn, buffered_items, updated_at=updated_at)
             self._delete_empty_unknown_clusters(conn)
 
+    def save_persona_assignment(
+        self,
+        persona: Persona,
+        items: Iterable[MediaItem],
+        *,
+        updated_at: str,
+        schema_version: int,
+        personas: dict[str, Persona] | None = None,
+    ) -> None:
+        buffered_items = list(items)
+        persona_map = dict(personas or {})
+        persona_map[persona.id] = persona
+        with self._connect() as conn:
+            self._set_metadata(conn, "schema_version", str(schema_version))
+            self._set_metadata(conn, "updated_at", updated_at)
+            conn.execute(
+                """
+                INSERT INTO personas (id, name, kind, created_at, payload)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  name=excluded.name,
+                  kind=excluded.kind,
+                  created_at=excluded.created_at,
+                  payload=excluded.payload
+                """,
+                self._persona_row(persona),
+            )
+            if not buffered_items:
+                return
+
+            needed_persona_ids = {
+                persona_id
+                for item in buffered_items
+                for persona_id in self._item_persona_ids(item)
+                if persona_id
+            }
+            missing_persona_ids = [
+                persona_id
+                for persona_id in needed_persona_ids
+                if persona_id not in persona_map
+            ]
+            if missing_persona_ids:
+                placeholders = ",".join("?" for _ in missing_persona_ids)
+                rows = conn.execute(
+                    f"SELECT id, payload FROM personas WHERE id IN ({placeholders})",
+                    missing_persona_ids,
+                ).fetchall()
+                for row in rows:
+                    persona_map[str(row["id"])] = Persona.from_dict(json.loads(row["payload"]))
+
+            conn.executemany(
+                """
+                INSERT INTO items (
+                  id, title, media_kind, captured_at, modified_ts, favorite, hidden, path, payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  title=excluded.title,
+                  media_kind=excluded.media_kind,
+                  captured_at=excluded.captured_at,
+                  modified_ts=excluded.modified_ts,
+                  favorite=excluded.favorite,
+                  hidden=excluded.hidden,
+                  path=excluded.path,
+                  payload=excluded.payload
+                """,
+                [self._item_row(item) for item in buffered_items],
+            )
+            self._delete_item_indexes(conn, [item.id for item in buffered_items])
+            self._insert_item_indexes(conn, buffered_items, persona_map)
+            self._replace_item_detection_rows(conn, buffered_items, updated_at=updated_at)
+            self._delete_empty_unknown_clusters(conn)
+
     def load_item(self, item_id: str) -> MediaItem | None:
         row = self._fetch_payload_row("items", item_id)
         return None if row is None else MediaItem.from_dict(json.loads(row["payload"]))
@@ -431,9 +504,13 @@ class SQLiteLibraryStore:
             "  uc.cluster_id, uc.kind, uc.label, uc.member_count, uc.item_count, "
             "  uc.representative_detection_id, uc.representative_item_id, uc.preview_path, "
             "  uc.latest_captured_at, uc.average_confidence, uc.revision, uc.is_partial, uc.updated_at, "
-            "  ucm.item_id AS member_item_id, ucm.detection_id AS member_detection_id "
+            "  d.item_id AS member_item_id, d.detection_id AS member_detection_id "
             "FROM unknown_clusters uc "
-            "LEFT JOIN unknown_cluster_members ucm ON ucm.cluster_id = uc.cluster_id"
+            "LEFT JOIN unknown_cluster_members ucm ON ucm.cluster_id = uc.cluster_id "
+            "LEFT JOIN detections d "
+            "  ON d.item_id = ucm.item_id "
+            " AND d.detection_id = ucm.detection_id "
+            " AND (d.persona_id IS NULL OR d.persona_id = '')"
         )
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
@@ -538,6 +615,7 @@ class SQLiteLibraryStore:
                   ON d.item_id = ucm.item_id
                  AND d.detection_id = ucm.detection_id
                 WHERE uc.kind = ?
+                  AND (d.persona_id IS NULL OR d.persona_id = '')
                 ORDER BY uc.cluster_id ASC, d.captured_at DESC, d.item_id ASC, d.detection_id ASC
                 """,
                 (kind,),
@@ -634,9 +712,18 @@ class SQLiteLibraryStore:
                 conn.executemany(
                     """
                     INSERT INTO unknown_cluster_members (cluster_id, item_id, detection_id)
-                    VALUES (?, ?, ?)
+                    SELECT ?, ?, ?
+                    WHERE EXISTS (
+                      SELECT 1 FROM detections
+                      WHERE item_id = ?
+                        AND detection_id = ?
+                        AND (persona_id IS NULL OR persona_id = '')
+                    )
                     """,
-                    member_rows,
+                    [
+                        (cluster_id, item_id, detection_id, item_id, detection_id)
+                        for cluster_id, item_id, detection_id in member_rows
+                    ],
                 )
             self._delete_empty_unknown_clusters(conn)
 
@@ -734,6 +821,7 @@ class SQLiteLibraryStore:
         conn = sqlite3.connect(str(self.path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         return conn
