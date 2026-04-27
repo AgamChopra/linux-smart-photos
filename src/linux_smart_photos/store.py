@@ -78,6 +78,18 @@ class SQLiteLibraryStore:
             row = conn.execute("SELECT COUNT(*) AS count FROM memories").fetchone()
         return int(row["count"]) if row is not None else 0
 
+    def count_detections(self, cluster_kind: str = "all", *, dirty_only: bool = False) -> int:
+        clauses, params = self._detection_query_clauses(
+            cluster_kind=cluster_kind,
+            dirty_only=dirty_only,
+        )
+        sql = "SELECT COUNT(*) AS count FROM detections"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row["count"]) if row is not None else 0
+
     def legacy_json_candidates(self) -> list[Path]:
         return [candidate for candidate in self._legacy_json_paths_for(self.requested_path) if candidate.exists()]
 
@@ -140,10 +152,22 @@ class SQLiteLibraryStore:
             self._replace_entity_table(conn, "personas", (self._persona_row(persona) for persona in state.personas.values()))
             self._replace_entity_table(conn, "albums", (self._album_row(album) for album in state.albums.values()))
             self._replace_entity_table(conn, "memories", (self._memory_row(memory) for memory in state.memories.values()))
-            self._replace_entity_table(conn, "items", (self._item_row(item) for item in state.items.values()))
+            self._replace_items_table_preserving_detections(conn, state.items.values())
             self._rebuild_item_indexes(conn, state.items.values(), state.personas)
             self._rebuild_detection_rows(conn, state.items.values(), updated_at=state.updated_at)
             self._delete_empty_unknown_clusters(conn)
+
+    def save_memories(
+        self,
+        memories: Iterable[Memory],
+        *,
+        updated_at: str,
+        schema_version: int,
+    ) -> None:
+        with self._connect() as conn:
+            self._set_metadata(conn, "schema_version", str(schema_version))
+            self._set_metadata(conn, "updated_at", updated_at)
+            self._replace_entity_table(conn, "memories", (self._memory_row(memory) for memory in memories))
 
     def save_items_progress(
         self,
@@ -459,17 +483,10 @@ class SQLiteLibraryStore:
         dirty_only: bool = False,
         item_ids: Sequence[str] | None = None,
     ) -> list[DetectionRecord]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if cluster_kind == "person":
-            clauses.append("kind = 'face'")
-        elif cluster_kind == "pet":
-            clauses.append("kind IN ('pet', 'pet_face')")
-        elif cluster_kind != "all":
-            clauses.append("kind = ?")
-            params.append(cluster_kind)
-        if dirty_only:
-            clauses.append("cluster_dirty = 1")
+        clauses, params = self._detection_query_clauses(
+            cluster_kind=cluster_kind,
+            dirty_only=dirty_only,
+        )
         if item_ids:
             filtered_ids = [item_id for item_id in item_ids if item_id]
             if not filtered_ids:
@@ -726,6 +743,19 @@ class SQLiteLibraryStore:
                     ],
                 )
             self._delete_empty_unknown_clusters(conn)
+
+    def mark_unknown_clusters_stable(self, kind: str, *, revision: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE unknown_clusters
+                SET is_partial = 0,
+                    revision = ?,
+                    updated_at = ?
+                WHERE kind = ?
+                """,
+                (revision, revision, kind),
+            )
 
     def mark_detections_cluster_clean(
         self,
@@ -1040,6 +1070,45 @@ class SQLiteLibraryStore:
                 buffered_rows,
             )
 
+    def _replace_items_table_preserving_detections(
+        self,
+        conn: sqlite3.Connection,
+        items: Iterable[MediaItem],
+    ) -> None:
+        item_rows = [self._item_row(item) for item in items]
+        new_item_ids = {str(row[0]) for row in item_rows}
+        existing_item_ids = {
+            str(row["id"])
+            for row in conn.execute("SELECT id FROM items").fetchall()
+        }
+        removed_item_ids = existing_item_ids - new_item_ids
+        if removed_item_ids:
+            conn.executemany(
+                "DELETE FROM items WHERE id = ?",
+                ((item_id,) for item_id in removed_item_ids),
+            )
+            self._delete_item_indexes(conn, sorted(removed_item_ids))
+        if not item_rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO items (
+              id, title, media_kind, captured_at, modified_ts, favorite, hidden, path, payload
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              title=excluded.title,
+              media_kind=excluded.media_kind,
+              captured_at=excluded.captured_at,
+              modified_ts=excluded.modified_ts,
+              favorite=excluded.favorite,
+              hidden=excluded.hidden,
+              path=excluded.path,
+              payload=excluded.payload
+            """,
+            item_rows,
+        )
+
     def _rebuild_item_indexes(
         self,
         conn: sqlite3.Connection,
@@ -1059,26 +1128,24 @@ class SQLiteLibraryStore:
         updated_at: str,
     ) -> None:
         buffered_items = list(items)
-        conn.execute("DELETE FROM detections")
+        existing_rows = self._existing_detection_rows(conn)
+        existing_keys = set(existing_rows)
+        new_keys: set[tuple[str, str]] = set()
         if not buffered_items:
-            self._touch_cluster_revision(conn, updated_at)
+            if existing_keys:
+                self._delete_detection_keys(conn, existing_keys)
+                self._touch_cluster_revision(conn, updated_at)
             return
         detection_rows: list[tuple[Any, ...]] = []
         for item in buffered_items:
             detection_rows.extend(self._detection_rows_for_item(item, updated_at=updated_at))
-        if detection_rows:
-            conn.executemany(
-                """
-                INSERT INTO detections (
-                  item_id, detection_id, kind, label, confidence,
-                  bbox_x, bbox_y, bbox_w, bbox_h, persona_id, encoding_json,
-                  signature, source_frame_token, captured_at, pipeline_revision,
-                  cluster_dirty, cluster_dirty_revision, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                detection_rows,
-            )
-        self._touch_cluster_revision(conn, updated_at)
+        new_keys = {(str(row[0]), str(row[1])) for row in detection_rows}
+        removed_keys = existing_keys - new_keys
+        if removed_keys:
+            self._delete_detection_keys(conn, removed_keys)
+        dirty_keys = self._upsert_detection_rows(conn, detection_rows, existing_rows, updated_at=updated_at)
+        if removed_keys or dirty_keys:
+            self._touch_cluster_revision(conn, updated_at)
 
     def _replace_item_detection_rows(
         self,
@@ -1088,25 +1155,18 @@ class SQLiteLibraryStore:
         updated_at: str,
     ) -> None:
         item_ids = [item.id for item in items if item.id]
-        if item_ids:
-            placeholders = ",".join("?" for _ in item_ids)
-            conn.execute(f"DELETE FROM detections WHERE item_id IN ({placeholders})", item_ids)
+        existing_rows = self._existing_detection_rows(conn, item_ids=item_ids)
+        existing_keys = set(existing_rows)
         detection_rows: list[tuple[Any, ...]] = []
         for item in items:
             detection_rows.extend(self._detection_rows_for_item(item, updated_at=updated_at))
-        if detection_rows:
-            conn.executemany(
-                """
-                INSERT INTO detections (
-                  item_id, detection_id, kind, label, confidence,
-                  bbox_x, bbox_y, bbox_w, bbox_h, persona_id, encoding_json,
-                  signature, source_frame_token, captured_at, pipeline_revision,
-                  cluster_dirty, cluster_dirty_revision, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                detection_rows,
-            )
-        self._touch_cluster_revision(conn, updated_at)
+        new_keys = {(str(row[0]), str(row[1])) for row in detection_rows}
+        removed_keys = existing_keys - new_keys
+        if removed_keys:
+            self._delete_detection_keys(conn, removed_keys)
+        dirty_keys = self._upsert_detection_rows(conn, detection_rows, existing_rows, updated_at=updated_at)
+        if removed_keys or dirty_keys:
+            self._touch_cluster_revision(conn, updated_at)
 
     def _insert_item_indexes(
         self,
@@ -1151,6 +1211,17 @@ class SQLiteLibraryStore:
         conn.execute("DELETE FROM cache_entries")
 
     def _delete_empty_unknown_clusters(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            DELETE FROM unknown_cluster_members
+            WHERE NOT EXISTS (
+              SELECT 1 FROM detections d
+              WHERE d.item_id = unknown_cluster_members.item_id
+                AND d.detection_id = unknown_cluster_members.detection_id
+                AND (d.persona_id IS NULL OR d.persona_id = '')
+            )
+            """
+        )
         conn.execute(
             """
             DELETE FROM unknown_clusters
@@ -1278,6 +1349,174 @@ class SQLiteLibraryStore:
                 )
             )
         return rows
+
+    def _detection_query_clauses(
+        self,
+        *,
+        cluster_kind: str,
+        dirty_only: bool,
+    ) -> tuple[list[str], list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if cluster_kind == "person":
+            clauses.append("kind = 'face'")
+        elif cluster_kind == "pet":
+            clauses.append("kind IN ('pet', 'pet_face')")
+        elif cluster_kind != "all":
+            clauses.append("kind = ?")
+            params.append(cluster_kind)
+        if dirty_only:
+            clauses.append("cluster_dirty = 1")
+        return clauses, params
+
+    def _existing_detection_rows(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        item_ids: Sequence[str] | None = None,
+    ) -> dict[tuple[str, str], sqlite3.Row]:
+        params: list[Any] = []
+        sql = (
+            "SELECT item_id, detection_id, kind, label, confidence, bbox_x, bbox_y, bbox_w, bbox_h, "
+            "persona_id, encoding_json, signature, source_frame_token, captured_at, pipeline_revision, "
+            "cluster_dirty, cluster_dirty_revision, updated_at "
+            "FROM detections"
+        )
+        if item_ids:
+            filtered_ids = [item_id for item_id in item_ids if item_id]
+            if not filtered_ids:
+                return {}
+            placeholders = ",".join("?" for _ in filtered_ids)
+            sql += f" WHERE item_id IN ({placeholders})"
+            params.extend(filtered_ids)
+        rows = conn.execute(sql, params).fetchall()
+        return {
+            (str(row["item_id"]), str(row["detection_id"])): row
+            for row in rows
+        }
+
+    def _upsert_detection_rows(
+        self,
+        conn: sqlite3.Connection,
+        rows: Sequence[tuple[Any, ...]],
+        existing_rows: dict[tuple[str, str], sqlite3.Row],
+        *,
+        updated_at: str,
+    ) -> set[tuple[str, str]]:
+        if not rows:
+            return set()
+        prepared_rows: list[tuple[Any, ...]] = []
+        dirty_keys: set[tuple[str, str]] = set()
+        for row in rows:
+            key = (str(row[0]), str(row[1]))
+            existing = existing_rows.get(key)
+            if existing is not None and self._detection_identity_from_tuple(row) == self._detection_identity_from_row(existing):
+                cluster_dirty = int(existing["cluster_dirty"])
+                cluster_dirty_revision = str(existing["cluster_dirty_revision"] or "")
+            else:
+                cluster_dirty = 1
+                cluster_dirty_revision = updated_at
+                dirty_keys.add(key)
+            prepared_rows.append(
+                (
+                    *row[:15],
+                    cluster_dirty,
+                    cluster_dirty_revision,
+                    updated_at,
+                )
+            )
+
+        conn.executemany(
+            """
+            INSERT INTO detections (
+              item_id, detection_id, kind, label, confidence,
+              bbox_x, bbox_y, bbox_w, bbox_h, persona_id, encoding_json,
+              signature, source_frame_token, captured_at, pipeline_revision,
+              cluster_dirty, cluster_dirty_revision, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, detection_id) DO UPDATE SET
+              kind=excluded.kind,
+              label=excluded.label,
+              confidence=excluded.confidence,
+              bbox_x=excluded.bbox_x,
+              bbox_y=excluded.bbox_y,
+              bbox_w=excluded.bbox_w,
+              bbox_h=excluded.bbox_h,
+              persona_id=excluded.persona_id,
+              encoding_json=excluded.encoding_json,
+              signature=excluded.signature,
+              source_frame_token=excluded.source_frame_token,
+              captured_at=excluded.captured_at,
+              pipeline_revision=excluded.pipeline_revision,
+              cluster_dirty=excluded.cluster_dirty,
+              cluster_dirty_revision=excluded.cluster_dirty_revision,
+              updated_at=excluded.updated_at
+            """,
+            prepared_rows,
+        )
+        if dirty_keys:
+            self._delete_unknown_cluster_members_for_detections(conn, dirty_keys)
+        return dirty_keys
+
+    def _delete_detection_keys(
+        self,
+        conn: sqlite3.Connection,
+        keys: Iterable[tuple[str, str]],
+    ) -> None:
+        buffered = [(item_id, detection_id) for item_id, detection_id in keys if item_id and detection_id]
+        if not buffered:
+            return
+        conn.executemany(
+            "DELETE FROM detections WHERE item_id = ? AND detection_id = ?",
+            buffered,
+        )
+
+    def _delete_unknown_cluster_members_for_detections(
+        self,
+        conn: sqlite3.Connection,
+        keys: Iterable[tuple[str, str]],
+    ) -> None:
+        buffered = [(item_id, detection_id) for item_id, detection_id in keys if item_id and detection_id]
+        if not buffered:
+            return
+        conn.executemany(
+            "DELETE FROM unknown_cluster_members WHERE item_id = ? AND detection_id = ?",
+            buffered,
+        )
+
+    def _detection_identity_from_tuple(self, row: tuple[Any, ...]) -> tuple[Any, ...]:
+        return (
+            str(row[2]),
+            str(row[3]),
+            float(row[4]),
+            int(row[5]),
+            int(row[6]),
+            int(row[7]),
+            int(row[8]),
+            "" if row[9] in {None, ""} else str(row[9]),
+            str(row[10] or ""),
+            str(row[11] or ""),
+            str(row[12] or ""),
+            str(row[13] or ""),
+            str(row[14] or ""),
+        )
+
+    def _detection_identity_from_row(self, row: sqlite3.Row) -> tuple[Any, ...]:
+        return (
+            str(row["kind"]),
+            str(row["label"]),
+            float(row["confidence"]),
+            int(row["bbox_x"]),
+            int(row["bbox_y"]),
+            int(row["bbox_w"]),
+            int(row["bbox_h"]),
+            "" if row["persona_id"] in {None, ""} else str(row["persona_id"]),
+            str(row["encoding_json"] or ""),
+            str(row["signature"] or ""),
+            str(row["source_frame_token"] or ""),
+            str(row["captured_at"] or ""),
+            str(row["pipeline_revision"] or ""),
+        )
 
     def _search_tokens(self, search_text: str) -> list[str]:
         return [token.lower() for token in search_text.split() if token.strip()]

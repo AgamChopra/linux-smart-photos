@@ -749,6 +749,7 @@ class UnknownClustersPage(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Assignment Failed", str(exc))
             return
+        self.service.reload()
         assigned_ids = {cluster.id for cluster in clusters}
         self._remove_assigned_clusters_from_view(
             assigned_ids,

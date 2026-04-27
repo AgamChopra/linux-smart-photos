@@ -404,9 +404,10 @@ class LibraryService:
                 overall_started_at=sync_started_at,
             ),
         )
+        self._merge_current_store_assignments_into_state()
         self._cleanup_collections()
         self.regenerate_memories()
-        self.save()
+        self._save_memories_only()
         completed += 1
         self._emit_progress(
             progress_callback,
@@ -430,14 +431,90 @@ class LibraryService:
         *,
         removed_item_ids: Iterable[str] = (),
     ) -> None:
+        buffered_items = list(items)
+        self._merge_current_store_assignments_into_items(buffered_items)
         self.state.updated_at = utc_now()
         self.store.save_items_progress(
-            items,
+            buffered_items,
             removed_item_ids,
             updated_at=self.state.updated_at,
             schema_version=self.state.schema_version,
             personas=self.state.personas,
         )
+
+    def _save_memories_only(self) -> None:
+        self.state.updated_at = utc_now()
+        self.store.save_memories(
+            self.state.memories.values(),
+            updated_at=self.state.updated_at,
+            schema_version=self.state.schema_version,
+        )
+
+    def _merge_current_store_assignments_into_state(self) -> None:
+        current_state = self.store.load()
+        for persona in current_state.personas.values():
+            self._merge_persona_into_state(persona)
+        for item_id, item in self.state.items.items():
+            current_item = current_state.items.get(item_id)
+            if current_item is not None:
+                self._merge_assignment_fields_from_item(item, current_item)
+
+    def _merge_current_store_assignments_into_items(self, items: list[MediaItem]) -> None:
+        if not items:
+            return
+        for persona in self.store.list_personas():
+            self._merge_persona_into_state(persona)
+        current_items = {
+            item.id: item
+            for item in self.store.load_items_by_ids([item.id for item in items])
+        }
+        for item in items:
+            current_item = current_items.get(item.id)
+            if current_item is not None:
+                self._merge_assignment_fields_from_item(item, current_item)
+
+    def _merge_assignment_fields_from_item(self, item: MediaItem, current_item: MediaItem) -> None:
+        persona_ids = set(item.manual_persona_ids)
+        persona_ids.update(
+            persona_id
+            for persona_id in current_item.manual_persona_ids
+            if persona_id in self.state.personas
+        )
+        item.manual_persona_ids = sorted(persona_ids)
+        self._merge_detection_assignments(item, current_item)
+
+    def _merge_persona_into_state(self, persona: Persona) -> None:
+        existing = self.state.personas.get(persona.id)
+        if existing is None:
+            self.state.personas[persona.id] = persona
+            return
+        if not existing.avatar_item_id and persona.avatar_item_id:
+            existing.avatar_item_id = persona.avatar_item_id
+        for encoding in persona.reference_encodings:
+            if encoding not in existing.reference_encodings:
+                existing.reference_encodings.append(encoding)
+        existing_signatures = set(existing.reference_signatures)
+        for signature in persona.reference_signatures:
+            if signature and signature not in existing_signatures:
+                existing.reference_signatures.append(signature)
+                existing_signatures.add(signature)
+        existing_reference_keys = {
+            (
+                reference.get("path", ""),
+                reference.get("source_item_id", ""),
+                reference.get("source_region_id", ""),
+            )
+            for reference in existing.reference_images
+        }
+        for reference in persona.reference_images:
+            key = (
+                reference.get("path", ""),
+                reference.get("source_item_id", ""),
+                reference.get("source_region_id", ""),
+            )
+            if key not in existing_reference_keys:
+                existing.reference_images.append(reference)
+                existing_reference_keys.add(key)
 
     def list_items(self) -> list[MediaItem]:
         if not self._state_loaded:
@@ -2015,6 +2092,8 @@ class LibraryService:
                 step_started_at=kind_started_at,
             ),
         )
+        dirty_count = self.store.count_detections(kind, dirty_only=True)
+        existing_cluster_payloads = self.store.list_unknown_clusters(kind)
         if partial:
             built_clusters = self._rebuild_unknown_clusters_incremental(
                 kind,
@@ -2023,6 +2102,19 @@ class LibraryService:
                 overall_started_at=overall_started_at,
                 step_started_at=kind_started_at,
             )
+        elif dirty_count > 0 or existing_cluster_payloads:
+            built_clusters = self._rebuild_unknown_clusters_incremental(
+                kind,
+                revision=revision,
+                progress_callback=progress_callback,
+                overall_started_at=overall_started_at,
+                step_started_at=kind_started_at,
+            )
+            self.store.mark_unknown_clusters_stable(kind, revision=revision)
+            built_clusters = [
+                self._deserialize_unknown_cluster(entry)
+                for entry in self.store.list_unknown_clusters(kind)
+            ]
         else:
             built_clusters = self._rebuild_unknown_clusters_full(
                 kind,
