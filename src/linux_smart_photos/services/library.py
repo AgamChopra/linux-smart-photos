@@ -135,6 +135,25 @@ class UnknownPersonaCluster:
 
 
 @dataclass(slots=True)
+class EmbeddingMapPoint:
+    item_id: str
+    detection_id: str
+    label: str
+    confidence: float
+    captured_at: str
+    embedding: list[float]
+    persona_id: str = ""
+    persona_name: str = ""
+    persona_color: str = "#A0A0A0"
+    persona_preview_path: str = ""
+    cluster_id: str = ""
+    cluster_label: str = ""
+    cluster_preview_path: str = ""
+    thumbnail_path: str = ""
+    source_path: str = ""
+
+
+@dataclass(slots=True)
 class UnknownClusterPersonaSuggestion:
     persona: Persona
     score: float
@@ -199,6 +218,8 @@ class LibraryService:
     def sync(
         self,
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
+        *,
+        include_pets: bool = True,
     ) -> SyncSummary:
         self._ensure_state_loaded()
         sync_started_at = monotonic()
@@ -283,7 +304,18 @@ class LibraryService:
         for item_id, spec in sorted_assets:
             existing = self.state.items.get(item_id)
             reanalysis_mode = self._reanalysis_mode(existing)
-            if existing and existing.file_signature == spec.file_signature and reanalysis_mode == "none":
+            needs_pet_analysis = (
+                include_pets
+                and existing is not None
+                and existing.file_signature == spec.file_signature
+                and not bool(existing.metadata.get("pet_analysis_enabled", False))
+            )
+            if (
+                existing
+                and existing.file_signature == spec.file_signature
+                and reanalysis_mode == "none"
+                and not needs_pet_analysis
+            ):
                 completed += 1
                 if self._should_emit_scan_progress(completed, total_work):
                     self._emit_progress(
@@ -300,7 +332,14 @@ class LibraryService:
                 continue
 
             analysis_mode = "full"
-            if existing and existing.file_signature == spec.file_signature and reanalysis_mode == "human_faces_only":
+            if not include_pets:
+                analysis_mode = "full_no_pets"
+            if (
+                existing
+                and existing.file_signature == spec.file_signature
+                and reanalysis_mode == "human_faces_only"
+                and not needs_pet_analysis
+            ):
                 analysis_mode = "human_faces_only"
             changed_entries.append((item_id, spec, existing, analysis_mode))
 
@@ -834,12 +873,98 @@ class LibraryService:
         references.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
         return references
 
+    def face_embedding_map_points(self, *, limit: int = 12000) -> list[EmbeddingMapPoint]:
+        records = [
+            record
+            for record in self.store.query_detections(cluster_kind="person", dirty_only=False)
+            if record.encoding
+        ]
+        if limit > 0:
+            records = records[:limit]
+        if not records:
+            return []
+
+        persona_ids = sorted({record.persona_id for record in records if record.persona_id})
+        personas_by_id = {
+            persona.id: persona
+            for persona in self.store.load_personas_by_ids(persona_ids)
+        }
+        avatar_item_ids = [
+            persona.avatar_item_id
+            for persona in personas_by_id.values()
+            if persona.avatar_item_id
+        ]
+        avatar_items_by_id = {
+            item.id: item
+            for item in self.store.load_items_by_ids(avatar_item_ids)
+        }
+        persona_preview_paths = {
+            persona.id: self._persona_embedding_preview_path(
+                persona,
+                avatar_items_by_id.get(persona.avatar_item_id),
+            )
+            for persona in personas_by_id.values()
+        }
+
+        cluster_by_member: dict[tuple[str, str], dict[str, object]] = {}
+        for cluster in self.store.list_unknown_clusters("person"):
+            for member in cluster.get("member_ids", []):
+                if isinstance(member, tuple) and len(member) == 2:
+                    cluster_by_member[(str(member[0]), str(member[1]))] = cluster
+
+        item_ids = sorted({record.item_id for record in records})
+        items_by_id = {
+            item.id: item
+            for item in self.store.load_items_by_ids(item_ids)
+        }
+
+        points: list[EmbeddingMapPoint] = []
+        for record in records:
+            item = items_by_id.get(record.item_id)
+            persona = personas_by_id.get(record.persona_id or "")
+            persona_id = persona.id if persona else ""
+            cluster = cluster_by_member.get((record.item_id, record.detection_id)) if not persona_id else None
+            points.append(
+                EmbeddingMapPoint(
+                    item_id=record.item_id,
+                    detection_id=record.detection_id,
+                    label=record.label,
+                    confidence=record.confidence,
+                    captured_at=record.captured_at,
+                    embedding=list(record.encoding),
+                    persona_id=persona_id,
+                    persona_name=persona.name if persona else "",
+                    persona_color=persona.color if persona else "#A0A0A0",
+                    persona_preview_path=persona_preview_paths.get(persona_id, "") if persona_id else "",
+                    cluster_id=str(cluster.get("id", "")) if cluster else "",
+                    cluster_label=str(cluster.get("label", "")) if cluster else "",
+                    cluster_preview_path=str(cluster.get("preview_path", "")) if cluster else "",
+                    thumbnail_path=item.thumbnail_path if item else "",
+                    source_path=item.path if item else "",
+                )
+            )
+        return points
+
+    def _persona_embedding_preview_path(self, persona: Persona, avatar_item: MediaItem | None) -> str:
+        for reference in sorted(
+            persona.reference_images,
+            key=lambda entry: entry.get("created_at", ""),
+            reverse=True,
+        ):
+            path = reference.get("path", "")
+            if path and Path(path).exists():
+                return path
+        if avatar_item and avatar_item.thumbnail_path and Path(avatar_item.thumbnail_path).exists():
+            return avatar_item.thumbnail_path
+        return ""
+
     def list_unknown_persona_clusters(
         self,
         kind: str = "person",
         *,
         allow_stale_cache: bool = False,
         build_if_missing: bool = True,
+        include_pets: bool = False,
     ) -> list[UnknownPersonaCluster]:
         del allow_stale_cache
         requested_kinds = (
@@ -858,6 +983,8 @@ class LibraryService:
             ]
             if persisted_clusters:
                 clusters.extend(persisted_clusters)
+                continue
+            if requested_kind == "pet" and not include_pets:
                 continue
             if not build_if_missing:
                 continue
@@ -1037,12 +1164,13 @@ class LibraryService:
         self,
         *,
         partial: bool,
+        include_pets: bool = False,
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
     ) -> None:
         self._ensure_state_loaded()
         revision = self.state.updated_at
         started_at = monotonic()
-        kinds = ("person", "pet")
+        kinds = ("person", "pet") if include_pets else ("person",)
         total_kinds = len(kinds)
         for index, kind in enumerate(kinds, start=1):
             self._refresh_unknown_clusters_kind(
@@ -1088,7 +1216,7 @@ class LibraryService:
             member_ids=[
                 (str(entry[0]), str(entry[1]))
                 for entry in payload.get("member_ids", [])
-                if isinstance(entry, list) and len(entry) == 2
+                if isinstance(entry, (list, tuple)) and len(entry) == 2
             ],
             item_ids=[str(item_id) for item_id in payload.get("item_ids", [])],
             preview_path=str(payload.get("preview_path", "")),
@@ -1132,16 +1260,20 @@ class LibraryService:
         self._ensure_state_loaded()
         persona = self._resolve_persona(persona_id, new_name, kind)
         item = self.state.items[item_id]
-        for detection in item.detections:
-            if detection.id != region_id:
-                continue
-            detection.persona_id = persona.id
-            self._remember_detection_reference(persona, item, detection)
-            if not persona.avatar_item_id:
-                persona.avatar_item_id = item.id
-            break
-        self.regenerate_memories()
-        self.save()
+        detection = next((entry for entry in item.detections if entry.id == region_id), None)
+        if detection is None:
+            raise ValueError("Selected detection no longer exists.")
+
+        cluster = self._unknown_cluster_containing_detection(kind, item_id, region_id)
+        member_ids = cluster.member_ids if cluster and cluster.member_ids else [(item_id, region_id)]
+        updated_items = self._assign_detection_members_to_persona(
+            persona,
+            member_ids,
+            allow_reassign=True,
+        )
+        if not updated_items:
+            raise ValueError("No assignable detections were found.")
+        self._persist_persona_detection_assignment(persona, updated_items)
         return persona
 
     def clear_region_assignment(self, item_id: str, region_id: str) -> None:
@@ -1246,37 +1378,68 @@ class LibraryService:
             raise ValueError("Selected clusters do not match the chosen persona kind.")
 
         persona = self._resolve_persona_for_live_assignment(persona_id, new_name, resolved_kind)
-        touched = False
+        cluster_list = self._refresh_unknown_clusters_from_store(cluster_list)
+        member_ids = [
+            (item_id, region_id)
+            for cluster in cluster_list
+            for item_id, region_id in cluster.member_ids
+        ]
+        updated_items = self._assign_detection_members_to_persona(
+            persona,
+            member_ids,
+            allow_reassign=False,
+        )
+        if not updated_items:
+            raise ValueError("The selected clusters no longer contain assignable detections.")
+
+        self._persist_persona_detection_assignment(persona, updated_items)
+        return persona
+
+    def _assign_detection_members_to_persona(
+        self,
+        persona: Persona,
+        member_ids: Iterable[tuple[str, str]],
+        *,
+        allow_reassign: bool = False,
+    ) -> dict[str, MediaItem]:
         seen_regions: set[tuple[str, str]] = set()
-        item_ids = sorted({item_id for cluster in cluster_list for item_id in cluster.item_ids})
+        member_list: list[tuple[str, str]] = []
+        for item_id, region_id in member_ids:
+            key = (str(item_id), str(region_id))
+            if not key[0] or not key[1] or key in seen_regions:
+                continue
+            seen_regions.add(key)
+            member_list.append(key)
+
+        item_ids = sorted({item_id for item_id, _ in member_list})
         items_by_id = {
             item.id: item
             for item in self.store.load_items_by_ids(item_ids)
         }
         updated_items: dict[str, MediaItem] = {}
-        for cluster in cluster_list:
-            for item_id, region_id in cluster.member_ids:
-                if (item_id, region_id) in seen_regions:
-                    continue
-                seen_regions.add((item_id, region_id))
-                item = items_by_id.get(item_id)
-                if item is None:
-                    continue
-                detection = next((entry for entry in item.detections if entry.id == region_id), None)
-                if detection is None:
-                    continue
-                if detection.persona_id and detection.persona_id != persona.id:
-                    continue
-                detection.persona_id = persona.id
-                self._remember_detection_reference(persona, item, detection)
-                if not persona.avatar_item_id:
-                    persona.avatar_item_id = item.id
-                updated_items[item.id] = item
-                touched = True
+        for item_id, region_id in member_list:
+            item = items_by_id.get(item_id)
+            if item is None:
+                continue
+            detection = next((entry for entry in item.detections if entry.id == region_id), None)
+            if detection is None:
+                continue
+            if not self._persona_can_own_detection(persona, detection):
+                continue
+            if detection.persona_id and detection.persona_id != persona.id and not allow_reassign:
+                continue
+            detection.persona_id = persona.id
+            self._remember_detection_reference(persona, item, detection)
+            if not persona.avatar_item_id:
+                persona.avatar_item_id = item.id
+            updated_items[item.id] = item
+        return updated_items
 
-        if not touched:
-            raise ValueError("The selected clusters no longer contain assignable detections.")
-
+    def _persist_persona_detection_assignment(
+        self,
+        persona: Persona,
+        updated_items: dict[str, MediaItem],
+    ) -> None:
         updated_at = utc_now()
         self.store.save_persona_assignment(
             persona,
@@ -1290,7 +1453,40 @@ class LibraryService:
             self.state.personas[persona.id] = persona
             for item in updated_items.values():
                 self.state.items[item.id] = item
-        return persona
+            self.regenerate_memories()
+            self._save_memories_only()
+
+    def _persona_can_own_detection(self, persona: Persona, detection: DetectionRegion) -> bool:
+        if persona.kind == "person":
+            return detection.kind == "face"
+        if persona.kind == "pet":
+            return self._is_pet_detection(detection)
+        return False
+
+    def _unknown_cluster_containing_detection(
+        self,
+        kind: str,
+        item_id: str,
+        region_id: str,
+    ) -> UnknownPersonaCluster | None:
+        if kind not in {"person", "pet"}:
+            return None
+        for payload in self.store.list_unknown_clusters(kind):
+            cluster = self._deserialize_unknown_cluster(payload)
+            if (item_id, region_id) in cluster.member_ids:
+                return cluster
+        return None
+
+    def _refresh_unknown_clusters_from_store(
+        self,
+        clusters: list[UnknownPersonaCluster],
+    ) -> list[UnknownPersonaCluster]:
+        by_id: dict[str, UnknownPersonaCluster] = {}
+        for kind in sorted({cluster.kind for cluster in clusters if cluster.kind in {"person", "pet"}}):
+            for payload in self.store.list_unknown_clusters(kind):
+                cluster = self._deserialize_unknown_cluster(payload)
+                by_id[cluster.id] = cluster
+        return [by_id.get(cluster.id, cluster) for cluster in clusters]
 
     def create_album(self, name: str, item_ids: Iterable[str] = ()) -> Album:
         self._ensure_state_loaded()
@@ -1649,7 +1845,7 @@ class LibraryService:
             return []
 
         analyses: list[AnalysisResult | None] = [None] * len(prepared_items)
-        for analysis_mode in ("full", "human_faces_only"):
+        for analysis_mode in ("full", "full_no_pets", "human_faces_only"):
             batch_indices = [
                 index
                 for index, prepared in enumerate(prepared_items)

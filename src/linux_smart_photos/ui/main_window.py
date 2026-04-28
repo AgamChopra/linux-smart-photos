@@ -4,7 +4,7 @@ from time import monotonic
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, QTimer, QSize, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QIcon
+from PySide6.QtGui import QCloseEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -27,9 +28,18 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import AppConfig
-from ..services.library import LibraryService, ProgressUpdate, UnknownPersonaCluster
+from ..services.library import EmbeddingMapPoint, LibraryService, ProgressUpdate, UnknownPersonaCluster
 from .dialogs import AlbumDialog, AssignPersonaDialog, CorrectionsDialog
 from .widgets import MediaGridWidget
+
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+    from matplotlib.figure import Figure
+except Exception:
+    Figure = None
+    FigureCanvas = None
+    NavigationToolbar = None
 
 
 PAGE_ITEM_PREVIEW_LIMIT = 720
@@ -117,7 +127,7 @@ class BackgroundTaskWorker(QObject):
                         service.download_recommended_models(progress_callback=self._emit_progress)
                     except Exception as exc:
                         download_error = str(exc)
-                summary = service.sync(progress_callback=self._emit_progress)
+                summary = service.sync(progress_callback=self._emit_progress, include_pets=False)
                 self.completed.emit(
                     {
                         "task": self.task_name,
@@ -129,7 +139,7 @@ class BackgroundTaskWorker(QObject):
                 return
 
             if self.task_name == "sync":
-                summary = service.sync(progress_callback=self._emit_progress)
+                summary = service.sync(progress_callback=self._emit_progress, include_pets=True)
                 self.completed.emit({"task": self.task_name, "summary": summary})
                 return
 
@@ -194,16 +204,18 @@ class UnknownClusterCacheWorker(QObject):
     completed = Signal(bool)
     failed = Signal(str)
 
-    def __init__(self, config: AppConfig, *, partial: bool) -> None:
+    def __init__(self, config: AppConfig, *, partial: bool, include_pets: bool = False) -> None:
         super().__init__()
         self.config = config
         self.partial = partial
+        self.include_pets = include_pets
 
     def run(self) -> None:
         try:
             service = LibraryService(self.config)
             service.rebuild_unknown_cluster_caches(
                 partial=self.partial,
+                include_pets=self.include_pets,
                 progress_callback=self._emit_progress,
             )
             self.completed.emit(self.partial)
@@ -241,6 +253,120 @@ class ItemLoadWorker(QObject):
             self.completed.emit(self.request_id, items)
         except Exception as exc:
             self.failed.emit(self.request_id, str(exc))
+
+
+class EmbeddingProjectionWorker(QObject):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: AppConfig, method: str, max_points: int) -> None:
+        super().__init__()
+        self.config = config
+        self.method = method
+        self.max_points = max_points
+
+    def run(self) -> None:
+        try:
+            service = LibraryService(self.config)
+            points = service.face_embedding_map_points(limit=self.max_points)
+            coordinates, method_used = self._project(points)
+            self.completed.emit(
+                {
+                    "points": points,
+                    "coordinates": coordinates,
+                    "method": method_used,
+                    "requested_method": self.method,
+                    "max_points": self.max_points,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _project(self, points: list[EmbeddingMapPoint]) -> tuple[list[tuple[float, float, float]], str]:
+        if not points:
+            return [], self.method.upper()
+
+        import numpy as np
+
+        matrix = np.asarray([point.embedding for point in points], dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[1] == 0:
+            raise ValueError("Face embeddings are empty or malformed.")
+
+        method = self.method.lower()
+        if method == "tsne":
+            coordinates = self._project_tsne(matrix)
+            method_used = "t-SNE"
+        elif method == "umap":
+            coordinates = self._project_umap(matrix)
+            method_used = "UMAP"
+        else:
+            coordinates = self._project_pca(matrix)
+            method_used = "PCA"
+
+        coordinates = self._normalize_coordinates(coordinates)
+        return [tuple(float(value) for value in row) for row in coordinates.tolist()], method_used
+
+    def _project_pca(self, matrix: Any) -> Any:
+        import numpy as np
+
+        centered = matrix - matrix.mean(axis=0, keepdims=True)
+        max_components = min(3, centered.shape[0], centered.shape[1])
+        if max_components <= 0:
+            return np.zeros((centered.shape[0], 3), dtype=np.float32)
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        projected = centered @ vt[:max_components].T
+        return self._pad_coordinates(projected)
+
+    def _project_tsne(self, matrix: Any) -> Any:
+        if matrix.shape[0] < 4:
+            return self._project_pca(matrix)
+        from sklearn.manifold import TSNE
+
+        perplexity = min(30.0, max(2.0, (matrix.shape[0] - 1) / 3.0))
+        perplexity = min(perplexity, float(matrix.shape[0] - 1))
+        reducer = TSNE(
+            n_components=3,
+            perplexity=perplexity,
+            init="pca" if matrix.shape[1] >= 3 else "random",
+            learning_rate="auto",
+            random_state=42,
+        )
+        return reducer.fit_transform(matrix)
+
+    def _project_umap(self, matrix: Any) -> Any:
+        if matrix.shape[0] < 4:
+            return self._project_pca(matrix)
+        try:
+            from umap import UMAP
+        except Exception as exc:
+            raise RuntimeError("UMAP is not installed. Use PCA or t-SNE, or install umap-learn.") from exc
+
+        reducer = UMAP(
+            n_components=3,
+            n_neighbors=min(30, max(2, matrix.shape[0] - 1)),
+            min_dist=0.05,
+            metric="cosine",
+            random_state=42,
+        )
+        return reducer.fit_transform(matrix)
+
+    def _pad_coordinates(self, coordinates: Any) -> Any:
+        import numpy as np
+
+        if coordinates.shape[1] >= 3:
+            return coordinates[:, :3]
+        padding = np.zeros((coordinates.shape[0], 3 - coordinates.shape[1]), dtype=coordinates.dtype)
+        return np.concatenate([coordinates, padding], axis=1)
+
+    def _normalize_coordinates(self, coordinates: Any) -> Any:
+        import numpy as np
+
+        normalized = np.nan_to_num(np.asarray(coordinates, dtype=np.float32), copy=False)
+        normalized = self._pad_coordinates(normalized)
+        normalized -= normalized.mean(axis=0, keepdims=True)
+        scale = normalized.std(axis=0, keepdims=True)
+        scale[scale < 1e-6] = 1.0
+        return normalized / scale
 
 
 class LibraryPage(QWidget):
@@ -684,7 +810,8 @@ class UnknownClustersPage(QWidget):
         if not self._clusters_by_id:
             if self.owner._active_task in {"startup", "sync"}:
                 self.summary.setText(
-                    "Background analysis is still running. Unknown face and pet clusters will appear automatically."
+                    "Background analysis is still running. Unknown face clusters will appear automatically. "
+                    "Pet clusters are built when you manually refresh the library."
                 )
             else:
                 self.summary.setText("No unknown people or pet clusters are waiting for assignment.")
@@ -755,7 +882,10 @@ class UnknownClustersPage(QWidget):
             assigned_ids,
             message=f"Assigned {len(assigned_ids)} cluster(s) to {persona.name}.",
         )
-        self.owner.request_unknown_cluster_cache_refresh(partial=self.owner.is_live_processing())
+        self.owner.request_unknown_cluster_cache_refresh(
+            partial=self.owner.is_live_processing(),
+            include_pets=clusters[0].kind == "pet",
+        )
         self.owner.refresh_views(refresh_unknown=False)
 
     def _open_corrections(self, *_args) -> None:
@@ -765,7 +895,7 @@ class UnknownClustersPage(QWidget):
             return
         dialog = CorrectionsDialog(self.service, item_id, self)
         dialog.exec()
-        self.owner.request_unknown_cluster_cache_refresh(partial=False)
+        self.owner.request_unknown_cluster_cache_refresh(partial=False, include_pets=True)
         self.owner.refresh_views()
 
     def _selected_clusters(self) -> list[UnknownPersonaCluster]:
@@ -850,7 +980,9 @@ class UnknownClustersPage(QWidget):
             self.summary.setText(
                 "Scanning in background. Unknown clusters will appear automatically as analyzed items accumulate."
             )
-            self.owner.set_cluster_view_status_complete("No unknown clusters yet; waiting for analyzed face/pet detections")
+            self.owner.set_cluster_view_status_complete(
+                "No unknown clusters yet; waiting for analyzed face detections"
+            )
         elif any(cluster.is_partial for cluster in self._pending_render_clusters):
             self.summary.setText(
                 f"Rendering {len(self._pending_render_clusters)} live partial unknown clusters..."
@@ -1002,6 +1134,383 @@ class UnknownClustersPage(QWidget):
         self._items_worker = None
         if self._pending_item_request is not None:
             QTimer.singleShot(0, self._start_next_item_request)
+
+
+class EmbeddingMapPage(QWidget):
+    def __init__(self, service: LibraryService, owner: "MainWindow") -> None:
+        super().__init__()
+        self.service = service
+        self.owner = owner
+        self._projection_thread: QThread | None = None
+        self._projection_worker: EmbeddingProjectionWorker | None = None
+        self._points: list[EmbeddingMapPoint] = []
+        self._coordinates: list[tuple[float, float, float]] = []
+        self._group_indices: dict[tuple[str, str], list[int]] = {}
+        self._group_keys: list[tuple[str, str]] = []
+        self._selected_group_key: tuple[str, str] | None = None
+        self._scatter = None
+        self._selected_scatter = None
+
+        self.method_combo = QComboBox()
+        self.method_combo.addItem("PCA", "pca")
+        self.method_combo.addItem("t-SNE", "tsne")
+        self.method_combo.addItem("UMAP", "umap")
+
+        self.max_points = QSpinBox()
+        self.max_points.setRange(250, 50000)
+        self.max_points.setSingleStep(250)
+        self.max_points.setValue(12000)
+        self.max_points.setToolTip("Maximum face embeddings to project. PCA can handle more; t-SNE can be slow.")
+
+        self.refresh_button = QPushButton("Build Map")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.previous_button = QPushButton("Previous Group")
+        self.previous_button.clicked.connect(lambda *_args: self._move_selection(-1))
+        self.next_button = QPushButton("Next Group")
+        self.next_button.clicked.connect(lambda *_args: self._move_selection(1))
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Projection"))
+        controls.addWidget(self.method_combo)
+        controls.addWidget(QLabel("Max points"))
+        controls.addWidget(self.max_points)
+        controls.addWidget(self.refresh_button)
+        controls.addWidget(self.previous_button)
+        controls.addWidget(self.next_button)
+        controls.addStretch(1)
+
+        self.status = QLabel("Build a 3D map from face embeddings.")
+        self.status.setWordWrap(True)
+
+        self.preview = QLabel("No selection")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(QSize(260, 260))
+        self.preview.setStyleSheet("border: 1px solid #888; background: #111; color: #ddd;")
+
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMinimumWidth(320)
+        self.details.setText("Click a point to inspect a persona or unknown cluster.")
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.addWidget(self.preview)
+        right_layout.addWidget(self.details, 1)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.addLayout(controls)
+        left_layout.addWidget(self.status)
+
+        self.figure = None
+        self.canvas = None
+        self.axes = None
+        if Figure is None or FigureCanvas is None or NavigationToolbar is None:
+            self.plot_placeholder = QLabel(
+                "Matplotlib is not available, so the 3D embedding map cannot be displayed."
+            )
+            self.plot_placeholder.setAlignment(Qt.AlignCenter)
+            self.plot_placeholder.setWordWrap(True)
+            left_layout.addWidget(self.plot_placeholder, 1)
+            self.refresh_button.setEnabled(False)
+        else:
+            self.figure = Figure(figsize=(9, 7), facecolor="#101417")
+            self.canvas = FigureCanvas(self.figure)
+            self.axes = self.figure.add_subplot(111, projection="3d")
+            self.canvas.mpl_connect("pick_event", self._handle_pick_event)
+            toolbar = NavigationToolbar(self.canvas, self)
+            left_layout.addWidget(toolbar)
+            left_layout.addWidget(self.canvas, 1)
+            self._render_empty_plot()
+
+        outer_layout = QHBoxLayout(self)
+        outer_layout.addWidget(left_panel, 1)
+        outer_layout.addWidget(right_panel)
+        self._update_navigation_buttons()
+
+    def refresh_if_empty(self) -> None:
+        if not self._points and self._projection_thread is None:
+            self.refresh()
+
+    def mark_dirty(self) -> None:
+        if self._projection_thread is None:
+            self.status.setText("New face detections or assignments are available. Rebuild the map to refresh it.")
+
+    def refresh(self, *_args) -> None:
+        if self.canvas is None:
+            return
+        if self._projection_thread is not None:
+            self.status.setText("Embedding projection is already running.")
+            return
+
+        method = str(self.method_combo.currentData())
+        max_points = int(self.max_points.value())
+        self.status.setText(f"Projecting up to {max_points:,} face embeddings with {self.method_combo.currentText()}...")
+        self.refresh_button.setEnabled(False)
+        self.method_combo.setEnabled(False)
+        self.max_points.setEnabled(False)
+        self.previous_button.setEnabled(False)
+        self.next_button.setEnabled(False)
+
+        thread = QThread(self)
+        worker = EmbeddingProjectionWorker(self.service.config, method, max_points)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_projection_completed)
+        worker.failed.connect(self._handle_projection_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_projection_handles)
+
+        self._projection_thread = thread
+        self._projection_worker = worker
+        thread.start()
+
+    def _handle_projection_completed(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            self._handle_projection_failed("Embedding worker returned an invalid payload.")
+            return
+        self._points = list(payload.get("points", []))
+        self._coordinates = list(payload.get("coordinates", []))
+        method = str(payload.get("method", "projection"))
+        self._selected_group_key = None
+        self._build_groups()
+        self._render_plot()
+        self._update_selection_details()
+        self.status.setText(
+            f"{method} map ready: {len(self._points):,} face embeddings, "
+            f"{len(self._group_keys):,} persona/cluster groups."
+        )
+        self._update_navigation_buttons()
+
+    def _handle_projection_failed(self, message: str) -> None:
+        self.status.setText(f"Embedding map failed: {message}")
+        self._update_navigation_buttons()
+
+    def _clear_projection_handles(self) -> None:
+        self._projection_thread = None
+        self._projection_worker = None
+        self.refresh_button.setEnabled(True)
+        self.method_combo.setEnabled(True)
+        self.max_points.setEnabled(True)
+        self._update_navigation_buttons()
+
+    def _build_groups(self) -> None:
+        self._group_indices = {}
+        for index, point in enumerate(self._points):
+            self._group_indices.setdefault(self._point_group_key(point), []).append(index)
+        self._group_keys = sorted(
+            self._group_indices,
+            key=lambda key: (
+                0 if key[0] == "persona" else 1 if key[0] == "cluster" else 2,
+                -len(self._group_indices[key]),
+                self._group_label(key).lower(),
+            ),
+        )
+
+    def _point_group_key(self, point: EmbeddingMapPoint) -> tuple[str, str]:
+        if point.persona_id:
+            return ("persona", point.persona_id)
+        if point.cluster_id:
+            return ("cluster", point.cluster_id)
+        return ("face", f"{point.item_id}:{point.detection_id}")
+
+    def _group_label(self, key: tuple[str, str]) -> str:
+        indices = self._group_indices.get(key, [])
+        if not indices:
+            return "No selection"
+        point = self._points[indices[0]]
+        if key[0] == "persona":
+            return point.persona_name or point.persona_id
+        if key[0] == "cluster":
+            return f"Unknown {point.cluster_label or 'face'} cluster"
+        return "Unassigned face"
+
+    def _render_empty_plot(self) -> None:
+        if self.axes is None or self.canvas is None:
+            return
+        self.axes.clear()
+        self.axes.set_facecolor("#101417")
+        self.axes.text2D(
+            0.5,
+            0.5,
+            "Build a map to visualize face embeddings",
+            transform=self.axes.transAxes,
+            ha="center",
+            va="center",
+            color="#D8DEE9",
+        )
+        self.axes.set_axis_off()
+        self.canvas.draw_idle()
+
+    def _render_plot(self) -> None:
+        if self.axes is None or self.canvas is None:
+            return
+        if not self._points or not self._coordinates:
+            self._render_empty_plot()
+            return
+
+        elev = getattr(self.axes, "elev", 25)
+        azim = getattr(self.axes, "azim", -60)
+        self.axes.clear()
+        self.axes.set_facecolor("#101417")
+        self.axes.view_init(elev=elev, azim=azim)
+
+        xs = [entry[0] for entry in self._coordinates]
+        ys = [entry[1] for entry in self._coordinates]
+        zs = [entry[2] for entry in self._coordinates]
+        colors = [point.persona_color if point.persona_id else "#9AA0A6" for point in self._points]
+        sizes = [26 if point.persona_id else 16 for point in self._points]
+        self._scatter = self.axes.scatter(
+            xs,
+            ys,
+            zs,
+            c=colors,
+            s=sizes,
+            alpha=0.78,
+            depthshade=True,
+            picker=6,
+        )
+
+        selected_indices = self._group_indices.get(self._selected_group_key, []) if self._selected_group_key else []
+        if selected_indices:
+            self._selected_scatter = self.axes.scatter(
+                [xs[index] for index in selected_indices],
+                [ys[index] for index in selected_indices],
+                [zs[index] for index in selected_indices],
+                c=["#FFD166"] * len(selected_indices),
+                s=[82] * len(selected_indices),
+                alpha=0.95,
+                depthshade=False,
+                edgecolors="#101417",
+                linewidths=0.8,
+            )
+        else:
+            self._selected_scatter = None
+
+        self.axes.set_title("Face Embedding Space", color="#E6EDF3")
+        self.axes.set_xlabel("x", color="#C9D1D9")
+        self.axes.set_ylabel("y", color="#C9D1D9")
+        self.axes.set_zlabel("z", color="#C9D1D9")
+        self.axes.tick_params(colors="#8B949E")
+        if self.figure is not None:
+            self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def _handle_pick_event(self, event: object) -> None:
+        if self._scatter is None or getattr(event, "artist", None) is not self._scatter:
+            return
+        indices = getattr(event, "ind", [])
+        if len(indices) == 0:
+            return
+        index = int(indices[0])
+        if 0 <= index < len(self._points):
+            self._select_group(self._point_group_key(self._points[index]))
+
+    def _select_group(self, key: tuple[str, str]) -> None:
+        if key not in self._group_indices:
+            return
+        self._selected_group_key = key
+        self._update_selection_details()
+        self._render_plot()
+        self._update_navigation_buttons()
+
+    def _move_selection(self, direction: int) -> None:
+        if not self._group_keys:
+            return
+        if self._selected_group_key not in self._group_keys:
+            next_index = 0 if direction >= 0 else len(self._group_keys) - 1
+        else:
+            current_index = self._group_keys.index(self._selected_group_key)
+            next_index = (current_index + direction) % len(self._group_keys)
+        self._select_group(self._group_keys[next_index])
+
+    def _update_selection_details(self) -> None:
+        if not self._selected_group_key:
+            self.preview.setText("No selection")
+            self.preview.setPixmap(QPixmap())
+            if self._points:
+                self.details.setText("Click a dot, or use Previous/Next Group to traverse personas and clusters.")
+            else:
+                self.details.setText("No face embeddings are loaded yet.")
+            return
+
+        indices = self._group_indices.get(self._selected_group_key, [])
+        if not indices:
+            return
+        point = self._points[indices[0]]
+        group_size = len(indices)
+        if self._selected_group_key[0] == "persona":
+            title = point.persona_name or point.persona_id
+            preview_path = point.persona_preview_path or point.thumbnail_path
+            detail_lines = [
+                f"Persona: {title}",
+                f"Face embeddings: {group_size}",
+                f"Representative image: {preview_path or 'not available'}",
+            ]
+        elif self._selected_group_key[0] == "cluster":
+            title = f"Unknown {point.cluster_label or 'face'} cluster"
+            preview_path = point.cluster_preview_path or point.thumbnail_path
+            detail_lines = [
+                title,
+                f"Face embeddings: {group_size}",
+                f"Cluster id: {point.cluster_id}",
+                f"Representative crop: {preview_path or 'not available'}",
+            ]
+        else:
+            title = "Unassigned face"
+            preview_path = point.thumbnail_path
+            detail_lines = [
+                title,
+                "This face is not currently assigned to a persona or unknown cluster.",
+            ]
+
+        detail_lines.extend(
+            [
+                "",
+                f"Selected detection: {point.detection_id}",
+                f"Item id: {point.item_id}",
+                f"Captured: {point.captured_at or 'unknown'}",
+                f"Confidence: {point.confidence:.3f}",
+                f"Source: {point.source_path or 'unknown'}",
+            ]
+        )
+        self.details.setText("\n".join(detail_lines))
+        self._set_preview_image(preview_path, title)
+
+    def _set_preview_image(self, path: str, fallback_text: str) -> None:
+        if not path:
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText(fallback_text)
+            return
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText(fallback_text)
+            return
+        self.preview.setText("")
+        self.preview.setPixmap(
+            pixmap.scaled(
+                self.preview.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+
+    def _update_navigation_buttons(self) -> None:
+        enabled = bool(self._group_keys) and self._projection_thread is None
+        self.previous_button.setEnabled(enabled)
+        self.next_button.setEnabled(enabled)
+
+    def set_busy(self, busy: bool) -> None:
+        if self._projection_thread is None:
+            self.refresh_button.setEnabled(not busy and self.canvas is not None)
+            self.method_combo.setEnabled(not busy)
+            self.max_points.setEnabled(not busy)
+        self._update_navigation_buttons()
 
 
 class AlbumsPage(QWidget):
@@ -1284,6 +1793,8 @@ class MainWindow(QMainWindow):
         self._cluster_cache_last_started = 0.0
         self._cluster_cache_partial_pending = False
         self._cluster_cache_final_pending = False
+        self._cluster_cache_partial_include_pets = False
+        self._cluster_cache_final_include_pets = False
         self._main_task_base_message = ""
         self._main_task_progress: ProgressUpdate | None = None
         self._cluster_cache_base_message = ""
@@ -1293,6 +1804,7 @@ class MainWindow(QMainWindow):
         self._library_dirty = False
         self._people_dirty = False
         self._unknown_clusters_dirty = True
+        self._embeddings_dirty = True
         self._albums_dirty = False
         self._memories_dirty = False
         self._models_dirty = False
@@ -1303,6 +1815,7 @@ class MainWindow(QMainWindow):
         self.library_page = LibraryPage(service, self)
         self.people_page = PeoplePage(service, self)
         self.unknown_clusters_page = UnknownClustersPage(service, self)
+        self.embedding_map_page = EmbeddingMapPage(service, self)
         self.albums_page = AlbumsPage(service, self)
         self.memories_page = MemoriesPage(service, self)
         self.models_page = ModelsPage(service, self)
@@ -1310,6 +1823,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.library_page, "Library")
         self.tabs.addTab(self.people_page, "People & Pets")
         self.tabs.addTab(self.unknown_clusters_page, "Unknown Clusters")
+        self.tabs.addTab(self.embedding_map_page, "Face Map")
         self.tabs.addTab(self.albums_page, "Albums")
         self.tabs.addTab(self.memories_page, "Memories")
         self.tabs.addTab(self.models_page, "AI Models")
@@ -1339,7 +1853,7 @@ class MainWindow(QMainWindow):
 
     def _finish_startup(self) -> None:
         self.refresh_views(refresh_unknown=False)
-        self.request_unknown_cluster_cache_refresh(partial=True)
+        self.request_unknown_cluster_cache_refresh(partial=True, include_pets=False)
         QTimer.singleShot(0, self._start_startup_tasks)
 
     def refresh_views(
@@ -1376,6 +1890,12 @@ class MainWindow(QMainWindow):
             self._unknown_clusters_dirty = False
         else:
             self._unknown_clusters_dirty = True
+        if current_widget is self.embedding_map_page:
+            if self._embeddings_dirty:
+                self.embedding_map_page.mark_dirty()
+            self._embeddings_dirty = False
+        else:
+            self._embeddings_dirty = True
 
     def refresh_live_views(self) -> None:
         current_widget = self.tabs.currentWidget()
@@ -1408,6 +1928,12 @@ class MainWindow(QMainWindow):
                 self._unknown_clusters_dirty = False
         else:
             self._unknown_clusters_dirty = True
+
+        if current_widget is self.embedding_map_page:
+            self.embedding_map_page.mark_dirty()
+            self._embeddings_dirty = False
+        else:
+            self._embeddings_dirty = True
 
         self._albums_dirty = True
         self._memories_dirty = True
@@ -1475,7 +2001,10 @@ class MainWindow(QMainWindow):
         if update.snapshot_ready:
             self._schedule_live_refresh()
             if self._active_task in {"startup", "sync"}:
-                self.request_unknown_cluster_cache_refresh(partial=True)
+                self.request_unknown_cluster_cache_refresh(
+                    partial=True,
+                    include_pets=self._active_task == "sync",
+                )
 
     def _handle_task_completed(self, payload: Any) -> None:
         task_name = str(payload.get("task", self._active_task))
@@ -1485,7 +2014,10 @@ class MainWindow(QMainWindow):
         self._main_task_progress = None
         self._main_task_base_message = ""
         if task_name in {"startup", "sync"}:
-            self.request_unknown_cluster_cache_refresh(partial=False)
+            self.request_unknown_cluster_cache_refresh(
+                partial=False,
+                include_pets=task_name == "sync",
+            )
         if task_name == "startup" and payload.get("download_error"):
             QMessageBox.warning(
                 self,
@@ -1516,6 +2048,11 @@ class MainWindow(QMainWindow):
         if current_widget is self.unknown_clusters_page and self._unknown_clusters_dirty:
             self.unknown_clusters_page.refresh()
             self._unknown_clusters_dirty = False
+        if current_widget is self.embedding_map_page:
+            if self._embeddings_dirty:
+                self.embedding_map_page.mark_dirty()
+                self._embeddings_dirty = False
+            self.embedding_map_page.refresh_if_empty()
         if current_widget is self.albums_page and self._albums_dirty:
             self.albums_page.refresh(load_items=True)
             self._albums_dirty = False
@@ -1545,11 +2082,13 @@ class MainWindow(QMainWindow):
         self.service.reload()
         self.refresh_live_views()
 
-    def request_unknown_cluster_cache_refresh(self, *, partial: bool) -> None:
+    def request_unknown_cluster_cache_refresh(self, *, partial: bool, include_pets: bool = False) -> None:
         if partial:
             self._cluster_cache_partial_pending = True
+            self._cluster_cache_partial_include_pets = self._cluster_cache_partial_include_pets or include_pets
         else:
             self._cluster_cache_final_pending = True
+            self._cluster_cache_final_include_pets = self._cluster_cache_final_include_pets or include_pets
         self._drain_unknown_cluster_cache_queue()
 
     def _drain_unknown_cluster_cache_queue(self) -> None:
@@ -1557,7 +2096,9 @@ class MainWindow(QMainWindow):
             return
         if self._cluster_cache_final_pending:
             self._cluster_cache_final_pending = False
-            self._start_unknown_cluster_cache_refresh(partial=False)
+            include_pets = self._cluster_cache_final_include_pets
+            self._cluster_cache_final_include_pets = False
+            self._start_unknown_cluster_cache_refresh(partial=False, include_pets=include_pets)
             return
         if not self._cluster_cache_partial_pending:
             return
@@ -1565,16 +2106,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(500, self._drain_unknown_cluster_cache_queue)
             return
         self._cluster_cache_partial_pending = False
-        self._start_unknown_cluster_cache_refresh(partial=True)
+        include_pets = self._cluster_cache_partial_include_pets
+        self._cluster_cache_partial_include_pets = False
+        self._start_unknown_cluster_cache_refresh(partial=True, include_pets=include_pets)
 
-    def _start_unknown_cluster_cache_refresh(self, *, partial: bool) -> None:
+    def _start_unknown_cluster_cache_refresh(self, *, partial: bool, include_pets: bool) -> None:
         if self._cluster_cache_thread is not None:
             if not partial:
                 self._cluster_cache_final_pending = True
+                self._cluster_cache_final_include_pets = self._cluster_cache_final_include_pets or include_pets
             return
 
         thread = QThread(self)
-        worker = UnknownClusterCacheWorker(self.service.config, partial=partial)
+        worker = UnknownClusterCacheWorker(self.service.config, partial=partial, include_pets=include_pets)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._handle_unknown_cluster_cache_progress)
@@ -1595,6 +2139,8 @@ class MainWindow(QMainWindow):
             if partial
             else "Building final unknown clusters"
         )
+        if include_pets:
+            message += " including pets"
         self.cluster_cache_status.set_active(message, indeterminate=True)
         thread.start()
 
@@ -1615,6 +2161,11 @@ class MainWindow(QMainWindow):
                 self._unknown_clusters_dirty = False
         else:
             self._unknown_clusters_dirty = True
+        if current_widget is self.embedding_map_page:
+            self.embedding_map_page.mark_dirty()
+            self._embeddings_dirty = False
+        else:
+            self._embeddings_dirty = True
 
     def _handle_unknown_cluster_cache_failed(self, message: str) -> None:
         self._cluster_cache_progress = None
@@ -1741,6 +2292,7 @@ class MainWindow(QMainWindow):
             self.library_page,
             self.people_page,
             self.unknown_clusters_page,
+            self.embedding_map_page,
             self.albums_page,
             self.memories_page,
             self.models_page,

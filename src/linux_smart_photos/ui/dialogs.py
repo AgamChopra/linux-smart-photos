@@ -242,13 +242,17 @@ class CorrectionsDialog(QDialog):
         if dialog.exec() != QDialog.Accepted:
             return
         choice = dialog.selection()
-        self.service.assign_region_to_persona(
-            self.item_id,
-            region_id,
-            persona_id=choice["persona_id"],
-            new_name=choice["new_name"],
-            kind=choice["kind"],
-        )
+        try:
+            self.service.assign_region_to_persona(
+                self.item_id,
+                region_id,
+                persona_id=choice["persona_id"],
+                new_name=choice["new_name"],
+                kind=choice["kind"],
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Assignment Failed", str(exc))
+            return
         self.refresh()
 
     def _clear_region(self) -> None:

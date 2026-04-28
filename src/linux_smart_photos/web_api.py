@@ -58,7 +58,11 @@ class BackgroundJobManager:
         return self._start_job(
             job_type="startup-sync" if startup else "sync",
             initial_message="Preparing library sync",
-            target=self._run_sync_job,
+            target=lambda service, progress_callback: self._run_sync_job(
+                service,
+                progress_callback,
+                include_pets=not startup,
+            ),
         )
 
     def start_model_download(self) -> tuple[dict[str, Any], bool]:
@@ -149,8 +153,10 @@ class BackgroundJobManager:
         self,
         service: LibraryService,
         progress_callback: Callable[[ProgressUpdate], None],
+        *,
+        include_pets: bool = True,
     ) -> dict[str, Any]:
-        summary = service.sync(progress_callback=progress_callback)
+        summary = service.sync(progress_callback=progress_callback, include_pets=include_pets)
         return {
             "added": summary.added,
             "updated": summary.updated,

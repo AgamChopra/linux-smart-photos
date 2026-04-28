@@ -167,8 +167,9 @@ class VisionAnalyzer:
         self.cat_face_detector = self._load_cat_face_detector()
         self.human_face_backend = self._load_human_face_backend()
         self.object_model = self._load_object_model()
-        self.pet_face_model = self._load_pet_face_model()
-        self.pet_embedding_model = self._load_pet_embedding_model()
+        self.pet_face_model = None
+        self.pet_embedding_model = None
+        self._pet_models_loaded = False
 
     def analyze(self, spec: MediaAssetSpec, *, analysis_mode: str = "full") -> AnalysisResult:
         if spec.media_kind == "video":
@@ -194,6 +195,16 @@ class VisionAnalyzer:
     def _empty_analysis(self) -> AnalysisResult:
         return AnalysisResult(tags=[], detections=[], metadata={})
 
+    def _include_pets_for_analysis_mode(self, analysis_mode: str) -> bool:
+        return self.config.pet_recognition_enabled and analysis_mode not in {"human_faces_only", "full_no_pets"}
+
+    def _ensure_pet_models_loaded(self) -> None:
+        if self._pet_models_loaded:
+            return
+        self.pet_face_model = self._load_pet_face_model()
+        self.pet_embedding_model = self._load_pet_embedding_model()
+        self._pet_models_loaded = True
+
     def _analyze_still_image(
         self,
         image: Image.Image | None,
@@ -211,15 +222,20 @@ class VisionAnalyzer:
             tags.update({"face", "person"})
             detections.extend(human_face_detections)
 
+        include_pets = self._include_pets_for_analysis_mode(analysis_mode)
         if analysis_mode == "human_faces_only":
             return AnalysisResult(
                 tags=sorted(tags),
                 detections=detections,
-                metadata=self._analysis_metadata(image),
+                metadata=self._analysis_metadata(image, include_pets=include_pets),
             )
 
         object_detections, object_tags = self._detect_objects(image)
-        pet_detections, pet_tags = self._build_pet_detections(image, object_detections)
+        pet_detections: list[DetectionRegion] = []
+        pet_tags: set[str] = set()
+        if include_pets:
+            self._ensure_pet_models_loaded()
+            pet_detections, pet_tags = self._build_pet_detections(image, object_detections)
         non_pet_object_detections = [
             detection
             for detection in object_detections
@@ -233,7 +249,7 @@ class VisionAnalyzer:
         return AnalysisResult(
             tags=sorted(tags),
             detections=detections,
-            metadata=self._analysis_metadata(image),
+            metadata=self._analysis_metadata(image, include_pets=include_pets),
         )
 
     def _merge_analysis_results(self, left: AnalysisResult, right: AnalysisResult) -> AnalysisResult:
@@ -245,7 +261,8 @@ class VisionAnalyzer:
             metadata=left.metadata | right.metadata,
         )
 
-    def _analysis_metadata(self, image: Image.Image) -> dict[str, Any]:
+    def _analysis_metadata(self, image: Image.Image, *, include_pets: bool | None = None) -> dict[str, Any]:
+        pet_analysis_enabled = bool(include_pets)
         return {
             "analyzed_width": image.size[0],
             "analyzed_height": image.size[1],
@@ -270,6 +287,7 @@ class VisionAnalyzer:
             "pet_face_device": self._yolo_device_label() if self.pet_face_model else "",
             "pet_embedding_model": self.config.pet_embedding_model_id if self.pet_embedding_model else "",
             "pet_embedding_device": getattr(self.pet_embedding_model, "device", ""),
+            "pet_analysis_enabled": pet_analysis_enabled,
             "cat_face_fallback": bool(self.cat_face_detector),
         }
 
@@ -353,6 +371,7 @@ class VisionAnalyzer:
                         tags=video_tags,
                         detections=video_detections,
                         video_metadata=asset.video_metadata,
+                        analysis_mode=analysis_mode,
                     )
                 )
                 continue
@@ -363,6 +382,7 @@ class VisionAnalyzer:
                     tags=video_tags,
                     detections=video_detections,
                     video_metadata=asset.video_metadata,
+                    analysis_mode=analysis_mode,
                 )
                 if video_result.tags or video_result.detections or video_result.metadata.get("video_ai_frames_analyzed"):
                     aggregated.append(self._merge_analysis_results(still_result, video_result))
@@ -476,10 +496,18 @@ class VisionAnalyzer:
         if not units:
             return []
 
+        include_pets = self._include_pets_for_analysis_mode(analysis_mode)
+        if include_pets:
+            self._ensure_pet_models_loaded()
+
         images = [unit.image for unit in units]
         human_face_batches = self._detect_human_faces_batch(images)
         object_batches = self._detect_objects_batch(images) if analysis_mode != "human_faces_only" else []
-        pet_face_batches = self._detect_pet_face_candidates_batch(images) if analysis_mode != "human_faces_only" else []
+        pet_face_batches = (
+            self._detect_pet_face_candidates_batch(images)
+            if analysis_mode != "human_faces_only" and include_pets
+            else []
+        )
         results: list[AnalysisResult] = []
         pet_embedding_requests: list[tuple[DetectionRegion, Image.Image]] = []
 
@@ -498,18 +526,21 @@ class VisionAnalyzer:
                     AnalysisResult(
                         tags=sorted(tags),
                         detections=detections,
-                        metadata=self._analysis_metadata(image),
+                        metadata=self._analysis_metadata(image, include_pets=include_pets),
                     )
                 )
                 continue
 
             object_detections, object_tags = object_batches[index]
-            pet_detections, pet_tags = self._build_pet_detections_from_candidates(
-                image,
-                object_detections,
-                pet_face_batches[index],
-                embed=False,
-            )
+            pet_detections: list[DetectionRegion] = []
+            pet_tags: set[str] = set()
+            if include_pets:
+                pet_detections, pet_tags = self._build_pet_detections_from_candidates(
+                    image,
+                    object_detections,
+                    pet_face_batches[index],
+                    embed=False,
+                )
             for detection in pet_detections:
                 crop = self.crop_region(image, detection.bbox)
                 if crop is not None:
@@ -527,11 +558,11 @@ class VisionAnalyzer:
                 AnalysisResult(
                     tags=sorted(tags),
                     detections=detections,
-                    metadata=self._analysis_metadata(image),
+                    metadata=self._analysis_metadata(image, include_pets=include_pets),
                 )
             )
 
-        if analysis_mode == "human_faces_only":
+        if analysis_mode == "human_faces_only" or not include_pets:
             return results
 
         embeddings = self._embed_pet_crops_batch([crop for _, crop in pet_embedding_requests])
@@ -545,11 +576,20 @@ class VisionAnalyzer:
         tags: set[str],
         detections: list[DetectionRegion],
         video_metadata: dict[str, Any],
+        *,
+        analysis_mode: str,
     ) -> AnalysisResult:
         if analyzed_video_image is None and not video_metadata.get("video_ai_frames_analyzed"):
             return self._empty_analysis()
 
-        metadata = self._analysis_metadata(analyzed_video_image) if analyzed_video_image is not None else {}
+        metadata = (
+            self._analysis_metadata(
+                analyzed_video_image,
+                include_pets=self._include_pets_for_analysis_mode(analysis_mode),
+            )
+            if analyzed_video_image is not None
+            else {}
+        )
         metadata.update(video_metadata)
         return AnalysisResult(
             tags=sorted(tags),
@@ -1441,6 +1481,7 @@ class VisionAnalyzer:
         image: Image.Image,
         object_detections: list[DetectionRegion],
     ) -> list[DetectionRegion]:
+        self._ensure_pet_models_loaded()
         pet_face_candidates = self._detect_pet_face_candidates_batch([image])[0]
         return self._build_pet_face_detections_from_candidates(
             image,
@@ -1556,6 +1597,7 @@ class VisionAnalyzer:
         return embeddings[0] if embeddings else []
 
     def _embed_pet_crops_batch(self, crops: list[Image.Image]) -> list[list[float]]:
+        self._ensure_pet_models_loaded()
         if not crops or self.pet_embedding_model is None:
             return [[] for _ in crops]
 
