@@ -105,10 +105,11 @@ class _AnalysisUnit:
 
 
 class PetEmbeddingModel:
-    def __init__(self, model_dir: Path) -> None:
+    def __init__(self, model_dir: Path, *, compute_mode: str = "auto") -> None:
         if torch is None or AutoModel is None or AutoImageProcessor is None:
             raise RuntimeError("Pet embedding dependencies are not installed.")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        use_cuda = compute_mode != "cpu" and torch.cuda.is_available()
+        self.device = "cuda" if use_cuda else "cpu"
         self.use_half = self.device == "cuda"
         self.processor = AutoImageProcessor.from_pretrained(str(model_dir), use_fast=True)
         self.model = AutoModel.from_pretrained(str(model_dir)).to(self.device).eval()
@@ -266,6 +267,7 @@ class VisionAnalyzer:
         return {
             "analyzed_width": image.size[0],
             "analyzed_height": image.size[1],
+            "compute_mode": self._compute_mode(),
             "human_face_model": (
                 f"{self.human_face_detector_name}+{self.human_face_recognizer_name}"
                 if self.human_face_backend
@@ -842,10 +844,17 @@ class VisionAnalyzer:
                 available = []
         return available
 
+    def _compute_mode(self) -> str:
+        mode = str(getattr(self.config, "compute_mode", "auto") or "auto").lower()
+        return mode if mode in {"auto", "cpu", "cuda"} else "auto"
+
+    def _gpu_enabled(self) -> bool:
+        return self._compute_mode() != "cpu"
+
     def _preferred_recognizer_provider_specs(self, *, include_cpu_fallback: bool = True) -> list[Any]:
         available = self._available_onnx_providers()
         providers: list[Any] = []
-        if "CUDAExecutionProvider" in available:
+        if self._gpu_enabled() and "CUDAExecutionProvider" in available:
             self._prepare_onnxruntime_cuda()
             providers.append(
                 (
@@ -873,7 +882,10 @@ class VisionAnalyzer:
     ) -> list[Any]:
         available = self._available_onnx_providers()
         providers: list[Any] = []
-        prefer_tensorrt = self.config.human_face_detector_backend in {"auto", "tensorrt"}
+        prefer_tensorrt = (
+            self._gpu_enabled()
+            and self.config.human_face_detector_backend in {"auto", "tensorrt"}
+        )
         if (
             prefer_tensorrt
             and "TensorrtExecutionProvider" in available
@@ -894,7 +906,7 @@ class VisionAnalyzer:
                 trt_options["trt_profile_opt_shapes"] = f"{detector_input_name}:8x3x{height}x{width}"
                 trt_options["trt_profile_max_shapes"] = f"{detector_input_name}:32x3x{height}x{width}"
             providers.append(("TensorrtExecutionProvider", trt_options))
-        if "CUDAExecutionProvider" in available:
+        if self._gpu_enabled() and "CUDAExecutionProvider" in available:
             self._prepare_onnxruntime_cuda()
             providers.append(
                 (
@@ -984,6 +996,8 @@ class VisionAnalyzer:
                 return
 
     def _preferred_yolo_device(self) -> int | str:
+        if not self._gpu_enabled():
+            return "cpu"
         if torch is not None and torch.cuda.is_available():
             return 0
         return "cpu"
@@ -1017,7 +1031,7 @@ class VisionAnalyzer:
         try:
             detection_input_size = (640, 640)
             available = self._available_onnx_providers()
-            gpu_provider_available = "CUDAExecutionProvider" in available
+            gpu_provider_available = self._gpu_enabled() and "CUDAExecutionProvider" in available
             detector_providers = self._preferred_detector_provider_specs(
                 detector_path,
                 detection_input_size=detection_input_size,
@@ -1210,7 +1224,7 @@ class VisionAnalyzer:
             return None
 
         try:
-            return PetEmbeddingModel(Path(model_dir))
+            return PetEmbeddingModel(Path(model_dir), compute_mode=self._compute_mode())
         except Exception:
             return None
 

@@ -14,6 +14,7 @@ class AppConfig:
     database_path: str
     cache_dir: str
     models_dir: str
+    compute_mode: str = "auto"
     thumbnail_size: int = 256
     face_recognition_enabled: bool = True
     object_detection_enabled: bool = True

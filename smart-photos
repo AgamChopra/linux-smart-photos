@@ -14,10 +14,12 @@ skip_setup="0"
 force_setup="0"
 setup_only="0"
 passthrough=()
+setup_args=()
+uninstall_all="0"
 
 print_usage() {
   cat <<'EOF'
-Usage: ./smart-photos [--gui] [--cli] [--setup] [--setup-only] [--help] [-- ...]
+Usage: ./smart-photos [--gui] [--cli] [--setup] [--setup-only] [--cpu|--gpu|--auto] [--uninstall] [--help] [-- ...]
 
 Modes:
   --gui          Launch the primary Tauri app (default)
@@ -29,6 +31,11 @@ Modes:
 Setup:
   --setup        Force the bootstrap script to run before launching
   --setup-only   Run bootstrap and exit
+  --cpu          Reconfigure setup for CPU-only AI mode
+  --gpu          Reconfigure setup for NVIDIA CUDA GPU AI mode
+  --auto         Auto-select GPU mode when an NVIDIA GPU is detected, otherwise CPU
+  --media-root PATH Set the photos folder during setup
+  --uninstall    Remove app setup, config, database, models, thumbnails, and desktop integration
 
 Examples:
   ./smart-photos
@@ -124,9 +131,50 @@ while (($#)); do
       force_setup="1"
       shift
       ;;
+    --cpu)
+      force_setup="1"
+      setup_args+=("--cpu")
+      shift
+      ;;
+    --gpu|--cuda)
+      force_setup="1"
+      setup_args+=("--gpu")
+      shift
+      ;;
+    --auto)
+      force_setup="1"
+      setup_args+=("--auto")
+      shift
+      ;;
+    --compute-mode)
+      if [[ $# -lt 2 ]]; then
+        echo "--compute-mode requires one of: cpu, cuda, auto" >&2
+        exit 2
+      fi
+      force_setup="1"
+      setup_args+=("--compute-mode" "$2")
+      shift 2
+      ;;
+    --media-root)
+      if [[ $# -lt 2 ]]; then
+        echo "--media-root requires a path." >&2
+        exit 2
+      fi
+      force_setup="1"
+      setup_args+=("--media-root" "$2")
+      shift 2
+      ;;
     --setup-only)
       force_setup="1"
       setup_only="1"
+      shift
+      ;;
+    --uninstall)
+      uninstall_all="1"
+      shift
+      ;;
+    --yes|-y)
+      setup_args+=("--yes")
       shift
       ;;
     --no-setup)
@@ -149,6 +197,10 @@ while (($#)); do
   esac
 done
 
+if [[ "$uninstall_all" == "1" ]]; then
+  exec "$SETUP_SCRIPT" --uninstall "${setup_args[@]}"
+fi
+
 if [[ "$skip_setup" != "1" ]]; then
   set +e
   "$SETUP_SCRIPT" --check >/dev/null 2>&1
@@ -162,9 +214,9 @@ if [[ "$skip_setup" != "1" ]]; then
   fi
 
   if [[ "$force_setup" == "1" ]]; then
-    "$SETUP_SCRIPT" --force
+    "$SETUP_SCRIPT" --force "${setup_args[@]}"
   else
-    "$SETUP_SCRIPT"
+    "$SETUP_SCRIPT" "${setup_args[@]}"
   fi
 fi
 

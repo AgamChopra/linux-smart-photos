@@ -1,3 +1,58 @@
+Metadata-Version: 2.4
+Name: linux-smart-photos
+Version: 0.1.0
+Summary: A Python desktop photo library for Linux with incremental indexing, albums, people/pets, search, and memories.
+License: MIT License
+        
+        Copyright (c) 2026 Agam Chopra
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Multimedia :: Graphics
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: PySide6>=6.7
+Requires-Dist: Pillow>=10.3
+Requires-Dist: numpy>=1.26
+Requires-Dist: opencv-python>=4.9
+Requires-Dist: imageio>=2.34
+Requires-Dist: imagehash>=4.3
+Requires-Dist: rapidfuzz>=3.9
+Requires-Dist: python-dateutil>=2.9
+Provides-Extra: ai
+Requires-Dist: huggingface-hub>=0.26; extra == "ai"
+Requires-Dist: insightface>=0.7.3; extra == "ai"
+Requires-Dist: onnxruntime-gpu[cuda,cudnn]>=1.21; platform_system == "Linux" and extra == "ai"
+Requires-Dist: onnxruntime>=1.20; platform_system != "Linux" and extra == "ai"
+Requires-Dist: safetensors>=0.4; extra == "ai"
+Requires-Dist: torch>=2.4; extra == "ai"
+Requires-Dist: transformers>=4.46; extra == "ai"
+Requires-Dist: ultralytics>=8.3; extra == "ai"
+Requires-Dist: pillow-heif>=0.16; extra == "ai"
+Provides-Extra: packaging
+Requires-Dist: pyinstaller>=6.19; extra == "packaging"
+Dynamic: license-file
+
 <p align="center">
   <img src="assets/smart-photos.svg" alt="Linux Smart Photos icon" width="256" height="256">
 </p>
@@ -47,10 +102,7 @@ cd linux-smart-photos
 ./smart-photos
 ```
 
-The launcher will create a virtual environment, install Python dependencies, initialize configuration, migrate older JSON data if needed, and install desktop integration. On first setup, it asks for:
-
-- your photos root folder, for example the folder that contains `2026/04/21/IMG_0001.HEIC`
-- CPU-only mode or NVIDIA CUDA GPU mode, after checking the detected GPU
+The launcher will create a virtual environment, install Python dependencies, initialize configuration, migrate older JSON data if needed, and install desktop integration.
 
 To run setup without opening the app:
 
@@ -63,22 +115,6 @@ To force a full setup refresh:
 ```bash
 ./smart-photos --setup
 ```
-
-Useful setup shortcuts:
-
-```bash
-./smart-photos --setup --cpu
-./smart-photos --setup --gpu
-./smart-photos --setup --media-root ~/Pictures/Pictures
-```
-
-To remove the app setup and start fresh:
-
-```bash
-./smart-photos --uninstall
-```
-
-This removes the virtual environment, app config, database, models, thumbnails, local UI build artifacts, and desktop integration. It does not delete your photos folder.
 
 ## Requirements
 
@@ -192,8 +228,6 @@ Optional for AI acceleration:
 
 - NVIDIA GPU with working CUDA runtime
 - TensorRT libraries if you want ONNX Runtime TensorRT acceleration
-
-CPU-only setup installs the CPU ONNX Runtime path and forces inference devices to CPU in config. GPU setup installs the CUDA ONNX Runtime path and lets LSP use CUDA/TensorRT when available.
 
 ## AI Features
 

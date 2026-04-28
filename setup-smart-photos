@@ -16,23 +16,279 @@ DESKTOP_FILE="$DESKTOP_DIR/smart-photos.desktop"
 BIN_DIR="$HOME/.local/bin"
 BIN_LINK="$BIN_DIR/smart-photos"
 LAUNCHER_PATH="$ROOT_DIR/smart-photos"
+CONFIG_DIR="$HOME/.config/linux-smart-photos"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+DATA_DIR="$HOME/.local/share/linux-smart-photos"
+CACHE_ROOT="$HOME/.cache/linux-smart-photos"
 
 force_setup="0"
 check_only="0"
+uninstall_all="0"
+assume_yes="0"
+compute_mode_arg=""
+media_root_arg=""
 
 print_usage() {
   cat <<'EOF'
-Usage: ./setup-smart-photos [--force] [--check] [--help]
+Usage: ./setup-smart-photos [--force] [--check] [--cpu|--gpu|--auto] [--media-root PATH] [--uninstall] [--help]
 
-  --force   Rebuild the virtual environment dependencies and refresh desktop integration
-  --check   Exit 0 if setup is current, 10 if setup is needed
+  --force           Rebuild the virtual environment dependencies and refresh desktop integration
+  --check           Exit 0 if setup is current, 10 if setup is needed
+  --cpu             Install and configure CPU-only AI mode
+  --gpu             Install and configure NVIDIA CUDA GPU AI mode
+  --auto            Auto-select GPU mode when an NVIDIA GPU is detected, otherwise CPU
+  --media-root PATH Set the photos folder containing year/month/day media folders
+  --uninstall       Remove app setup, config, database, models, thumbnails, and desktop integration
+  --yes             Skip uninstall confirmation
 EOF
+}
+
+read_config_field() {
+  local field="$1"
+  if [[ ! -f "$CONFIG_FILE" ]] || ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  python3 - "$CONFIG_FILE" "$field" <<'PY'
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+field = sys.argv[2]
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+value = payload.get(field, "")
+if isinstance(value, str):
+    print(value)
+PY
+}
+
+detect_gpu_names() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true
+    return 0
+  fi
+  if command -v lspci >/dev/null 2>&1; then
+    lspci 2>/dev/null | grep -Ei 'vga|3d|display' | sed -E 's/^[^ ]+ //'
+    return 0
+  fi
+  return 0
+}
+
+has_nvidia_gpu() {
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -Eiq 'nvidia.*(vga|3d|display)|(vga|3d|display).*nvidia'; then
+    return 0
+  fi
+  return 1
+}
+
+choose_compute_mode() {
+  local existing_mode="$1"
+  local detected_gpus="$2"
+  local recommended="cpu"
+  if has_nvidia_gpu; then
+    recommended="cuda"
+  fi
+
+  if [[ -n "$compute_mode_arg" ]]; then
+    if [[ "$compute_mode_arg" == "auto" ]]; then
+      echo "$recommended"
+    else
+      echo "$compute_mode_arg"
+    fi
+    return 0
+  fi
+
+  if [[ -n "$existing_mode" && "$existing_mode" != "auto" ]]; then
+    echo "$existing_mode"
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
+    echo "Choose AI runtime mode for Linux Smart Photos:" >&2
+    if [[ -n "$detected_gpus" ]]; then
+      echo "Detected GPU(s):" >&2
+      while IFS= read -r gpu_line; do
+        [[ -n "$gpu_line" ]] && echo "- $gpu_line" >&2
+      done <<< "$detected_gpus"
+    else
+      echo "Detected GPU(s): none" >&2
+    fi
+    echo "1) GPU mode (NVIDIA CUDA; fastest if supported)" >&2
+    echo "2) CPU-only mode (most compatible; slower)" >&2
+    if [[ "$recommended" == "cuda" ]]; then
+      read -r -p "Select mode [1]: " selection
+      selection="${selection:-1}"
+    else
+      read -r -p "Select mode [2]: " selection
+      selection="${selection:-2}"
+    fi
+    case "$selection" in
+      1|g|G|gpu|GPU)
+        echo "cuda"
+        ;;
+      *)
+        echo "cpu"
+        ;;
+    esac
+    return 0
+  fi
+
+  echo "$recommended"
+}
+
+choose_media_root() {
+  local existing_root="$1"
+
+  if [[ -n "$media_root_arg" ]]; then
+    echo "$media_root_arg"
+    return 0
+  fi
+
+  if [[ -n "$existing_root" ]]; then
+    echo "$existing_root"
+    return 0
+  fi
+
+  local default_root="$HOME/Pictures"
+  if [[ -d "$HOME/Pictures/Pictures" ]]; then
+    default_root="$HOME/Pictures/Pictures"
+  fi
+
+  if [[ -t 0 ]]; then
+    echo "Choose your photos folder." >&2
+    echo "This should be the root folder that contains year/month/day folders, for example:" >&2
+    echo "  $default_root/2026/04/21/IMG_0001.HEIC" >&2
+    while true; do
+      read -r -p "Photos folder [$default_root]: " selected_root
+      selected_root="${selected_root:-$default_root}"
+      selected_root="${selected_root/#\~/$HOME}"
+      if [[ -d "$selected_root" ]]; then
+        echo "$selected_root"
+        return 0
+      fi
+      read -r -p "That folder does not exist. Use it anyway? [y/N]: " use_missing
+      case "$use_missing" in
+        y|Y|yes|YES)
+          echo "$selected_root"
+          return 0
+          ;;
+      esac
+    done
+  fi
+
+  echo "$default_root"
+}
+
+safe_remove_path() {
+  local target="$1"
+  local kind="$2"
+  if [[ -z "$target" ]]; then
+    return 0
+  fi
+  case "$target" in
+    *linux-smart-photos*|*/library.sqlite3)
+      if [[ "$kind" == "file" ]]; then
+        rm -f "$target"
+      else
+        rm -rf "$target"
+      fi
+      echo "Removed: $target"
+      ;;
+    *)
+      echo "Skipped custom path outside linux-smart-photos namespace: $target" >&2
+      ;;
+  esac
+}
+
+run_uninstall() {
+  echo "This will remove Linux Smart Photos setup and app data:"
+  echo "- virtual environment: $VENV_DIR"
+  echo "- config: $CONFIG_DIR"
+  echo "- data/models/database: $DATA_DIR"
+  echo "- caches/thumbnails: $CACHE_ROOT"
+  echo "- desktop launcher/icon/bin link"
+  echo "- local Tauri/Electron build dependencies"
+  echo "Your photos folder will NOT be deleted."
+
+  if [[ "$assume_yes" != "1" ]]; then
+    local confirmation=""
+    read -r -p "Type REMOVE LSP to continue: " confirmation
+    if [[ "$confirmation" != "REMOVE LSP" ]]; then
+      echo "Uninstall cancelled."
+      return 1
+    fi
+  fi
+
+  local configured_database configured_cache configured_models
+  configured_database="$(read_config_field database_path || true)"
+  configured_cache="$(read_config_field cache_dir || true)"
+  configured_models="$(read_config_field models_dir || true)"
+
+  safe_remove_path "$configured_database" "file"
+  safe_remove_path "$configured_cache" "dir"
+  safe_remove_path "$configured_models" "dir"
+  rm -rf "$VENV_DIR" "$CONFIG_DIR" "$DATA_DIR" "$CACHE_ROOT"
+  rm -rf "$TAURI_DIR/node_modules" "$TAURI_DIR/src-tauri/target" "$ELECTRON_DIR/node_modules"
+  rm -f "$DESKTOP_FILE" "$ICON_DEST" "$BIN_LINK"
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+  fi
+  echo "Linux Smart Photos has been removed. Re-run ./smart-photos or ./setup-smart-photos for a fresh setup."
 }
 
 while (($#)); do
   case "$1" in
     --force)
       force_setup="1"
+      shift
+      ;;
+    --cpu)
+      compute_mode_arg="cpu"
+      force_setup="1"
+      shift
+      ;;
+    --gpu|--cuda)
+      compute_mode_arg="cuda"
+      force_setup="1"
+      shift
+      ;;
+    --auto)
+      compute_mode_arg="auto"
+      force_setup="1"
+      shift
+      ;;
+    --compute-mode)
+      compute_mode_arg="${2:-}"
+      if [[ "$compute_mode_arg" != "cpu" && "$compute_mode_arg" != "cuda" && "$compute_mode_arg" != "auto" ]]; then
+        echo "--compute-mode must be one of: cpu, cuda, auto" >&2
+        exit 2
+      fi
+      force_setup="1"
+      shift 2
+      ;;
+    --media-root)
+      media_root_arg="${2:-}"
+      if [[ -z "$media_root_arg" ]]; then
+        echo "--media-root requires a path." >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --uninstall)
+      uninstall_all="1"
+      shift
+      ;;
+    --yes|-y)
+      assume_yes="1"
       shift
       ;;
     --check)
@@ -50,6 +306,11 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ "$uninstall_all" == "1" ]]; then
+  run_uninstall
+  exit $?
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required to set up Linux Smart Photos." >&2
@@ -87,9 +348,24 @@ print(digest.hexdigest())
 PY
 )"
 
+existing_compute_mode="$(read_config_field compute_mode || true)"
+existing_media_root="$(read_config_field media_root || true)"
+setup_has_config="0"
+if [[ -f "$CONFIG_FILE" ]]; then
+  setup_has_config="1"
+fi
+prompt_compute_mode="$existing_compute_mode"
+if [[ -z "$existing_compute_mode" ]]; then
+  existing_compute_mode="auto"
+fi
+if [[ "$setup_has_config" != "1" ]]; then
+  prompt_compute_mode=""
+fi
+stamp_payload="$manifest_hash:$existing_compute_mode"
+
 setup_current="0"
 if [[ -x "$VENV_DIR/bin/python" && -f "$STAMP_FILE" ]]; then
-  if [[ "$(cat "$STAMP_FILE")" == "$manifest_hash" ]]; then
+  if [[ "$setup_has_config" == "1" && "$(cat "$STAMP_FILE")" == "$stamp_payload" ]]; then
     setup_current="1"
   fi
 fi
@@ -117,14 +393,37 @@ if [[ "$force_setup" != "1" && "$setup_current" == "1" ]]; then
 fi
 
 echo "Setting up Linux Smart Photos in $ROOT_DIR"
+detected_gpus="$(detect_gpu_names)"
+selected_compute_mode="$(choose_compute_mode "$prompt_compute_mode" "$detected_gpus")"
+selected_media_root="$(choose_media_root "$existing_media_root")"
+if [[ "$selected_compute_mode" == "cuda" && ! has_nvidia_gpu ]]; then
+  echo "GPU mode selected, but no NVIDIA GPU was detected. Setup will install GPU packages anyway; runtime may fall back to CPU." >&2
+fi
+if [[ "$selected_compute_mode" == "cuda" ]]; then
+  ai_extra="ai-gpu"
+else
+  ai_extra="ai-cpu"
+fi
+echo "Selected compute mode: $selected_compute_mode"
+echo "Selected photos folder: $selected_media_root"
+
 python3 -m venv "$VENV_DIR"
 
 echo "Installing Python dependencies"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip "setuptools<82" wheel
+if [[ "$selected_compute_mode" == "cpu" ]]; then
+  "$VENV_DIR/bin/pip" uninstall -y onnxruntime-gpu >/dev/null 2>&1 || true
+  "$VENV_DIR/bin/pip" install --upgrade --index-url https://download.pytorch.org/whl/cpu torch torchvision
+elif [[ "$selected_compute_mode" == "cuda" ]]; then
+  "$VENV_DIR/bin/pip" uninstall -y onnxruntime >/dev/null 2>&1 || true
+fi
 (
   cd "$ROOT_DIR"
-  "$VENV_DIR/bin/pip" install -e ".[ai]"
+  "$VENV_DIR/bin/pip" install -e ".[$ai_extra]"
 )
+if [[ "$selected_compute_mode" == "cpu" ]]; then
+  "$VENV_DIR/bin/pip" uninstall -y onnxruntime-gpu >/dev/null 2>&1 || true
+fi
 
 if [[ -f "$TAURI_DIR/package.json" ]]; then
   if command -v npm >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
@@ -150,7 +449,10 @@ if [[ ! -x "$TAURI_BINARY" && -f "$ELECTRON_DIR/package.json" ]]; then
 fi
 
 echo "Initializing local configuration"
-"$VENV_DIR/bin/python" -m linux_smart_photos.bootstrap --skip-models
+"$VENV_DIR/bin/python" -m linux_smart_photos.bootstrap \
+  --skip-models \
+  --compute-mode "$selected_compute_mode" \
+  --media-root "$selected_media_root"
 
 echo "Migrating legacy library data"
 "$VENV_DIR/bin/smart-photos-migrate"
@@ -179,5 +481,5 @@ if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
 fi
 
-printf '%s\n' "$manifest_hash" > "$STAMP_FILE"
+printf '%s\n' "$manifest_hash:$selected_compute_mode" > "$STAMP_FILE"
 echo "Linux Smart Photos is ready."

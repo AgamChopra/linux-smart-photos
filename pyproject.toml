@@ -38,6 +38,27 @@ ai = [
   "ultralytics>=8.3",
   "pillow-heif>=0.16",
 ]
+ai-cpu = [
+  "huggingface-hub>=0.26",
+  "insightface>=0.7.3",
+  "onnxruntime>=1.20",
+  "safetensors>=0.4",
+  "torch>=2.4",
+  "transformers>=4.46",
+  "ultralytics>=8.3",
+  "pillow-heif>=0.16",
+]
+ai-gpu = [
+  "huggingface-hub>=0.26",
+  "insightface>=0.7.3",
+  "onnxruntime-gpu[cuda,cudnn]>=1.21; platform_system == 'Linux'",
+  "onnxruntime>=1.20; platform_system != 'Linux'",
+  "safetensors>=0.4",
+  "torch>=2.4",
+  "transformers>=4.46",
+  "ultralytics>=8.3",
+  "pillow-heif>=0.16",
+]
 packaging = [
   "pyinstaller>=6.19",
 ]

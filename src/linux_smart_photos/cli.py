@@ -94,6 +94,7 @@ def run_status(service: LibraryService, config_override: Path | None) -> int:
     print(APP_NAME)
     print(f"Config: {config_override or config_file_path()}")
     print(f"Media root: {service.config.media_root_path}")
+    print(f"Compute mode: {service.config.compute_mode}")
     print(f"Items: {len(service.list_items())}")
     print(f"Personas: {len(service.list_personas())}")
     print(f"Albums: {len(service.list_albums())}")
