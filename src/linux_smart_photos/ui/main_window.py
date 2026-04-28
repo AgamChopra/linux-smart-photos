@@ -4,12 +4,16 @@ from time import monotonic
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, QTimer, QSize, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QIcon, QPixmap
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QColorDialog,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -27,9 +31,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import AppConfig
+from ..config import AppConfig, write_config
 from ..services.library import EmbeddingMapPoint, LibraryService, ProgressUpdate, UnknownPersonaCluster
 from .dialogs import AlbumDialog, AssignPersonaDialog, CorrectionsDialog
+from .theme import apply_app_theme, default_palette, normalize_theme, readable_text_color, valid_color
 from .widgets import MediaGridWidget
 
 try:
@@ -45,6 +50,93 @@ except Exception:
 PAGE_ITEM_PREVIEW_LIMIT = 720
 CLUSTER_RENDER_CHUNK_SIZE = 128
 LIVE_REFRESH_INTERVAL_MS = 2500
+
+
+class AppearanceDialog(QDialog):
+    def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Customize Appearance")
+        self.config = config
+        theme = normalize_theme(getattr(config, "ui_theme", "light"))
+        palette = default_palette(theme)
+        self._accent_color = QColor(
+            valid_color(getattr(config, "ui_accent_color", "") or palette["accent"], palette["accent"])
+        )
+        background_value = getattr(config, "ui_background_color", "") or ""
+        self._background_color = QColor(background_value) if QColor(background_value).isValid() else None
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Light", "light")
+        self.theme_combo.addItem("Dark", "dark")
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(theme))
+
+        self.accent_button = QPushButton()
+        self.accent_button.clicked.connect(self._choose_accent_color)
+        self.background_button = QPushButton()
+        self.background_button.clicked.connect(self._choose_background_color)
+        self.reset_background_button = QPushButton("Use Theme Default")
+        self.reset_background_button.clicked.connect(self._reset_background_color)
+
+        background_row = QHBoxLayout()
+        background_row.addWidget(self.background_button, 1)
+        background_row.addWidget(self.reset_background_button)
+
+        form = QFormLayout()
+        form.addRow("Theme", self.theme_combo)
+        form.addRow("Accent color", self.accent_button)
+        form.addRow("Background", background_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self._refresh_color_buttons()
+
+    def selected_theme(self) -> str:
+        return str(self.theme_combo.currentData() or "light")
+
+    def selected_accent_color(self) -> str:
+        return self._accent_color.name()
+
+    def selected_background_color(self) -> str:
+        return "" if self._background_color is None else self._background_color.name()
+
+    def _choose_accent_color(self) -> None:
+        color = QColorDialog.getColor(self._accent_color, self, "Choose Accent Color")
+        if color.isValid():
+            self._accent_color = color
+            self._refresh_color_buttons()
+
+    def _choose_background_color(self) -> None:
+        fallback = default_palette(self.selected_theme())["background"]
+        current = self._background_color or QColor(fallback)
+        color = QColorDialog.getColor(current, self, "Choose Background Color")
+        if color.isValid():
+            self._background_color = color
+            self._refresh_color_buttons()
+
+    def _reset_background_color(self) -> None:
+        self._background_color = None
+        self._refresh_color_buttons()
+
+    def _refresh_color_buttons(self) -> None:
+        accent_text = readable_text_color(self._accent_color.name())
+        self.accent_button.setText(self._accent_color.name())
+        self.accent_button.setStyleSheet(
+            f"background: {self._accent_color.name()}; color: {accent_text};"
+        )
+        if self._background_color is None:
+            self.background_button.setText("Theme default")
+            self.background_button.setStyleSheet("")
+            return
+        background = self._background_color.name()
+        self.background_button.setText(background)
+        self.background_button.setStyleSheet(
+            f"background: {background}; color: {readable_text_color(background)};"
+        )
 
 
 class TaskStatusRow(QWidget):
@@ -1185,7 +1277,7 @@ class EmbeddingMapPage(QWidget):
         self.preview = QLabel("No selection")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(QSize(260, 260))
-        self.preview.setStyleSheet("border: 1px solid #888; background: #111; color: #ddd;")
+        self.preview.setObjectName("FaceMapPreview")
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
@@ -1810,6 +1902,7 @@ class MainWindow(QMainWindow):
         self._models_dirty = False
         self.setWindowTitle("Linux Smart Photos")
         self.resize(1560, 980)
+        self._build_menus()
 
         self.tabs = QTabWidget()
         self.library_page = LibraryPage(service, self)
@@ -1850,6 +1943,41 @@ class MainWindow(QMainWindow):
         self._status_refresh_timer.start()
 
         QTimer.singleShot(0, self._finish_startup)
+
+    def _build_menus(self) -> None:
+        view_menu = self.menuBar().addMenu("View")
+
+        customize_action = QAction("Customize Appearance...", self)
+        customize_action.triggered.connect(self._show_appearance_dialog)
+        view_menu.addAction(customize_action)
+
+        view_menu.addSeparator()
+        light_action = QAction("Light Mode", self)
+        light_action.triggered.connect(lambda: self._set_theme_mode("light"))
+        view_menu.addAction(light_action)
+
+        dark_action = QAction("Dark Mode", self)
+        dark_action.triggered.connect(lambda: self._set_theme_mode("dark"))
+        view_menu.addAction(dark_action)
+
+    def _set_theme_mode(self, theme: str) -> None:
+        self.service.config.ui_theme = normalize_theme(theme)
+        write_config(self.service.config)
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_theme(app, self.service.config)
+
+    def _show_appearance_dialog(self) -> None:
+        dialog = AppearanceDialog(self.service.config, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.service.config.ui_theme = dialog.selected_theme()
+        self.service.config.ui_accent_color = dialog.selected_accent_color()
+        self.service.config.ui_background_color = dialog.selected_background_color()
+        write_config(self.service.config)
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_theme(app, self.service.config)
 
     def _finish_startup(self) -> None:
         self.refresh_views(refresh_unknown=False)

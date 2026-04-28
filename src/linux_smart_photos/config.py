@@ -15,6 +15,9 @@ class AppConfig:
     cache_dir: str
     models_dir: str
     compute_mode: str = "auto"
+    ui_theme: str = "light"
+    ui_accent_color: str = "#0d3b66"
+    ui_background_color: str = ""
     thumbnail_size: int = 256
     face_recognition_enabled: bool = True
     object_detection_enabled: bool = True

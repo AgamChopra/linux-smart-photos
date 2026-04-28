@@ -49,6 +49,25 @@ Requires-Dist: torch>=2.4; extra == "ai"
 Requires-Dist: transformers>=4.46; extra == "ai"
 Requires-Dist: ultralytics>=8.3; extra == "ai"
 Requires-Dist: pillow-heif>=0.16; extra == "ai"
+Provides-Extra: ai-cpu
+Requires-Dist: huggingface-hub>=0.26; extra == "ai-cpu"
+Requires-Dist: insightface>=0.7.3; extra == "ai-cpu"
+Requires-Dist: onnxruntime>=1.20; extra == "ai-cpu"
+Requires-Dist: safetensors>=0.4; extra == "ai-cpu"
+Requires-Dist: torch>=2.4; extra == "ai-cpu"
+Requires-Dist: transformers>=4.46; extra == "ai-cpu"
+Requires-Dist: ultralytics>=8.3; extra == "ai-cpu"
+Requires-Dist: pillow-heif>=0.16; extra == "ai-cpu"
+Provides-Extra: ai-gpu
+Requires-Dist: huggingface-hub>=0.26; extra == "ai-gpu"
+Requires-Dist: insightface>=0.7.3; extra == "ai-gpu"
+Requires-Dist: onnxruntime-gpu[cuda,cudnn]>=1.21; platform_system == "Linux" and extra == "ai-gpu"
+Requires-Dist: onnxruntime>=1.20; platform_system != "Linux" and extra == "ai-gpu"
+Requires-Dist: safetensors>=0.4; extra == "ai-gpu"
+Requires-Dist: torch>=2.4; extra == "ai-gpu"
+Requires-Dist: transformers>=4.46; extra == "ai-gpu"
+Requires-Dist: ultralytics>=8.3; extra == "ai-gpu"
+Requires-Dist: pillow-heif>=0.16; extra == "ai-gpu"
 Provides-Extra: packaging
 Requires-Dist: pyinstaller>=6.19; extra == "packaging"
 Dynamic: license-file
@@ -102,7 +121,10 @@ cd linux-smart-photos
 ./smart-photos
 ```
 
-The launcher will create a virtual environment, install Python dependencies, initialize configuration, migrate older JSON data if needed, and install desktop integration.
+The launcher will create a virtual environment, install Python dependencies, initialize configuration, migrate older JSON data if needed, and install desktop integration. On first setup, it asks for:
+
+- your photos root folder, for example the folder that contains `2026/04/21/IMG_0001.HEIC`
+- CPU-only mode or NVIDIA CUDA GPU mode, after checking the detected GPU
 
 To run setup without opening the app:
 
@@ -115,6 +137,22 @@ To force a full setup refresh:
 ```bash
 ./smart-photos --setup
 ```
+
+Useful setup shortcuts:
+
+```bash
+./smart-photos --setup --cpu
+./smart-photos --setup --gpu
+./smart-photos --setup --media-root ~/Pictures/Pictures
+```
+
+To remove the app setup and start fresh:
+
+```bash
+./smart-photos --uninstall
+```
+
+This removes the virtual environment, app config, database, models, thumbnails, local UI build artifacts, and desktop integration. It does not delete your photos folder.
 
 ## Requirements
 
@@ -228,6 +266,8 @@ Optional for AI acceleration:
 
 - NVIDIA GPU with working CUDA runtime
 - TensorRT libraries if you want ONNX Runtime TensorRT acceleration
+
+CPU-only setup installs the CPU ONNX Runtime path and forces inference devices to CPU in config. GPU setup installs the CUDA ONNX Runtime path and lets LSP use CUDA/TensorRT when available.
 
 ## AI Features
 

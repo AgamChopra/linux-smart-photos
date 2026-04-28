@@ -137,9 +137,7 @@ class CorrectionsDialog(QDialog):
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumHeight(240)
-        self.preview_label.setStyleSheet(
-            "background: #f3f1ec; border: 1px solid #ddd3c7; border-radius: 12px;"
-        )
+        self.preview_label.setObjectName("PreviewPanel")
 
         self.summary_label = QLabel()
         self.summary_label.setWordWrap(True)

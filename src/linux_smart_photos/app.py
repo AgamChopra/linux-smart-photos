@@ -9,6 +9,7 @@ from .branding import APP_DESKTOP_ID, APP_NAME, icon_path
 from .config import load_config
 from .services.library import LibraryService
 from .ui.main_window import MainWindow
+from .ui.theme import apply_app_theme
 
 
 def main() -> int:
@@ -22,34 +23,7 @@ def main() -> int:
     if resolved_icon.exists():
         app.setWindowIcon(QIcon(str(resolved_icon)))
     app.setStyle("Fusion")
-    app.setStyleSheet(
-        """
-        QWidget {
-            font-size: 13px;
-        }
-        QMainWindow {
-            background: #faf7f2;
-        }
-        QTabWidget::pane {
-            border: 0;
-        }
-        QListWidget, QTextEdit, QTableWidget {
-            background: #fffdf9;
-            border: 1px solid #ddd3c7;
-            border-radius: 10px;
-        }
-        QPushButton, QComboBox, QLineEdit {
-            min-height: 34px;
-            border: 1px solid #d5c8b8;
-            border-radius: 10px;
-            padding: 4px 10px;
-            background: #fffaf2;
-        }
-        QPushButton:hover {
-            background: #f4ebe0;
-        }
-        """
-    )
+    apply_app_theme(app, config)
 
     service = LibraryService(config)
     window = MainWindow(service)

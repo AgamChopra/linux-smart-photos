@@ -798,9 +798,7 @@ class MediaGridWidget(QWidget):
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumWidth(420)
         self.preview_label.setMinimumHeight(420)
-        self.preview_label.setStyleSheet(
-            "background: #f3f1ec; border: 1px solid #ddd3c7; border-radius: 12px;"
-        )
+        self.preview_label.setObjectName("PreviewPanel")
         self.preview_label.setWordWrap(True)
 
         self.preview_stack = QStackedWidget()
@@ -810,9 +808,7 @@ class MediaGridWidget(QWidget):
         self.video_status_label.setAlignment(Qt.AlignCenter)
         self.video_status_label.setMinimumWidth(420)
         self.video_status_label.setMinimumHeight(420)
-        self.video_status_label.setStyleSheet(
-            "background: #f3f1ec; border: 1px solid #ddd3c7; border-radius: 12px;"
-        )
+        self.video_status_label.setObjectName("VideoPreviewPanel")
         self.video_status_label.setWordWrap(True)
         self.preview_stack.addWidget(self.video_status_label)
 

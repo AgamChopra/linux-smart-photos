@@ -224,12 +224,47 @@ class LibraryService:
         self._ensure_state_loaded()
         sync_started_at = monotonic()
         discovery_started_at = monotonic()
+        media_root = self.config.media_root_path
+        if not media_root.exists():
+            message = (
+                f"Media root does not exist: {media_root}. "
+                "Run `./smart-photos --setup --media-root /path/to/photos` to fix the library path."
+            )
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="sync",
+                    message="Media root not found",
+                    detail=message,
+                    indeterminate=False,
+                    overall_started_at=sync_started_at,
+                    step_started_at=discovery_started_at,
+                ),
+            )
+            raise FileNotFoundError(message)
+        if not media_root.is_dir():
+            message = (
+                f"Media root is not a directory: {media_root}. "
+                "Run `./smart-photos --setup --media-root /path/to/photos` to fix the library path."
+            )
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="sync",
+                    message="Media root is not a directory",
+                    detail=message,
+                    indeterminate=False,
+                    overall_started_at=sync_started_at,
+                    step_started_at=discovery_started_at,
+                ),
+            )
+            raise NotADirectoryError(message)
         self._emit_progress(
             progress_callback,
             self._make_progress_update(
                 phase="sync",
                 message="Discovering media files",
-                detail=str(self.config.media_root_path),
+                detail=str(media_root),
                 indeterminate=True,
                 overall_started_at=sync_started_at,
                 step_started_at=discovery_started_at,
@@ -257,7 +292,7 @@ class LibraryService:
             )
 
         assets = build_asset_specs(
-            self.config.media_root_path,
+            media_root,
             progress_callback=emit_discovery_progress,
         )
         sorted_assets = self._sorted_asset_entries(assets)
