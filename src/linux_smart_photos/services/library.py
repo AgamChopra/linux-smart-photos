@@ -396,27 +396,60 @@ class LibraryService:
             max_workers = min(self._prefetch_workers(), max(1, batch_size), len(changed_entries))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 total_batches = (len(changed_entries) + batch_size - 1) // batch_size
-                for batch_index, batch_start in enumerate(range(0, len(changed_entries), batch_size), start=1):
-                    batch_entries = changed_entries[batch_start : batch_start + batch_size]
-                    batch_started_at = monotonic()
+                batch_plan = [
+                    (
+                        batch_index,
+                        changed_entries[batch_start : batch_start + batch_size],
+                    )
+                    for batch_index, batch_start in enumerate(range(0, len(changed_entries), batch_size), start=1)
+                ]
+                pending_futures: list[Future[PreparedSyncItem]] | None = None
+                pending_started_at = monotonic()
+                if batch_plan:
+                    first_index, first_entries = batch_plan[0]
                     self._emit_progress(
                         progress_callback,
                         self._make_progress_update(
                             phase="sync",
-                            message=f"Prefetching batch {batch_index}/{total_batches}",
+                            message=f"Prefetching batch {first_index}/{total_batches}",
                             current=completed,
                             total=total_work,
-                            detail=self._batch_detail(batch_entries),
+                            detail=self._batch_detail(first_entries),
                             indeterminate=True,
                             overall_started_at=sync_started_at,
-                            step_started_at=batch_started_at,
+                            step_started_at=pending_started_at,
                         ),
                     )
-                    prepared_batch = self._prepare_batch(batch_entries, executor)
+                    pending_futures = self._submit_prepare_batch(first_entries, executor)
+
+                for plan_index, (batch_index, batch_entries) in enumerate(batch_plan):
+                    batch_started_at = monotonic()
+                    prepared_batch = self._collect_prepared_batch(pending_futures or [])
                     existing_by_id = {
                         prepared.spec.id: prepared.existing
                         for prepared in prepared_batch
                     }
+
+                    next_plan_index = plan_index + 1
+                    pending_futures = None
+                    if next_plan_index < len(batch_plan):
+                        next_batch_index, next_batch_entries = batch_plan[next_plan_index]
+                        pending_started_at = monotonic()
+                        self._emit_progress(
+                            progress_callback,
+                            self._make_progress_update(
+                                phase="sync",
+                                message=f"Prefetching batch {next_batch_index}/{total_batches}",
+                                current=completed,
+                                total=total_work,
+                                detail=self._batch_detail(next_batch_entries),
+                                indeterminate=True,
+                                overall_started_at=sync_started_at,
+                                step_started_at=pending_started_at,
+                            ),
+                        )
+                        pending_futures = self._submit_prepare_batch(next_batch_entries, executor)
+
                     self._emit_progress(
                         progress_callback,
                         self._make_progress_update(
@@ -1821,10 +1854,22 @@ class LibraryService:
         entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]],
         executor: ThreadPoolExecutor,
     ) -> list[PreparedSyncItem]:
-        futures: list[Future[PreparedSyncItem]] = [
+        return self._collect_prepared_batch(self._submit_prepare_batch(entries, executor))
+
+    def _submit_prepare_batch(
+        self,
+        entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]],
+        executor: ThreadPoolExecutor,
+    ) -> list[Future[PreparedSyncItem]]:
+        return [
             executor.submit(self._prepare_sync_item, spec, existing, analysis_mode=analysis_mode)
             for _, spec, existing, analysis_mode in entries
         ]
+
+    def _collect_prepared_batch(
+        self,
+        futures: list[Future[PreparedSyncItem]],
+    ) -> list[PreparedSyncItem]:
         return [future.result() for future in futures]
 
     def _prepare_sync_item(

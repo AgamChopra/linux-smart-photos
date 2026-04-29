@@ -4,6 +4,7 @@ from bisect import bisect_left
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
+import os
 from pathlib import Path
 from time import monotonic
 from typing import Callable, Iterator
@@ -22,7 +23,7 @@ except Exception:
 else:
     register_heif_opener()
 
-from PySide6.QtCore import QObject, QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QEvent, QPoint, QRunnable, QRect, QSize, Qt, QThread, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QMovie, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -165,6 +166,37 @@ class PreviewLoadWorker(QObject):
             capture.release()
 
 
+class _ThumbnailLoadSignals(QObject):
+    completed = Signal(str, QImage, int, int)
+    failed = Signal(str, int)
+
+
+class _ThumbnailLoadTask(QRunnable):
+    def __init__(self, item_id: str, thumbnail_path: str, tile_size: int, generation: int) -> None:
+        super().__init__()
+        self.item_id = item_id
+        self.thumbnail_path = thumbnail_path
+        self.tile_size = tile_size
+        self.generation = generation
+        self.signals = _ThumbnailLoadSignals()
+
+    def run(self) -> None:
+        image = QImage(self.thumbnail_path)
+        if image.isNull():
+            self.signals.failed.emit(self.item_id, self.generation)
+            return
+        scaled = image.scaled(
+            self.tile_size,
+            self.tile_size,
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation,
+        )
+        source_x = max(0, (scaled.width() - self.tile_size) // 2)
+        source_y = max(0, (scaled.height() - self.tile_size) // 2)
+        cropped = scaled.copy(source_x, source_y, self.tile_size, self.tile_size)
+        self.signals.completed.emit(self.item_id, cropped, self.tile_size, self.generation)
+
+
 class TimelineViewport(QAbstractScrollArea):
     currentItemChanged = Signal(str)
     selectionChanged = Signal(list)
@@ -177,8 +209,8 @@ class TimelineViewport(QAbstractScrollArea):
     MAX_TILE_SIZE = 240
     TILE_CORNER_RADIUS = 14
     DEFAULT_CACHE_BUDGET_MB = 2048
-    THUMBNAIL_BATCH_SIZE = 18
-    PREFETCH_THUMBNAIL_BATCH_SIZE = 8
+    THUMBNAIL_BATCH_SIZE = 24
+    PREFETCH_THUMBNAIL_BATCH_SIZE = 12
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -201,10 +233,14 @@ class TimelineViewport(QAbstractScrollArea):
         self._thumbnail_cache_budget_bytes = self.DEFAULT_CACHE_BUDGET_MB * 1024 * 1024
         self._thumbnail_queue: deque[str] = deque()
         self._thumbnail_prefetch_queue: deque[str] = deque()
+        self._thumbnail_loading_ids: set[str] = set()
         self._queued_visible_thumbnail_ids: set[str] = set()
         self._queued_prefetch_thumbnail_ids: set[str] = set()
         self._full_thumbnail_prefetch_enabled = False
         self._prefetch_cursor = 0
+        self._thumbnail_generation = 0
+        self._thumbnail_pool = QThreadPool(self)
+        self._thumbnail_pool.setMaxThreadCount(max(2, min(6, os.cpu_count() or 2)))
         self._last_interaction_at = 0.0
         self._placeholder_icon = self.style().standardIcon(QStyle.SP_FileIcon)
         self._thumbnail_timer = QTimer(self)
@@ -228,9 +264,11 @@ class TimelineViewport(QAbstractScrollArea):
         self._request_more_pending = False
         self._thumbnail_queue = deque()
         self._thumbnail_prefetch_queue = deque()
+        self._thumbnail_loading_ids.clear()
         self._queued_visible_thumbnail_ids.clear()
         self._queued_prefetch_thumbnail_ids.clear()
         self._prefetch_cursor = 0
+        self._thumbnail_generation += 1
         self._status_text = status_text
         self.verticalScrollBar().setRange(0, 0)
         self.viewport().update()
@@ -261,9 +299,11 @@ class TimelineViewport(QAbstractScrollArea):
             self._items = list(items)
             self._thumbnail_queue = deque()
             self._thumbnail_prefetch_queue = deque()
+            self._thumbnail_loading_ids.clear()
             self._queued_visible_thumbnail_ids.clear()
             self._queued_prefetch_thumbnail_ids.clear()
             self._prefetch_cursor = 0
+            self._thumbnail_generation += 1
 
         self._item_ids = [item.id for item in self._items]
         self._item_index_by_id = {
@@ -325,9 +365,11 @@ class TimelineViewport(QAbstractScrollArea):
         self._thumbnail_cache_bytes = 0
         self._thumbnail_queue = deque()
         self._thumbnail_prefetch_queue = deque()
+        self._thumbnail_loading_ids.clear()
         self._queued_visible_thumbnail_ids.clear()
         self._queued_prefetch_thumbnail_ids.clear()
         self._prefetch_cursor = 0
+        self._thumbnail_generation += 1
         self._rebuild_layout(scroll_ratio=current_ratio)
         self.zoomChanged.emit(self._zoom_level)
 
@@ -590,6 +632,8 @@ class TimelineViewport(QAbstractScrollArea):
                 break
             if tile.item_id in self._thumbnail_cache or tile.item_id in self._queued_visible_thumbnail_ids:
                 continue
+            if tile.item_id in self._thumbnail_loading_ids:
+                continue
             item = self._items[tile.index]
             if not item.thumbnail_path or not Path(item.thumbnail_path).exists():
                 continue
@@ -607,6 +651,8 @@ class TimelineViewport(QAbstractScrollArea):
             self._prefetch_cursor += 1
             if item.id in self._thumbnail_cache or item.id in self._queued_prefetch_thumbnail_ids:
                 continue
+            if item.id in self._thumbnail_loading_ids:
+                continue
             if not item.thumbnail_path or not Path(item.thumbnail_path).exists():
                 continue
             self._thumbnail_prefetch_queue.append(item.id)
@@ -614,8 +660,19 @@ class TimelineViewport(QAbstractScrollArea):
             queued += 1
 
     def _load_next_thumbnail_batch(self) -> None:
-        loaded_any = False
-        batch_size = self.THUMBNAIL_BATCH_SIZE if self._thumbnail_queue else self.PREFETCH_THUMBNAIL_BATCH_SIZE
+        if not self._thumbnail_queue and self._thumbnail_prefetch_queue and self.is_interacting(idle_seconds=0.35):
+            self._thumbnail_timer.start(35)
+            return
+
+        available_slots = max(0, self._thumbnail_pool.maxThreadCount() - self._thumbnail_pool.activeThreadCount())
+        if available_slots <= 0:
+            self._thumbnail_timer.start(12)
+            return
+
+        batch_size = min(
+            available_slots,
+            self.THUMBNAIL_BATCH_SIZE if self._thumbnail_queue else self.PREFETCH_THUMBNAIL_BATCH_SIZE,
+        )
         for _ in range(batch_size):
             if self._thumbnail_queue:
                 item_id = self._thumbnail_queue.popleft()
@@ -625,17 +682,17 @@ class TimelineViewport(QAbstractScrollArea):
                 self._queued_prefetch_thumbnail_ids.discard(item_id)
             else:
                 break
-            loaded_any = self._load_thumbnail_for_item_id(item_id) or loaded_any
-        if loaded_any:
-            self.viewport().update()
+            self._start_thumbnail_load_for_item_id(item_id)
         if self._full_thumbnail_prefetch_enabled and len(self._thumbnail_prefetch_queue) < self.PREFETCH_THUMBNAIL_BATCH_SIZE:
             self._queue_prefetch_thumbnails()
-        if self._thumbnail_queue or self._thumbnail_prefetch_queue:
+        if self._thumbnail_queue or self._thumbnail_prefetch_queue or self._thumbnail_pool.activeThreadCount() > 0:
             self._thumbnail_timer.start(8 if self._thumbnail_queue else 16)
 
-    def _load_thumbnail_for_item_id(self, item_id: str) -> bool:
+    def _start_thumbnail_load_for_item_id(self, item_id: str) -> bool:
         if item_id in self._thumbnail_cache:
             self._thumbnail_cache.move_to_end(item_id)
+            return False
+        if item_id in self._thumbnail_loading_ids:
             return False
         item_index = self._item_index_by_id.get(item_id)
         if item_index is None:
@@ -644,11 +701,34 @@ class TimelineViewport(QAbstractScrollArea):
         thumbnail_path = Path(item.thumbnail_path)
         if not item.thumbnail_path or not thumbnail_path.exists():
             return False
-        pixmap = self._prepare_tile_pixmap(QPixmap(str(thumbnail_path)))
-        if pixmap.isNull():
-            return False
-        self._store_thumbnail_pixmap(item_id, pixmap)
+        self._thumbnail_loading_ids.add(item_id)
+        task = _ThumbnailLoadTask(
+            item_id,
+            str(thumbnail_path),
+            self._tile_size(),
+            self._thumbnail_generation,
+        )
+        task.signals.completed.connect(self._handle_thumbnail_loaded)
+        task.signals.failed.connect(self._handle_thumbnail_failed)
+        self._thumbnail_pool.start(task)
         return True
+
+    def _handle_thumbnail_loaded(self, item_id: str, image: QImage, tile_size: int, generation: int) -> None:
+        self._thumbnail_loading_ids.discard(item_id)
+        if generation != self._thumbnail_generation or tile_size != self._tile_size():
+            return
+        if item_id not in self._item_index_by_id or image.isNull():
+            return
+        self._store_thumbnail_pixmap(item_id, QPixmap.fromImage(image))
+        self.viewport().update()
+        if self._thumbnail_queue or self._thumbnail_prefetch_queue:
+            self._thumbnail_timer.start(0)
+
+    def _handle_thumbnail_failed(self, item_id: str, generation: int) -> None:
+        if generation == self._thumbnail_generation:
+            self._thumbnail_loading_ids.discard(item_id)
+        if self._thumbnail_queue or self._thumbnail_prefetch_queue:
+            self._thumbnail_timer.start(16)
 
     def _store_thumbnail_pixmap(self, item_id: str, pixmap: QPixmap) -> None:
         previous_cost = self._thumbnail_cache_costs.pop(item_id, 0)
@@ -675,31 +755,6 @@ class TimelineViewport(QAbstractScrollArea):
         start = bisect_left(self._tile_bottoms, y)
         for index in range(start, len(self._tiles)):
             yield self._tiles[index]
-
-    def _prepare_tile_pixmap(self, source: QPixmap) -> QPixmap:
-        if source.isNull():
-            return source
-        tile_size = self._tile_size()
-        scaled = source.scaled(
-            tile_size,
-            tile_size,
-            Qt.KeepAspectRatioByExpanding,
-            Qt.SmoothTransformation,
-        )
-        result = QPixmap(tile_size, tile_size)
-        result.fill(QColor("#ece6db"))
-        painter = QPainter(result)
-        try:
-            source_x = max(0, (scaled.width() - tile_size) // 2)
-            source_y = max(0, (scaled.height() - tile_size) // 2)
-            painter.drawPixmap(
-                QRect(0, 0, tile_size, tile_size),
-                scaled,
-                QRect(source_x, source_y, tile_size, tile_size),
-            )
-        finally:
-            painter.end()
-        return result
 
     def _maybe_request_more(self) -> None:
         if not self._has_more or self._request_more_pending:
