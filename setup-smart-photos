@@ -411,19 +411,26 @@ python3 -m venv "$VENV_DIR"
 
 echo "Installing Python dependencies"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip "setuptools<82" wheel
+"$VENV_DIR/bin/pip" uninstall -y onnxruntime onnxruntime-gpu >/dev/null 2>&1 || true
 if [[ "$selected_compute_mode" == "cpu" ]]; then
-  "$VENV_DIR/bin/pip" uninstall -y onnxruntime-gpu >/dev/null 2>&1 || true
   "$VENV_DIR/bin/pip" install --upgrade --index-url https://download.pytorch.org/whl/cpu torch torchvision
-elif [[ "$selected_compute_mode" == "cuda" ]]; then
-  "$VENV_DIR/bin/pip" uninstall -y onnxruntime >/dev/null 2>&1 || true
+  "$VENV_DIR/bin/pip" install --upgrade --force-reinstall "onnxruntime>=1.20"
+else
+  "$VENV_DIR/bin/pip" install --upgrade --force-reinstall "onnxruntime-gpu[cuda,cudnn]>=1.21"
 fi
 (
   cd "$ROOT_DIR"
   "$VENV_DIR/bin/pip" install -e ".[$ai_extra]"
 )
-if [[ "$selected_compute_mode" == "cpu" ]]; then
-  "$VENV_DIR/bin/pip" uninstall -y onnxruntime-gpu >/dev/null 2>&1 || true
-fi
+"$VENV_DIR/bin/python" - <<'PY'
+import onnxruntime as ort
+
+if not hasattr(ort, "InferenceSession"):
+    raise SystemExit(
+        "The installed onnxruntime package is incomplete. "
+        "Run ./smart-photos --setup --cpu or ./smart-photos --setup --gpu to reinstall it."
+    )
+PY
 
 if [[ -f "$TAURI_DIR/package.json" ]]; then
   if command -v npm >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then

@@ -70,6 +70,14 @@ class HumanFaceBackend:
     ) -> None:
         if ort is None or cv2 is None:
             raise RuntimeError("Human face backend dependencies are unavailable.")
+        if not callable(getattr(ort, "InferenceSession", None)):
+            module_path = getattr(ort, "__file__", "unknown location")
+            raise RuntimeError(
+                "ONNX Runtime import is incomplete: "
+                f"module loaded from {module_path!s} has no InferenceSession. "
+                "Run `./smart-photos --setup --cpu` or `./smart-photos --setup --gpu` "
+                "to reinstall a clean ONNX Runtime package."
+            )
 
         self.detector_session = ort.InferenceSession(str(detector_path), providers=detector_providers)
         self.recognizer_session = ort.InferenceSession(str(recognizer_path), providers=recognizer_providers)

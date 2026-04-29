@@ -1021,6 +1021,15 @@ class VisionAnalyzer:
     def _load_human_face_backend(self):
         if ort is None or cv2 is None or not self.config.face_recognition_enabled:
             return None
+        if not callable(getattr(ort, "InferenceSession", None)):
+            module_path = getattr(ort, "__file__", "unknown location")
+            self.human_face_backend_error = (
+                "ONNX Runtime import is incomplete: "
+                f"module loaded from {module_path!s} has no InferenceSession. "
+                "Run `./smart-photos --setup --cpu` or `./smart-photos --setup --gpu` "
+                "to reinstall a clean ONNX Runtime package."
+            )
+            return None
 
         detector_path = self._resolve_human_face_detector_path(download_missing=self.config.auto_download_models)
         recognizer_path = self._resolve_human_face_recognizer_path(download_missing=self.config.auto_download_models)
