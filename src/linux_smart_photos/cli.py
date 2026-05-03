@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from time import monotonic
 
 from .branding import APP_NAME
 from .config import config_file_path, load_config
@@ -336,6 +338,10 @@ class PlainProgressRenderer:
     def __init__(self, label: str) -> None:
         self.label = label
         self.last_line = ""
+        self.last_width = 0
+        self.last_emit_at = 0.0
+        self.stream = sys.stderr
+        self.overwrite = self.stream.isatty()
 
     def __call__(self, update) -> None:
         detail = format_progress_detail(update)
@@ -345,10 +351,26 @@ class PlainProgressRenderer:
         if detail:
             line += f" | {detail}"
         if line != self.last_line:
-            print(line)
+            now = monotonic()
+            finished = update.total > 0 and update.current >= update.total
+            if not self.overwrite and not finished and now - self.last_emit_at < 0.75:
+                return
+            self.last_emit_at = now
+            if self.overwrite:
+                width = max(20, shutil.get_terminal_size((120, 20)).columns - 1)
+                rendered = line[:width]
+                padding = " " * max(0, self.last_width - len(rendered))
+                self.stream.write(f"\r{rendered}{padding}")
+                self.stream.flush()
+                self.last_width = len(rendered)
+            else:
+                print(line, file=self.stream)
             self.last_line = line
 
     def close(self) -> None:
+        if self.overwrite and self.last_line:
+            self.stream.write("\n")
+            self.stream.flush()
         return
 
 
@@ -375,7 +397,8 @@ class TqdmProgressRenderer:
                 desc=update.message,
                 unit="step",
                 dynamic_ncols=True,
-                leave=True,
+                leave=False,
+                mininterval=0.10,
             )
         self.bar.set_description_str(update.message)
         detail = format_progress_detail(update)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import difflib
@@ -323,7 +323,7 @@ class LibraryService:
         def emit_discovery_progress(path_text: str, scanned_entries: int, discovered_media: int) -> None:
             nonlocal last_discovery_emit_at
             now = monotonic()
-            if now - last_discovery_emit_at < 0.75:
+            if now - last_discovery_emit_at < 0.20:
                 return
             last_discovery_emit_at = now
             self._emit_progress(
@@ -341,6 +341,7 @@ class LibraryService:
         assets = build_asset_specs(
             media_root,
             progress_callback=emit_discovery_progress,
+            progress_interval=128,
         )
         sorted_assets = self._sorted_asset_entries(assets)
         existing_ids = set(self.state.items)
@@ -383,6 +384,31 @@ class LibraryService:
         if removed_ids:
             self._save_progress_items([], removed_item_ids=sorted(removed_ids))
 
+        last_check_emit_at = monotonic()
+        queued_entries = 0
+
+        def emit_check_status(spec: MediaAssetSpec, status: str, *, force: bool = False) -> None:
+            nonlocal last_check_emit_at
+            now = monotonic()
+            if not force and now - last_check_emit_at < 0.20 and not self._should_emit_scan_progress(completed, total_work):
+                return
+            last_check_emit_at = now
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="sync",
+                    message="Checking library for changes",
+                    current=completed,
+                    total=total_work,
+                    detail=(
+                        f"{status}: {spec.relative_key} | "
+                        f"known {completed}/{len(sorted_assets)} | queued {queued_entries}"
+                    ),
+                    overall_started_at=sync_started_at,
+                    step_started_at=discovery_started_at,
+                ),
+            )
+
         for item_id, spec in sorted_assets:
             existing = self.state.items.get(item_id)
             analysis_mode = self._analysis_mode_for_sync_item(
@@ -398,23 +424,18 @@ class LibraryService:
                 and analysis_mode == "none"
             ):
                 completed += 1
-                if self._should_emit_scan_progress(completed, total_work):
-                    self._emit_progress(
-                        progress_callback,
-                        self._make_progress_update(
-                            phase="sync",
-                            message="Scanning library",
-                            current=completed,
-                            total=total_work,
-                            detail=spec.relative_key,
-                            overall_started_at=sync_started_at,
-                        ),
-                    )
+                emit_check_status(spec, "already indexed")
                 continue
 
             if analysis_mode == "none":
                 analysis_mode = "metadata_only"
+            queued_entries += 1
+            status = "adding to catalog" if existing is None else "changed; updating catalog"
+            emit_check_status(spec, status)
             changed_entries.append((item_id, spec, existing, analysis_mode))
+
+        if sorted_assets:
+            emit_check_status(sorted_assets[-1][1], "change scan complete", force=True)
 
         if changed_entries:
             batch_added, batch_updated, completed = self._run_sync_analysis_pipeline(
@@ -617,7 +638,16 @@ class LibraryService:
                         ),
                     )
                     futures = self._submit_prepare_batch(batch.entries, executor)
-                    prepared_items = self._collect_prepared_batch(futures)
+                    prepared_items = self._collect_prepared_batch_with_progress(
+                        batch,
+                        futures,
+                        progress_callback=progress_callback,
+                        progress_state=progress_state,
+                        progress_lock=progress_lock,
+                        total_work=total_work,
+                        sync_started_at=sync_started_at,
+                        batch_started_at=batch_started_at,
+                    )
                     prepared_batch = PreparedBatch(
                         batch=batch,
                         items=prepared_items,
@@ -630,6 +660,54 @@ class LibraryService:
         finally:
             if not stop_event.is_set():
                 self._put_sync_pipeline_message(prepared_queue, _SYNC_PIPELINE_STOP, stop_event)
+
+    def _collect_prepared_batch_with_progress(
+        self,
+        batch: SyncBatch,
+        futures: list[Future[PreparedSyncItem]],
+        *,
+        progress_callback: Callable[[ProgressUpdate], None] | None,
+        progress_state: dict[str, int],
+        progress_lock: Lock,
+        total_work: int,
+        sync_started_at: float,
+        batch_started_at: float,
+    ) -> list[PreparedSyncItem]:
+        if not futures:
+            return []
+
+        prepared_items: list[PreparedSyncItem | None] = [None] * len(futures)
+        future_indexes = {future: index for index, future in enumerate(futures)}
+        last_emit_at = batch_started_at
+        for done_count, future in enumerate(as_completed(futures), start=1):
+            item_index = future_indexes[future]
+            prepared = future.result()
+            prepared_items[item_index] = prepared
+            now = monotonic()
+            if (
+                progress_callback is not None
+                and (done_count == 1 or done_count == len(futures) or now - last_emit_at >= 0.20)
+            ):
+                last_emit_at = now
+                self._emit_progress(
+                    progress_callback,
+                    self._make_progress_update(
+                        phase="sync",
+                        message=f"Preparing thumbnails batch {batch.index}/{batch.total}",
+                        current=self._sync_pipeline_completed(progress_state, progress_lock),
+                        total=total_work,
+                        detail=(
+                            f"{done_count}/{len(futures)} ready | "
+                            f"{prepared.spec.relative_key} | "
+                            f"{'adding' if prepared.existing is None else 'updating'}"
+                        ),
+                        indeterminate=True,
+                        overall_started_at=sync_started_at,
+                        step_started_at=batch_started_at,
+                    ),
+                )
+
+        return [self._require_prepared_sync_item(item) for item in prepared_items]
 
     def _sync_analyze_worker(
         self,
@@ -790,6 +868,11 @@ class LibraryService:
     def _sync_pipeline_completed(self, progress_state: dict[str, int], progress_lock: Lock) -> int:
         with progress_lock:
             return progress_state["completed"]
+
+    def _require_prepared_sync_item(self, item: PreparedSyncItem | None) -> PreparedSyncItem:
+        if item is None:
+            raise RuntimeError("Missing prepared media item.")
+        return item
 
     def save(self) -> None:
         self.state.updated_at = utc_now()
