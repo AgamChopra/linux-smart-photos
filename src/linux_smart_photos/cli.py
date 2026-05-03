@@ -1,11 +1,38 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import subprocess
+import sys
 from pathlib import Path
 
 from .branding import APP_NAME
 from .config import config_file_path, load_config
 from .migration import migrate_configured_library
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - exercised when tqdm is unavailable.
+    tqdm = None
+
+
+def ensure_tqdm_available() -> bool:
+    global tqdm
+    if tqdm is not None:
+        return True
+    print("tqdm is not installed; installing it for CLI progress bars...", file=sys.stderr)
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "tqdm>=4.66"],
+            stdout=subprocess.DEVNULL,
+        )
+        module = importlib.import_module("tqdm")
+        tqdm = module.tqdm
+        return True
+    except Exception as exc:
+        print(f"Unable to auto-install tqdm: {exc}", file=sys.stderr)
+        print("Continuing with plain progress output.", file=sys.stderr)
+        return False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +56,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Print the sync summary as JSON-like lines.",
+    )
+    sync_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Run all sync stages with yes answers and no prompts.",
+    )
+    sync_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Print plain status lines instead of progress bars.",
     )
 
     search_parser = subparsers.add_parser("search", help="Search the indexed library.")
@@ -80,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     if command == "status":
         return run_status(service, args.config)
     if command == "sync":
-        return run_sync(service, json_output=bool(args.json))
+        return run_sync(service, args)
     if command == "search":
         return run_search(service, args)
     if command == "models":
@@ -106,17 +144,286 @@ def run_status(service: LibraryService, config_override: Path | None) -> int:
     return 0
 
 
-def run_sync(service: LibraryService, json_output: bool = False) -> int:
-    summary = service.sync()
-    if json_output:
+def run_sync(service: LibraryService, args: argparse.Namespace) -> int:
+    if bool(args.json):
+        summary = service.sync()
         print("{")
         print(f'  "added": {summary.added},')
         print(f'  "updated": {summary.updated},')
         print(f'  "removed": {summary.removed}')
         print("}")
+        return 0
+
+    if bool(args.yes):
+        choices = SyncCliChoices(
+            scan_library=True,
+            apply_ai=True,
+            detect_objects=True,
+            detect_people=True,
+            detect_pets=True,
+            cluster_unassigned=True,
+        )
+    elif sys.stdin.isatty():
+        choices = prompt_sync_choices()
     else:
-        print(f"Sync complete: added={summary.added} updated={summary.updated} removed={summary.removed}")
+        choices = SyncCliChoices(
+            scan_library=True,
+            apply_ai=True,
+            detect_objects=True,
+            detect_people=True,
+            detect_pets=False,
+            cluster_unassigned=True,
+        )
+
+    if not any((choices.scan_library, choices.apply_ai, choices.cluster_unassigned)):
+        print("No sync stages selected.")
+        return 0
+
+    progress_factory = PlainProgressRenderer
+    if not bool(args.no_progress) and ensure_tqdm_available():
+        progress_factory = TqdmProgressRenderer
+    stage_results: list[tuple[str, object]] = []
+
+    if choices.scan_library:
+        print_stage_header("1. Scanning library and generating thumbnails")
+        renderer = progress_factory("scan")
+        summary = service.sync(
+            progress_callback=renderer,
+            include_pets=False,
+            detect_objects=False,
+            detect_people=False,
+            scan_only=True,
+        )
+        renderer.close()
+        stage_results.append(("scan", summary))
+        print(f"Scan complete: added={summary.added} updated={summary.updated} removed={summary.removed}")
+
+    if choices.apply_ai:
+        print_stage_header("2. Applying AI detections")
+        details = []
+        if choices.detect_objects:
+            details.append("objects")
+        if choices.detect_people:
+            details.append("people")
+        if choices.detect_pets:
+            details.append("pets")
+        print(f"Detection targets: {', '.join(details) if details else 'none'}")
+        if details:
+            renderer = progress_factory("ai")
+            summary = service.sync(
+                progress_callback=renderer,
+                include_pets=choices.detect_pets,
+                detect_objects=choices.detect_objects,
+                detect_people=choices.detect_people,
+                scan_only=False,
+            )
+            renderer.close()
+            stage_results.append(("ai", summary))
+            print(f"AI detection complete: added={summary.added} updated={summary.updated} removed={summary.removed}")
+        else:
+            print("Skipped AI detection because no detection targets were selected.")
+
+    if choices.cluster_unassigned:
+        print_stage_header("3. Clustering unassigned detections")
+        renderer = progress_factory("clusters")
+        assigned = service.assign_unclustered_detections_to_known_personas(
+            include_pets=choices.detect_pets,
+            progress_callback=renderer,
+        )
+        service.rebuild_unknown_cluster_caches(
+            partial=False,
+            include_pets=choices.detect_pets,
+            progress_callback=renderer,
+        )
+        renderer.close()
+        person_clusters = service.list_unknown_persona_clusters(kind="person")
+        pet_clusters = service.list_unknown_persona_clusters(kind="pet") if choices.detect_pets else []
+        stage_results.append((
+            "clusters",
+            {"known_assigned": assigned, "person": len(person_clusters), "pet": len(pet_clusters)},
+        ))
+        print(
+            "Cluster scan complete: "
+            f"known_assigned={assigned} "
+            f"person_clusters={len(person_clusters)} pet_clusters={len(pet_clusters)}"
+        )
+
+    print_stage_header("Summary")
+    for stage_name, result in stage_results:
+        if hasattr(result, "added"):
+            print(
+                f"{stage_name}: "
+                f"added={result.added} updated={result.updated} removed={result.removed}"
+            )
+        else:
+            print(f"{stage_name}: {result}")
     return 0
+
+
+class SyncCliChoices:
+    def __init__(
+        self,
+        *,
+        scan_library: bool,
+        apply_ai: bool,
+        detect_objects: bool,
+        detect_people: bool,
+        detect_pets: bool,
+        cluster_unassigned: bool,
+    ) -> None:
+        self.scan_library = scan_library
+        self.apply_ai = apply_ai
+        self.detect_objects = detect_objects
+        self.detect_people = detect_people
+        self.detect_pets = detect_pets
+        self.cluster_unassigned = cluster_unassigned
+
+
+def prompt_sync_choices() -> SyncCliChoices:
+    print(APP_NAME)
+    print("Interactive CLI sync")
+    scan_library = prompt_yes_no(
+        "1) Scan library for new/changed photos and generate thumbnails?",
+        default=True,
+    )
+    apply_ai = prompt_yes_no(
+        "2) Apply object/person/pet detection after scanning?",
+        default=True,
+    )
+    detect_objects = False
+    detect_people = False
+    detect_pets = False
+    if apply_ai:
+        detect_objects = prompt_yes_no("   Detect objects?", default=True)
+        detect_people = prompt_yes_no("   Detect people/faces?", default=True)
+        detect_pets = prompt_yes_no("   Detect pets? This is slower and optional.", default=False)
+        if not any((detect_objects, detect_people, detect_pets)):
+            apply_ai = False
+    cluster_unassigned = prompt_yes_no(
+        "3) Add unassigned detections to known/unknown clusters?",
+        default=apply_ai or scan_library,
+    )
+    return SyncCliChoices(
+        scan_library=scan_library,
+        apply_ai=apply_ai,
+        detect_objects=detect_objects,
+        detect_people=detect_people,
+        detect_pets=detect_pets,
+        cluster_unassigned=cluster_unassigned,
+    )
+
+
+def prompt_yes_no(question: str, *, default: bool) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{question} {suffix} ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def print_stage_header(title: str) -> None:
+    print()
+    print(title)
+    print("-" * len(title))
+
+
+class PlainProgressRenderer:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.last_line = ""
+
+    def __call__(self, update) -> None:
+        detail = format_progress_detail(update)
+        line = f"{update.message}"
+        if update.total > 0:
+            line += f" [{update.current}/{update.total}]"
+        if detail:
+            line += f" | {detail}"
+        if line != self.last_line:
+            print(line)
+            self.last_line = line
+
+    def close(self) -> None:
+        return
+
+
+class TqdmProgressRenderer:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.bar = None
+        self.phase = ""
+        self.total: int | None = None
+        self.plain = PlainProgressRenderer(label) if tqdm is None else None
+
+    def __call__(self, update) -> None:
+        total = update.total if update.total > 0 else None
+        if tqdm is None:
+            if self.plain is not None:
+                self.plain(update)
+            return
+        if self.bar is None or self.phase != update.phase or self.total != total:
+            self.close()
+            self.phase = update.phase
+            self.total = total
+            self.bar = tqdm(
+                total=total,
+                desc=update.message,
+                unit="step",
+                dynamic_ncols=True,
+                leave=True,
+            )
+        self.bar.set_description_str(update.message)
+        detail = format_progress_detail(update)
+        if detail:
+            self.bar.set_postfix_str(detail[:180])
+        if total is None:
+            self.bar.update(1)
+        else:
+            target = max(0, min(update.current, total))
+            if target >= self.bar.n:
+                self.bar.update(target - self.bar.n)
+            else:
+                self.bar.n = target
+                self.bar.refresh()
+
+    def close(self) -> None:
+        if self.plain is not None:
+            self.plain.close()
+        if self.bar is not None:
+            self.bar.close()
+            self.bar = None
+
+
+def format_progress_detail(update) -> str:
+    parts: list[str] = []
+    if update.detail:
+        parts.append(str(update.detail))
+    timing = []
+    if update.elapsed_seconds is not None:
+        timing.append(f"elapsed {format_duration(update.elapsed_seconds)}")
+    if update.step_seconds is not None:
+        timing.append(f"step {format_duration(update.step_seconds)}")
+    if update.eta_seconds is not None:
+        timing.append(f"eta {format_duration(update.eta_seconds)}")
+    if timing:
+        parts.append(", ".join(timing))
+    return " | ".join(parts)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def run_search(service: LibraryService, args: argparse.Namespace) -> int:

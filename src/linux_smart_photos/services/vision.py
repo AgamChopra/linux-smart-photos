@@ -196,8 +196,31 @@ class VisionAnalyzer:
     def _empty_analysis(self) -> AnalysisResult:
         return AnalysisResult(tags=[], detections=[], metadata={})
 
+    def _include_people_for_analysis_mode(self, analysis_mode: str) -> bool:
+        return analysis_mode in {
+            "full",
+            "full_no_pets",
+            "human_faces_only",
+            "human_faces_pets",
+            "objects_people",
+        }
+
+    def _include_objects_for_analysis_mode(self, analysis_mode: str) -> bool:
+        return analysis_mode in {
+            "full",
+            "full_no_pets",
+            "objects_only",
+            "objects_people",
+            "objects_pets",
+        }
+
     def _include_pets_for_analysis_mode(self, analysis_mode: str) -> bool:
-        return self.config.pet_recognition_enabled and analysis_mode not in {"human_faces_only", "full_no_pets"}
+        return self.config.pet_recognition_enabled and analysis_mode in {
+            "full",
+            "pets_only",
+            "objects_pets",
+            "human_faces_pets",
+        }
 
     def _ensure_pet_models_loaded(self) -> None:
         if self._pet_models_loaded:
@@ -218,20 +241,40 @@ class VisionAnalyzer:
         tags: set[str] = set()
         detections: list[DetectionRegion] = []
 
-        human_face_detections = self._detect_human_faces(image)
+        include_people = self._include_people_for_analysis_mode(analysis_mode)
+        include_objects = self._include_objects_for_analysis_mode(analysis_mode)
+        include_pets = self._include_pets_for_analysis_mode(analysis_mode)
+
+        if analysis_mode == "metadata_only":
+            return AnalysisResult(
+                tags=[],
+                detections=[],
+                metadata=self._analysis_metadata(
+                    image,
+                    include_people=False,
+                    include_objects=False,
+                    include_pets=False,
+                ),
+            )
+
+        human_face_detections = self._detect_human_faces(image) if include_people else []
         if human_face_detections:
             tags.update({"face", "person"})
             detections.extend(human_face_detections)
 
-        include_pets = self._include_pets_for_analysis_mode(analysis_mode)
         if analysis_mode == "human_faces_only":
             return AnalysisResult(
                 tags=sorted(tags),
                 detections=detections,
-                metadata=self._analysis_metadata(image, include_pets=include_pets),
+                metadata=self._analysis_metadata(
+                    image,
+                    include_people=include_people,
+                    include_objects=False,
+                    include_pets=include_pets,
+                ),
             )
 
-        object_detections, object_tags = self._detect_objects(image)
+        object_detections, object_tags = self._detect_objects(image) if include_objects or include_pets else ([], set())
         pet_detections: list[DetectionRegion] = []
         pet_tags: set[str] = set()
         if include_pets:
@@ -243,14 +286,20 @@ class VisionAnalyzer:
             if detection.label.lower() not in PET_LABELS
         ]
         detections.extend(pet_detections)
-        detections.extend(non_pet_object_detections)
-        tags.update(object_tags - PET_LABELS)
+        if include_objects:
+            detections.extend(non_pet_object_detections)
+            tags.update(object_tags - PET_LABELS)
         tags.update(pet_tags)
 
         return AnalysisResult(
             tags=sorted(tags),
             detections=detections,
-            metadata=self._analysis_metadata(image, include_pets=include_pets),
+            metadata=self._analysis_metadata(
+                image,
+                include_people=include_people,
+                include_objects=include_objects,
+                include_pets=include_pets,
+            ),
         )
 
     def _merge_analysis_results(self, left: AnalysisResult, right: AnalysisResult) -> AnalysisResult:
@@ -262,33 +311,80 @@ class VisionAnalyzer:
             metadata=left.metadata | right.metadata,
         )
 
-    def _analysis_metadata(self, image: Image.Image, *, include_pets: bool | None = None) -> dict[str, Any]:
+    def _analysis_metadata(
+        self,
+        image: Image.Image,
+        *,
+        include_people: bool | None = None,
+        include_objects: bool | None = None,
+        include_pets: bool | None = None,
+    ) -> dict[str, Any]:
+        human_face_analysis_enabled = bool(include_people and self.human_face_backend)
+        object_analysis_enabled = bool(include_objects and self.object_model)
         pet_analysis_enabled = bool(include_pets)
         return {
             "analyzed_width": image.size[0],
             "analyzed_height": image.size[1],
             "compute_mode": self._compute_mode(),
+            "human_face_analysis_enabled": human_face_analysis_enabled,
             "human_face_model": (
                 f"{self.human_face_detector_name}+{self.human_face_recognizer_name}"
-                if self.human_face_backend
+                if human_face_analysis_enabled and self.human_face_backend
                 else ""
             ),
-            "human_face_pipeline": self.human_face_pipeline_id if self.human_face_backend else "",
-            "human_face_providers": list(self.human_face_providers),
-            "human_face_device": self.human_face_device_label if self.human_face_backend else "",
-            "human_face_detector_providers": list(self.human_face_detector_providers),
-            "human_face_recognizer_providers": list(self.human_face_recognizer_providers),
-            "human_face_detector_device": self.human_face_detector_device_label if self.human_face_backend else "",
-            "human_face_recognizer_device": self.human_face_recognizer_device_label if self.human_face_backend else "",
-            "human_face_detector_model": self.human_face_detector_name if self.human_face_backend else "",
-            "human_face_recognizer_model": self.human_face_recognizer_name if self.human_face_backend else "",
-            "human_face_backend_error": self.human_face_backend_error,
-            "object_model": self.config.object_model_id if self.object_model else "",
-            "object_device": self._yolo_device_label() if self.object_model else "",
-            "pet_face_model": self.config.pet_detector_model_id if self.pet_face_model else "",
-            "pet_face_device": self._yolo_device_label() if self.pet_face_model else "",
-            "pet_embedding_model": self.config.pet_embedding_model_id if self.pet_embedding_model else "",
-            "pet_embedding_device": getattr(self.pet_embedding_model, "device", ""),
+            "human_face_pipeline": (
+                self.human_face_pipeline_id
+                if human_face_analysis_enabled and self.human_face_backend
+                else ""
+            ),
+            "human_face_providers": list(self.human_face_providers) if human_face_analysis_enabled else [],
+            "human_face_device": (
+                self.human_face_device_label
+                if human_face_analysis_enabled and self.human_face_backend
+                else ""
+            ),
+            "human_face_detector_providers": (
+                list(self.human_face_detector_providers)
+                if human_face_analysis_enabled
+                else []
+            ),
+            "human_face_recognizer_providers": (
+                list(self.human_face_recognizer_providers)
+                if human_face_analysis_enabled
+                else []
+            ),
+            "human_face_detector_device": (
+                self.human_face_detector_device_label
+                if human_face_analysis_enabled and self.human_face_backend
+                else ""
+            ),
+            "human_face_recognizer_device": (
+                self.human_face_recognizer_device_label
+                if human_face_analysis_enabled and self.human_face_backend
+                else ""
+            ),
+            "human_face_detector_model": (
+                self.human_face_detector_name
+                if human_face_analysis_enabled and self.human_face_backend
+                else ""
+            ),
+            "human_face_recognizer_model": (
+                self.human_face_recognizer_name
+                if human_face_analysis_enabled and self.human_face_backend
+                else ""
+            ),
+            "human_face_backend_error": self.human_face_backend_error if human_face_analysis_enabled else "",
+            "object_analysis_enabled": object_analysis_enabled,
+            "object_model": self.config.object_model_id if object_analysis_enabled and self.object_model else "",
+            "object_device": self._yolo_device_label() if object_analysis_enabled and self.object_model else "",
+            "pet_face_model": self.config.pet_detector_model_id if pet_analysis_enabled and self.pet_face_model else "",
+            "pet_face_device": self._yolo_device_label() if pet_analysis_enabled and self.pet_face_model else "",
+            "pet_embedding_model": (
+                self.config.pet_embedding_model_id
+                if pet_analysis_enabled and self.pet_embedding_model
+                else ""
+            ),
+            "pet_embedding_device": getattr(self.pet_embedding_model, "device", "") if pet_analysis_enabled else "",
             "pet_analysis_enabled": pet_analysis_enabled,
             "cat_face_fallback": bool(self.cat_face_detector),
         }
@@ -498,16 +594,26 @@ class VisionAnalyzer:
         if not units:
             return []
 
+        include_people = self._include_people_for_analysis_mode(analysis_mode)
+        include_objects = self._include_objects_for_analysis_mode(analysis_mode)
         include_pets = self._include_pets_for_analysis_mode(analysis_mode)
         if include_pets:
             self._ensure_pet_models_loaded()
 
         images = [unit.image for unit in units]
-        human_face_batches = self._detect_human_faces_batch(images)
-        object_batches = self._detect_objects_batch(images) if analysis_mode != "human_faces_only" else []
+        human_face_batches = (
+            self._detect_human_faces_batch(images)
+            if include_people
+            else [[] for _ in images]
+        )
+        object_batches = (
+            self._detect_objects_batch(images)
+            if include_objects or include_pets
+            else [([], set()) for _ in images]
+        )
         pet_face_batches = (
             self._detect_pet_face_candidates_batch(images)
-            if analysis_mode != "human_faces_only" and include_pets
+            if include_pets
             else []
         )
         results: list[AnalysisResult] = []
@@ -523,12 +629,32 @@ class VisionAnalyzer:
                 tags.update({"face", "person"})
                 detections.extend(human_face_detections)
 
+            if analysis_mode == "metadata_only":
+                results.append(
+                    AnalysisResult(
+                        tags=[],
+                        detections=[],
+                        metadata=self._analysis_metadata(
+                            image,
+                            include_people=False,
+                            include_objects=False,
+                            include_pets=False,
+                        ),
+                    )
+                )
+                continue
+
             if analysis_mode == "human_faces_only":
                 results.append(
                     AnalysisResult(
                         tags=sorted(tags),
                         detections=detections,
-                        metadata=self._analysis_metadata(image, include_pets=include_pets),
+                        metadata=self._analysis_metadata(
+                            image,
+                            include_people=include_people,
+                            include_objects=False,
+                            include_pets=include_pets,
+                        ),
                     )
                 )
                 continue
@@ -553,18 +679,24 @@ class VisionAnalyzer:
                 if detection.label.lower() not in PET_LABELS
             ]
             detections.extend(pet_detections)
-            detections.extend(non_pet_object_detections)
-            tags.update(object_tags - PET_LABELS)
+            if include_objects:
+                detections.extend(non_pet_object_detections)
+                tags.update(object_tags - PET_LABELS)
             tags.update(pet_tags)
             results.append(
                 AnalysisResult(
                     tags=sorted(tags),
                     detections=detections,
-                    metadata=self._analysis_metadata(image, include_pets=include_pets),
+                    metadata=self._analysis_metadata(
+                        image,
+                        include_people=include_people,
+                        include_objects=include_objects,
+                        include_pets=include_pets,
+                    ),
                 )
             )
 
-        if analysis_mode == "human_faces_only" or not include_pets:
+        if analysis_mode in {"metadata_only", "human_faces_only"} or not include_pets:
             return results
 
         embeddings = self._embed_pet_crops_batch([crop for _, crop in pet_embedding_requests])
@@ -587,6 +719,8 @@ class VisionAnalyzer:
         metadata = (
             self._analysis_metadata(
                 analyzed_video_image,
+                include_people=self._include_people_for_analysis_mode(analysis_mode),
+                include_objects=self._include_objects_for_analysis_mode(analysis_mode),
                 include_pets=self._include_pets_for_analysis_mode(analysis_mode),
             )
             if analyzed_video_image is not None

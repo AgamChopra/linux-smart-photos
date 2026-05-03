@@ -24,6 +24,7 @@ dependencies = [
   "imagehash>=4.3",
   "rapidfuzz>=3.9",
   "python-dateutil>=2.9",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

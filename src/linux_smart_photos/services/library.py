@@ -9,10 +9,11 @@ from itertools import combinations
 import math
 import os
 from pathlib import Path
+from queue import Empty, Full, Queue
 import re
-from threading import Lock
+from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 try:
     import cv2
@@ -63,6 +64,20 @@ UNKNOWN_CLUSTER_SIGNATURE_MERGE_SLACK = 2.0
 SCAN_PROGRESS_EMIT_INTERVAL = 48
 SEARCH_CANDIDATE_LIMIT = 600
 CLUSTER_DIRTY_CHUNK_SIZE = 512
+SYNC_PREPARED_QUEUE_DEPTH = 2
+SYNC_ANALYZED_QUEUE_DEPTH = 2
+_SYNC_PIPELINE_STOP = object()
+SYNC_ANALYSIS_MODES = (
+    "metadata_only",
+    "full",
+    "full_no_pets",
+    "human_faces_only",
+    "objects_only",
+    "pets_only",
+    "objects_people",
+    "objects_pets",
+    "human_faces_pets",
+)
 
 
 @dataclass(slots=True)
@@ -104,6 +119,28 @@ class PreparedSyncItem:
     still_image: Image.Image | None
     video_frames: list[VideoFrameSample]
     video_metadata: dict[str, object]
+
+
+@dataclass(slots=True)
+class SyncBatch:
+    index: int
+    total: int
+    entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]]
+
+
+@dataclass(slots=True)
+class PreparedBatch:
+    batch: SyncBatch
+    items: list[PreparedSyncItem]
+    prepared_at: float
+
+
+@dataclass(slots=True)
+class AnalyzedBatch:
+    batch: SyncBatch
+    prepared_items: list[PreparedSyncItem]
+    analyses: list[AnalysisResult]
+    analyzed_at: float
 
 
 @dataclass(slots=True)
@@ -220,8 +257,18 @@ class LibraryService:
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
         *,
         include_pets: bool = True,
+        detect_objects: bool | None = None,
+        detect_people: bool | None = None,
+        scan_only: bool = False,
     ) -> SyncSummary:
         self._ensure_state_loaded()
+        requested_objects = bool(self.config.object_detection_enabled if detect_objects is None else detect_objects)
+        requested_people = bool(self.config.face_recognition_enabled if detect_people is None else detect_people)
+        requested_pets = bool(include_pets and self.config.pet_recognition_enabled)
+        if scan_only:
+            requested_objects = False
+            requested_people = False
+            requested_pets = False
         sync_started_at = monotonic()
         discovery_started_at = monotonic()
         media_root = self.config.media_root_path
@@ -338,18 +385,17 @@ class LibraryService:
 
         for item_id, spec in sorted_assets:
             existing = self.state.items.get(item_id)
-            reanalysis_mode = self._reanalysis_mode(existing)
-            needs_pet_analysis = (
-                include_pets
-                and existing is not None
-                and existing.file_signature == spec.file_signature
-                and not bool(existing.metadata.get("pet_analysis_enabled", False))
+            analysis_mode = self._analysis_mode_for_sync_item(
+                existing,
+                spec,
+                detect_objects=requested_objects,
+                detect_people=requested_people,
+                detect_pets=requested_pets,
             )
             if (
                 existing
                 and existing.file_signature == spec.file_signature
-                and reanalysis_mode == "none"
-                and not needs_pet_analysis
+                and analysis_mode == "none"
             ):
                 completed += 1
                 if self._should_emit_scan_progress(completed, total_work):
@@ -366,139 +412,20 @@ class LibraryService:
                     )
                 continue
 
-            analysis_mode = "full"
-            if not include_pets:
-                analysis_mode = "full_no_pets"
-            if (
-                existing
-                and existing.file_signature == spec.file_signature
-                and reanalysis_mode == "human_faces_only"
-                and not needs_pet_analysis
-            ):
-                analysis_mode = "human_faces_only"
+            if analysis_mode == "none":
+                analysis_mode = "metadata_only"
             changed_entries.append((item_id, spec, existing, analysis_mode))
 
         if changed_entries:
-            self._emit_progress(
-                progress_callback,
-                self._make_progress_update(
-                    phase="sync",
-                    message="Initializing AI backends",
-                    current=completed,
-                    total=total_work,
-                    detail="Preparing models for batched analysis",
-                    indeterminate=True,
-                    overall_started_at=sync_started_at,
-                ),
+            batch_added, batch_updated, completed = self._run_sync_analysis_pipeline(
+                changed_entries,
+                progress_callback=progress_callback,
+                completed=completed,
+                total_work=total_work,
+                sync_started_at=sync_started_at,
             )
-            _ = self.vision
-            batch_size = self._scan_batch_size()
-            max_workers = min(self._prefetch_workers(), max(1, batch_size), len(changed_entries))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                total_batches = (len(changed_entries) + batch_size - 1) // batch_size
-                batch_plan = [
-                    (
-                        batch_index,
-                        changed_entries[batch_start : batch_start + batch_size],
-                    )
-                    for batch_index, batch_start in enumerate(range(0, len(changed_entries), batch_size), start=1)
-                ]
-                pending_futures: list[Future[PreparedSyncItem]] | None = None
-                pending_started_at = monotonic()
-                if batch_plan:
-                    first_index, first_entries = batch_plan[0]
-                    self._emit_progress(
-                        progress_callback,
-                        self._make_progress_update(
-                            phase="sync",
-                            message=f"Prefetching batch {first_index}/{total_batches}",
-                            current=completed,
-                            total=total_work,
-                            detail=self._batch_detail(first_entries),
-                            indeterminate=True,
-                            overall_started_at=sync_started_at,
-                            step_started_at=pending_started_at,
-                        ),
-                    )
-                    pending_futures = self._submit_prepare_batch(first_entries, executor)
-
-                for plan_index, (batch_index, batch_entries) in enumerate(batch_plan):
-                    batch_started_at = monotonic()
-                    prepared_batch = self._collect_prepared_batch(pending_futures or [])
-                    existing_by_id = {
-                        prepared.spec.id: prepared.existing
-                        for prepared in prepared_batch
-                    }
-
-                    next_plan_index = plan_index + 1
-                    pending_futures = None
-                    if next_plan_index < len(batch_plan):
-                        next_batch_index, next_batch_entries = batch_plan[next_plan_index]
-                        pending_started_at = monotonic()
-                        self._emit_progress(
-                            progress_callback,
-                            self._make_progress_update(
-                                phase="sync",
-                                message=f"Prefetching batch {next_batch_index}/{total_batches}",
-                                current=completed,
-                                total=total_work,
-                                detail=self._batch_detail(next_batch_entries),
-                                indeterminate=True,
-                                overall_started_at=sync_started_at,
-                                step_started_at=pending_started_at,
-                            ),
-                        )
-                        pending_futures = self._submit_prepare_batch(next_batch_entries, executor)
-
-                    self._emit_progress(
-                        progress_callback,
-                        self._make_progress_update(
-                            phase="sync",
-                            message=f"Running AI batch {batch_index}/{total_batches}",
-                            current=completed,
-                            total=total_work,
-                            detail=f"{len(prepared_batch)} items",
-                            indeterminate=True,
-                            overall_started_at=sync_started_at,
-                            step_started_at=batch_started_at,
-                        ),
-                    )
-                    built_items = self._build_items_batch(prepared_batch)
-                    for item in built_items:
-                        self.state.items[item.id] = item
-                        source_existing = existing_by_id.get(item.id)
-                        if source_existing is None:
-                            added += 1
-                        else:
-                            updated += 1
-                    completed += len(built_items)
-                    if built_items:
-                        self._emit_progress(
-                            progress_callback,
-                            self._make_progress_update(
-                                phase="sync",
-                                message=f"Indexed batch {batch_index}/{total_batches}",
-                                current=completed,
-                                total=total_work,
-                                detail=self._batch_detail(batch_entries),
-                                overall_started_at=sync_started_at,
-                                step_started_at=batch_started_at,
-                            ),
-                        )
-                        self._save_progress_items(built_items)
-                        self._emit_progress(
-                            progress_callback,
-                            self._make_progress_update(
-                                phase="sync",
-                                message=f"Updated live view for batch {batch_index}/{total_batches}",
-                                current=completed,
-                                total=total_work,
-                                detail=f"{len(self.state.items)} indexed items",
-                                snapshot_ready=True,
-                                overall_started_at=sync_started_at,
-                                step_started_at=batch_started_at,
-                            ),
-                        )
+            added += batch_added
+            updated += batch_updated
 
         completed += 1
         self._emit_progress(
@@ -527,6 +454,342 @@ class LibraryService:
             ),
         )
         return SyncSummary(added=added, updated=updated, removed=len(removed_ids))
+
+    def _run_sync_analysis_pipeline(
+        self,
+        changed_entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]],
+        *,
+        progress_callback: Callable[[ProgressUpdate], None] | None,
+        completed: int,
+        total_work: int,
+        sync_started_at: float,
+    ) -> tuple[int, int, int]:
+        requires_ai = any(entry[3] != "metadata_only" for entry in changed_entries)
+        self._emit_progress(
+            progress_callback,
+            self._make_progress_update(
+                phase="sync",
+                message="Initializing AI backends" if requires_ai else "Preparing scan pipeline",
+                current=completed,
+                total=total_work,
+                detail=(
+                    "Preparing models for batched analysis"
+                    if requires_ai
+                    else "Preparing metadata and thumbnails without AI analysis"
+                ),
+                indeterminate=True,
+                overall_started_at=sync_started_at,
+            ),
+        )
+        if requires_ai:
+            _ = self.vision
+
+        batch_size = self._scan_batch_size()
+        total_batches = (len(changed_entries) + batch_size - 1) // batch_size
+        batches = [
+            SyncBatch(
+                index=batch_index,
+                total=total_batches,
+                entries=changed_entries[batch_start : batch_start + batch_size],
+            )
+            for batch_index, batch_start in enumerate(range(0, len(changed_entries), batch_size), start=1)
+        ]
+        if not batches:
+            return 0, 0, completed
+
+        prepared_queue: Queue[PreparedBatch | object] = Queue(maxsize=SYNC_PREPARED_QUEUE_DEPTH)
+        analyzed_queue: Queue[AnalyzedBatch | object] = Queue(maxsize=SYNC_ANALYZED_QUEUE_DEPTH)
+        error_queue: Queue[BaseException] = Queue()
+        stop_event = Event()
+        progress_lock = Lock()
+        progress_state = {"completed": completed}
+        prepare_workers = self._prefetch_workers()
+
+        prepare_thread = Thread(
+            target=self._sync_prepare_worker,
+            name="lsp-sync-prepare",
+            args=(
+                batches,
+                prepared_queue,
+                error_queue,
+                stop_event,
+                prepare_workers,
+                progress_callback,
+                progress_state,
+                progress_lock,
+                total_work,
+                sync_started_at,
+            ),
+            daemon=True,
+        )
+        analyze_thread = Thread(
+            target=self._sync_analyze_worker,
+            name="lsp-sync-analyze",
+            args=(
+                prepared_queue,
+                analyzed_queue,
+                error_queue,
+                stop_event,
+                progress_callback,
+                progress_state,
+                progress_lock,
+                total_work,
+                sync_started_at,
+            ),
+            daemon=True,
+        )
+
+        added = 0
+        updated = 0
+        pipeline_error: BaseException | None = None
+        prepare_thread.start()
+        analyze_thread.start()
+        try:
+            while True:
+                pipeline_error = self._sync_pipeline_error(error_queue)
+                if pipeline_error is not None:
+                    stop_event.set()
+                    break
+                try:
+                    message = analyzed_queue.get(timeout=0.1)
+                except Empty:
+                    if not prepare_thread.is_alive() and not analyze_thread.is_alive():
+                        break
+                    continue
+                if message is _SYNC_PIPELINE_STOP:
+                    break
+                if not isinstance(message, AnalyzedBatch):
+                    continue
+                batch_added, batch_updated, completed = self._commit_analyzed_batch(
+                    message,
+                    progress_callback=progress_callback,
+                    completed=completed,
+                    progress_state=progress_state,
+                    progress_lock=progress_lock,
+                    total_work=total_work,
+                    sync_started_at=sync_started_at,
+                )
+                added += batch_added
+                updated += batch_updated
+        finally:
+            stop_event.set()
+            prepare_thread.join(timeout=10)
+            analyze_thread.join(timeout=10)
+
+        pipeline_error = pipeline_error or self._sync_pipeline_error(error_queue)
+        if pipeline_error is not None:
+            raise pipeline_error
+        return added, updated, completed
+
+    def _sync_prepare_worker(
+        self,
+        batches: list[SyncBatch],
+        prepared_queue: Queue[PreparedBatch | object],
+        error_queue: Queue[BaseException],
+        stop_event: Event,
+        max_workers: int,
+        progress_callback: Callable[[ProgressUpdate], None] | None,
+        progress_state: dict[str, int],
+        progress_lock: Lock,
+        total_work: int,
+        sync_started_at: float,
+    ) -> None:
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for batch in batches:
+                    if stop_event.is_set():
+                        break
+                    batch_started_at = monotonic()
+                    self._emit_progress(
+                        progress_callback,
+                        self._make_progress_update(
+                            phase="sync",
+                            message=f"Prefetching batch {batch.index}/{batch.total}",
+                            current=self._sync_pipeline_completed(progress_state, progress_lock),
+                            total=total_work,
+                            detail=(
+                                f"{self._batch_detail(batch.entries)} | "
+                                f"prepared queue {prepared_queue.qsize()}/{SYNC_PREPARED_QUEUE_DEPTH}"
+                            ),
+                            indeterminate=True,
+                            overall_started_at=sync_started_at,
+                            step_started_at=batch_started_at,
+                        ),
+                    )
+                    futures = self._submit_prepare_batch(batch.entries, executor)
+                    prepared_items = self._collect_prepared_batch(futures)
+                    prepared_batch = PreparedBatch(
+                        batch=batch,
+                        items=prepared_items,
+                        prepared_at=monotonic(),
+                    )
+                    if not self._put_sync_pipeline_message(prepared_queue, prepared_batch, stop_event):
+                        break
+        except BaseException as exc:
+            self._put_sync_pipeline_error(error_queue, stop_event, exc)
+        finally:
+            if not stop_event.is_set():
+                self._put_sync_pipeline_message(prepared_queue, _SYNC_PIPELINE_STOP, stop_event)
+
+    def _sync_analyze_worker(
+        self,
+        prepared_queue: Queue[PreparedBatch | object],
+        analyzed_queue: Queue[AnalyzedBatch | object],
+        error_queue: Queue[BaseException],
+        stop_event: Event,
+        progress_callback: Callable[[ProgressUpdate], None] | None,
+        progress_state: dict[str, int],
+        progress_lock: Lock,
+        total_work: int,
+        sync_started_at: float,
+    ) -> None:
+        try:
+            while True:
+                if stop_event.is_set() and prepared_queue.empty():
+                    break
+                try:
+                    message = prepared_queue.get(timeout=0.1)
+                except Empty:
+                    continue
+                if message is _SYNC_PIPELINE_STOP:
+                    break
+                if not isinstance(message, PreparedBatch):
+                    continue
+                batch_started_at = monotonic()
+                batch_requires_ai = any(prepared.analysis_mode != "metadata_only" for prepared in message.items)
+                self._emit_progress(
+                    progress_callback,
+                    self._make_progress_update(
+                        phase="sync",
+                        message=(
+                            f"Running AI batch {message.batch.index}/{message.batch.total}"
+                            if batch_requires_ai
+                            else f"Preparing metadata batch {message.batch.index}/{message.batch.total}"
+                        ),
+                        current=self._sync_pipeline_completed(progress_state, progress_lock),
+                        total=total_work,
+                        detail=(
+                            f"{len(message.items)} items | "
+                            f"{'AI worker active' if batch_requires_ai else 'AI skipped'} | "
+                            f"prepared queue {prepared_queue.qsize()}/{SYNC_PREPARED_QUEUE_DEPTH} | "
+                            f"analyzed queue {analyzed_queue.qsize()}/{SYNC_ANALYZED_QUEUE_DEPTH}"
+                        ),
+                        indeterminate=True,
+                        overall_started_at=sync_started_at,
+                        step_started_at=batch_started_at,
+                    ),
+                )
+                analyses = self._analyze_prepared_batch(message.items)
+                analyzed_batch = AnalyzedBatch(
+                    batch=message.batch,
+                    prepared_items=message.items,
+                    analyses=analyses,
+                    analyzed_at=monotonic(),
+                )
+                if not self._put_sync_pipeline_message(analyzed_queue, analyzed_batch, stop_event):
+                    break
+        except BaseException as exc:
+            self._put_sync_pipeline_error(error_queue, stop_event, exc)
+        finally:
+            if not stop_event.is_set():
+                self._put_sync_pipeline_message(analyzed_queue, _SYNC_PIPELINE_STOP, stop_event)
+
+    def _commit_analyzed_batch(
+        self,
+        analyzed_batch: AnalyzedBatch,
+        *,
+        progress_callback: Callable[[ProgressUpdate], None] | None,
+        completed: int,
+        progress_state: dict[str, int],
+        progress_lock: Lock,
+        total_work: int,
+        sync_started_at: float,
+    ) -> tuple[int, int, int]:
+        batch = analyzed_batch.batch
+        batch_started_at = analyzed_batch.analyzed_at
+        built_items = self._build_items_from_analyses(
+            analyzed_batch.prepared_items,
+            analyzed_batch.analyses,
+        )
+        added = 0
+        updated = 0
+        existing_by_id = {
+            prepared.spec.id: prepared.existing
+            for prepared in analyzed_batch.prepared_items
+        }
+        for item in built_items:
+            self.state.items[item.id] = item
+            if existing_by_id.get(item.id) is None:
+                added += 1
+            else:
+                updated += 1
+        completed += len(built_items)
+        with progress_lock:
+            progress_state["completed"] = completed
+        if built_items:
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="sync",
+                    message=f"Indexed batch {batch.index}/{batch.total}",
+                    current=completed,
+                    total=total_work,
+                    detail=f"{self._batch_detail(batch.entries)} | committed {completed}/{total_work}",
+                    overall_started_at=sync_started_at,
+                    step_started_at=batch_started_at,
+                ),
+            )
+            self._save_progress_items(built_items)
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="sync",
+                    message=f"Updated live view for batch {batch.index}/{batch.total}",
+                    current=completed,
+                    total=total_work,
+                    detail=f"{len(self.state.items)} indexed items",
+                    snapshot_ready=True,
+                    overall_started_at=sync_started_at,
+                    step_started_at=batch_started_at,
+                ),
+            )
+        return added, updated, completed
+
+    def _put_sync_pipeline_message(
+        self,
+        target_queue: Queue[Any],
+        message: object,
+        stop_event: Event,
+    ) -> bool:
+        while not stop_event.is_set():
+            try:
+                target_queue.put(message, timeout=0.1)
+                return True
+            except Full:
+                continue
+        return False
+
+    def _put_sync_pipeline_error(
+        self,
+        error_queue: Queue[BaseException],
+        stop_event: Event,
+        exc: BaseException,
+    ) -> None:
+        stop_event.set()
+        try:
+            error_queue.put_nowait(exc)
+        except Full:
+            pass
+
+    def _sync_pipeline_error(self, error_queue: Queue[BaseException]) -> BaseException | None:
+        try:
+            return error_queue.get_nowait()
+        except Empty:
+            return None
+
+    def _sync_pipeline_completed(self, progress_state: dict[str, int], progress_lock: Lock) -> int:
+        with progress_lock:
+            return progress_state["completed"]
 
     def save(self) -> None:
         self.state.updated_at = utc_now()
@@ -1250,6 +1513,106 @@ class LibraryService:
                 overall_total=total_kinds,
             )
 
+    def assign_unclustered_detections_to_known_personas(
+        self,
+        *,
+        include_pets: bool = False,
+        progress_callback: Callable[[ProgressUpdate], None] | None = None,
+    ) -> int:
+        self._ensure_state_loaded()
+        started_at = monotonic()
+        kinds = ("person", "pet") if include_pets else ("person",)
+        records = [
+            record
+            for kind in kinds
+            for record in self.store.query_detections(cluster_kind=kind, dirty_only=False)
+            if not record.persona_id
+        ]
+        total = len(records)
+        if not records:
+            self._emit_progress(
+                progress_callback,
+                self._make_progress_update(
+                    phase="known_personas",
+                    message="No unassigned detections to match",
+                    current=0,
+                    total=0,
+                    overall_started_at=started_at,
+                    step_started_at=started_at,
+                ),
+            )
+            return 0
+
+        self._emit_progress(
+            progress_callback,
+            self._make_progress_update(
+                phase="known_personas",
+                message="Matching unassigned detections to known personas",
+                current=0,
+                total=total,
+                detail=f"{total} candidate detection(s)",
+                overall_started_at=started_at,
+                step_started_at=started_at,
+            ),
+        )
+        item_ids = sorted({record.item_id for record in records})
+        items_by_id = {
+            item.id: item
+            for item in self.store.load_items_by_ids(item_ids)
+        }
+        assigned = 0
+        updated_items: dict[str, MediaItem] = {}
+        for index, record in enumerate(records, start=1):
+            item = items_by_id.get(record.item_id)
+            if item is None:
+                continue
+            detection = next((entry for entry in item.detections if entry.id == record.detection_id), None)
+            if detection is None or detection.persona_id:
+                continue
+            persona_id = None
+            if detection.kind == "face" and detection.encoding:
+                persona_id = self._match_face_to_persona(detection.encoding)
+            elif include_pets and self._is_pet_detection(detection):
+                persona_id = self._match_pet_to_persona(detection.encoding, detection.signature)
+            if not persona_id:
+                continue
+            detection.persona_id = persona_id
+            updated_items[item.id] = item
+            assigned += 1
+            if self._should_emit_scan_progress(index, total):
+                self._emit_progress(
+                    progress_callback,
+                    self._make_progress_update(
+                        phase="known_personas",
+                        message="Matching unassigned detections to known personas",
+                        current=index,
+                        total=total,
+                        detail=f"{assigned} assigned",
+                        overall_started_at=started_at,
+                        step_started_at=started_at,
+                    ),
+                )
+
+        if updated_items:
+            for item in updated_items.values():
+                self.state.items[item.id] = item
+            self._save_progress_items(updated_items.values())
+            self.regenerate_memories()
+            self._save_memories_only()
+        self._emit_progress(
+            progress_callback,
+            self._make_progress_update(
+                phase="known_personas",
+                message="Known persona matching complete",
+                current=total,
+                total=total,
+                detail=f"{assigned} detection(s) assigned",
+                overall_started_at=started_at,
+                step_started_at=started_at,
+            ),
+        )
+        return assigned
+
     def _serialize_unknown_cluster(self, cluster: UnknownPersonaCluster) -> dict[str, object]:
         return {
             "id": cluster.id,
@@ -1883,9 +2246,11 @@ class LibraryService:
         video_frames: list[VideoFrameSample] = []
         video_metadata: dict[str, object] = {}
 
-        if spec.media_kind in {"image", "gif", "live_photo"}:
+        if analysis_mode == "metadata_only":
+            still_image = self._load_thumbnail_source_image(spec)
+        elif spec.media_kind in {"image", "gif", "live_photo"}:
             still_image = self.vision.load_analysis_image(spec)
-        if spec.media_kind in {"video", "live_photo"}:
+        if analysis_mode != "metadata_only" and spec.media_kind in {"video", "live_photo"}:
             sampled_frames, sampled_metadata = self.vision.load_video_analysis_frames(spec)
             video_frames = sampled_frames
             video_metadata = sampled_metadata
@@ -1921,11 +2286,29 @@ class LibraryService:
         )
 
     def _build_items_batch(self, prepared_items: list[PreparedSyncItem]) -> list[MediaItem]:
+        analyses = self._analyze_prepared_batch(prepared_items)
+        return self._build_items_from_analyses(prepared_items, analyses)
+
+    def _analyze_prepared_batch(self, prepared_items: list[PreparedSyncItem]) -> list[AnalysisResult]:
         if not prepared_items:
             return []
 
         analyses: list[AnalysisResult | None] = [None] * len(prepared_items)
-        for analysis_mode in ("full", "full_no_pets", "human_faces_only"):
+        for index, prepared in enumerate(prepared_items):
+            if prepared.analysis_mode == "metadata_only":
+                metadata: dict[str, object] = {
+                    "human_face_analysis_enabled": False,
+                    "object_analysis_enabled": False,
+                    "pet_analysis_enabled": False,
+                }
+                if prepared.still_image is not None:
+                    metadata["analyzed_width"] = prepared.still_image.size[0]
+                    metadata["analyzed_height"] = prepared.still_image.size[1]
+                analyses[index] = AnalysisResult(tags=[], detections=[], metadata=metadata)
+
+        for analysis_mode in SYNC_ANALYSIS_MODES:
+            if analysis_mode == "metadata_only":
+                continue
             batch_indices = [
                 index
                 for index, prepared in enumerate(prepared_items)
@@ -1952,15 +2335,30 @@ class LibraryService:
             for item_index, analysis in zip(batch_indices, batch_analyses, strict=False):
                 analyses[item_index] = analysis
 
+        return [self._require_analysis_result(analysis) for analysis in analyses]
+
+    def _build_items_from_analyses(
+        self,
+        prepared_items: list[PreparedSyncItem],
+        analyses: list[AnalysisResult],
+    ) -> list[MediaItem]:
+        if len(prepared_items) != len(analyses):
+            raise RuntimeError("Prepared media and analysis result counts do not match.")
+
         built_items: list[MediaItem] = []
         for prepared, analysis in zip(prepared_items, analyses, strict=False):
-            if analysis is None:
-                raise RuntimeError("Missing analysis result for prepared media item.")
             if prepared.analysis_mode == "human_faces_only":
                 built_items.append(self._build_item_from_face_reanalysis(prepared, analysis))
+            elif self._is_partial_analysis_mode(prepared.analysis_mode):
+                built_items.append(self._build_item_from_partial_reanalysis(prepared, analysis))
             else:
                 built_items.append(self._build_item_from_prepared_analysis(prepared, analysis))
         return built_items
+
+    def _require_analysis_result(self, analysis: AnalysisResult | None) -> AnalysisResult:
+        if analysis is None:
+            raise RuntimeError("Missing analysis result for prepared media item.")
+        return analysis
 
     def _build_item_from_prepared_analysis(
         self,
@@ -2075,6 +2473,63 @@ class LibraryService:
         self._auto_assign_personas(item)
         return item
 
+    def _build_item_from_partial_reanalysis(
+        self,
+        prepared: PreparedSyncItem,
+        analysis: AnalysisResult,
+    ) -> MediaItem:
+        item = self._build_item_from_prepared_analysis(prepared, analysis)
+        existing = prepared.existing
+        if existing is None or existing.file_signature != prepared.spec.file_signature:
+            return item
+
+        replaced_kinds = self._analysis_mode_replaced_detection_kinds(prepared.analysis_mode)
+        if not replaced_kinds:
+            return item
+
+        preserved_detections = [
+            self._clone_detection_region(detection)
+            for detection in existing.detections
+            if self._detection_cluster_kind(detection) not in replaced_kinds
+        ]
+        item.detections = [*analysis.detections, *preserved_detections]
+        item.tags = sorted(set(existing.tags) | set(analysis.tags) | set(self._tags_from_relative_key(item.relative_key)))
+        self._merge_detection_assignments(item, existing)
+        self._auto_assign_personas(item)
+        return item
+
+    def _is_partial_analysis_mode(self, analysis_mode: str) -> bool:
+        return analysis_mode in {
+            "objects_only",
+            "pets_only",
+            "objects_people",
+            "objects_pets",
+            "human_faces_pets",
+            "full_no_pets",
+        }
+
+    def _analysis_mode_replaced_detection_kinds(self, analysis_mode: str) -> set[str]:
+        if analysis_mode == "objects_only":
+            return {"object"}
+        if analysis_mode == "pets_only":
+            return {"pet"}
+        if analysis_mode == "objects_people":
+            return {"object", "person"}
+        if analysis_mode == "objects_pets":
+            return {"object", "pet"}
+        if analysis_mode == "human_faces_pets":
+            return {"person", "pet"}
+        if analysis_mode == "full_no_pets":
+            return {"object", "person"}
+        return set()
+
+    def _detection_cluster_kind(self, detection: DetectionRegion) -> str:
+        if detection.kind == "face":
+            return "person"
+        if self._is_pet_detection(detection):
+            return "pet"
+        return "object"
+
     def _extract_metadata(self, spec: MediaAssetSpec) -> dict[str, object]:
         captured_at = self._guess_capture_date(spec)
         width = 0
@@ -2082,7 +2537,7 @@ class LibraryService:
         duration_seconds = 0.0
         metadata: dict[str, object] = {"component_count": len(spec.component_paths)}
 
-        image_path = self.vision.primary_image_path(spec)
+        image_path = self._primary_image_path(spec)
         if image_path:
             try:
                 with Image.open(image_path) as image:
@@ -2103,7 +2558,7 @@ class LibraryService:
             except (UnidentifiedImageError, OSError):
                 pass
 
-        video_path = self.vision.primary_video_path(spec)
+        video_path = self._primary_video_path(spec)
         if video_path and cv2 is not None:
             capture = cv2.VideoCapture(str(video_path))
             try:
@@ -2126,11 +2581,57 @@ class LibraryService:
 
     def _ensure_thumbnail(self, spec: MediaAssetSpec) -> str:
         cache_path = self.config.cache_path / f"{spec.id}.jpg"
-        image = self.vision.load_preview_image(spec)
+        image = self._load_thumbnail_source_image(spec)
         if image is None:
             return ""
 
         return self._ensure_thumbnail_from_image(spec, image)
+
+    def _primary_image_path(self, spec: MediaAssetSpec) -> Path | None:
+        for component in spec.component_paths:
+            path = Path(component)
+            if path.suffix.lower() in IMAGE_EXTENSIONS:
+                return path
+        path = Path(spec.display_path)
+        return path if path.suffix.lower() in IMAGE_EXTENSIONS else None
+
+    def _primary_video_path(self, spec: MediaAssetSpec) -> Path | None:
+        for component in spec.component_paths:
+            path = Path(component)
+            if path.suffix.lower() in VIDEO_EXTENSIONS:
+                return path
+        path = Path(spec.display_path)
+        return path if path.suffix.lower() in VIDEO_EXTENSIONS else None
+
+    def _load_thumbnail_source_image(self, spec: MediaAssetSpec) -> Image.Image | None:
+        try:
+            if spec.media_kind in {"image", "live_photo"}:
+                image_path = self._primary_image_path(spec)
+                if image_path:
+                    with Image.open(image_path) as image:
+                        return ImageOps.exif_transpose(image).convert("RGB")
+                return None
+
+            if spec.media_kind == "gif":
+                with Image.open(spec.display_path) as image:
+                    frame = next(ImageSequence.Iterator(image))
+                    return ImageOps.exif_transpose(frame).convert("RGB")
+
+            video_path = self._primary_video_path(spec)
+            if not video_path or cv2 is None:
+                return None
+
+            capture = cv2.VideoCapture(str(video_path))
+            try:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    return None
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return Image.fromarray(rgb_frame)
+            finally:
+                capture.release()
+        except (FileNotFoundError, UnidentifiedImageError, OSError):
+            return None
 
     def _ensure_thumbnail_from_image(self, spec: MediaAssetSpec, image: Image.Image | None) -> str:
         if image is None:
@@ -2221,6 +2722,66 @@ class LibraryService:
             if current_revision and recorded_revision != current_revision:
                 return "human_faces_only"
         return "none"
+
+    def _analysis_mode_for_sync_item(
+        self,
+        item: MediaItem | None,
+        spec: MediaAssetSpec,
+        *,
+        detect_objects: bool,
+        detect_people: bool,
+        detect_pets: bool,
+    ) -> str:
+        requested = {
+            "object": bool(detect_objects),
+            "person": bool(detect_people),
+            "pet": bool(detect_pets),
+        }
+        if item is None or item.file_signature != spec.file_signature:
+            return self._analysis_mode_for_requested_detections(requested)
+
+        needed = {
+            "object": requested["object"] and not self._item_has_current_object_analysis(item),
+            "person": requested["person"] and not self._item_has_current_human_face_analysis(item),
+            "pet": requested["pet"] and not self._item_has_current_pet_analysis(item),
+        }
+        if not any(needed.values()):
+            return "none"
+        return self._analysis_mode_for_requested_detections(needed)
+
+    def _analysis_mode_for_requested_detections(self, requested: dict[str, bool]) -> str:
+        detect_objects = bool(requested.get("object", False))
+        detect_people = bool(requested.get("person", False))
+        detect_pets = bool(requested.get("pet", False))
+        if detect_objects and detect_people and detect_pets:
+            return "full"
+        if detect_objects and detect_people:
+            return "objects_people"
+        if detect_objects and detect_pets:
+            return "objects_pets"
+        if detect_people and detect_pets:
+            return "human_faces_pets"
+        if detect_objects:
+            return "objects_only"
+        if detect_people:
+            return "human_faces_only"
+        if detect_pets:
+            return "pets_only"
+        return "metadata_only"
+
+    def _item_has_current_object_analysis(self, item: MediaItem) -> bool:
+        metadata = item.metadata
+        return bool(metadata.get("object_analysis_enabled", False)) or bool(metadata.get("object_model", ""))
+
+    def _item_has_current_pet_analysis(self, item: MediaItem) -> bool:
+        return bool(item.metadata.get("pet_analysis_enabled", False))
+
+    def _item_has_current_human_face_analysis(self, item: MediaItem) -> bool:
+        if not self.config.face_recognition_enabled:
+            return False
+        recorded_revision = str(item.metadata.get("human_face_pipeline", ""))
+        current_revision = self._current_human_face_pipeline_revision()
+        return bool(current_revision and recorded_revision == current_revision)
 
     def _current_human_face_pipeline_revision(self) -> str:
         if not self.config.face_recognition_enabled:

@@ -27,4 +27,5 @@ src/linux_smart_photos/services/vision.py
 src/linux_smart_photos/ui/__init__.py
 src/linux_smart_photos/ui/dialogs.py
 src/linux_smart_photos/ui/main_window.py
+src/linux_smart_photos/ui/theme.py
 src/linux_smart_photos/ui/widgets.py
