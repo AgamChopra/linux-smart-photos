@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import re
 from typing import Callable
 
 
@@ -113,6 +114,99 @@ def build_asset_specs(
             discovered_media += 1
             if progress_callback is not None and scanned_entries % max(1, progress_interval) == 0:
                 progress_callback(str(path), scanned_entries, discovered_media)
+    return _build_asset_specs_from_files(root, files, stat_cache)
+
+
+def build_latest_asset_specs(
+    root: Path,
+    *,
+    limit: int,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_interval: int = 1024,
+) -> dict[str, MediaAssetSpec]:
+    """Walk newest-looking folders first and return a bounded latest asset set.
+
+    This is optimized for date-foldered libraries such as year/month/day trees.
+    It intentionally does not prove that older folders are unchanged; callers
+    should use build_asset_specs() for full reconciliation.
+    """
+
+    root = root.expanduser().resolve()
+    if not root.exists():
+        return {}
+
+    target_files = max(1, int(limit)) * 2 + 64
+    files: list[Path] = []
+    stat_cache: dict[Path, os.stat_result] = {}
+    scanned_entries = 0
+    discovered_media = 0
+    stack: list[Path] = [root]
+
+    while stack and len(files) < target_files:
+        directory = stack.pop()
+        if progress_callback is not None:
+            progress_callback(str(directory), scanned_entries, discovered_media)
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+
+        child_dirs: list[Path] = []
+        media_entries: list[tuple[Path, os.stat_result]] = []
+        for entry in entries:
+            scanned_entries += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    child_dirs.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+
+            path = Path(entry.path)
+            if not is_supported(path):
+                if progress_callback is not None and scanned_entries % max(1, progress_interval) == 0:
+                    progress_callback(str(path), scanned_entries, discovered_media)
+                continue
+            try:
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            stat_cache[path] = stat
+            media_entries.append((path, stat))
+            discovered_media += 1
+            if progress_callback is not None and scanned_entries % max(1, progress_interval) == 0:
+                progress_callback(str(path), scanned_entries, discovered_media)
+
+        media_entries.sort(
+            key=lambda entry: _path_sort_key(entry[0], root, entry[1]),
+            reverse=True,
+        )
+        for path, _stat in media_entries:
+            files.append(path)
+            if len(files) >= target_files:
+                break
+
+        child_dirs.sort(key=lambda path: _directory_sort_key(path, root), reverse=True)
+        stack.extend(reversed(child_dirs))
+
+    assets = _build_asset_specs_from_files(root, files, stat_cache)
+    if len(assets) <= limit:
+        return assets
+    latest_assets = sorted(
+        assets.items(),
+        key=lambda entry: _asset_sort_key(entry[1]),
+        reverse=True,
+    )[:limit]
+    return dict(latest_assets)
+
+
+def _build_asset_specs_from_files(
+    root: Path,
+    files: list[Path],
+    stat_cache: dict[Path, os.stat_result],
+) -> dict[str, MediaAssetSpec]:
     files.sort()
     grouped: dict[tuple[Path, str], list[Path]] = {}
     for path in files:
@@ -173,3 +267,33 @@ def build_asset_specs(
         )
 
     return assets
+
+
+def _asset_sort_key(spec: MediaAssetSpec) -> tuple[tuple[tuple[int, int, str], ...], float, str]:
+    relative_path = Path(spec.relative_key)
+    segment_key = tuple(_segment_sort_key(part) for part in relative_path.parts[:-1])
+    return (segment_key, spec.modified_ts, relative_path.name.lower())
+
+
+def _path_sort_key(path: Path, root: Path, stat: os.stat_result) -> tuple[tuple[tuple[int, int, str], ...], float, str]:
+    try:
+        relative_path = path.relative_to(root)
+    except ValueError:
+        relative_path = path
+    segment_key = tuple(_segment_sort_key(part) for part in relative_path.parts[:-1])
+    return (segment_key, stat.st_mtime, relative_path.name.lower())
+
+
+def _directory_sort_key(path: Path, root: Path) -> tuple[tuple[int, int, str], ...]:
+    try:
+        relative_path = path.relative_to(root)
+    except ValueError:
+        relative_path = path
+    return tuple(_segment_sort_key(part) for part in relative_path.parts)
+
+
+def _segment_sort_key(segment: str) -> tuple[int, int, str]:
+    numbers = [int(value) for value in re.findall(r"\d+", segment)]
+    if numbers:
+        return (1, numbers[0], segment.lower())
+    return (0, 0, segment.lower())

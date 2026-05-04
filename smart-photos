@@ -36,12 +36,15 @@ Setup:
   --auto         Auto-select GPU mode when an NVIDIA GPU is detected, otherwise CPU
   --media-root PATH Set the photos folder during setup
   --uninstall    Remove app setup, config, database, models, thumbnails, and desktop integration
+  --sync-limit N Limit Qt background sync to the latest N media items (default: 1000)
+  --sync-full    Let Qt background sync examine the full library
 
 Examples:
   ./smart-photos
   ./smart-photos --cli status
+  ./smart-photos --cli sync --limit full
   ./smart-photos --cli search cat --limit 10
-  ./smart-photos --qt
+  ./smart-photos --qt --sync-limit 250
   ./smart-photos --setup-only
 EOF
 }

@@ -487,7 +487,7 @@ class SQLiteLibraryStore:
             cluster_kind=cluster_kind,
             dirty_only=dirty_only,
         )
-        if item_ids:
+        if item_ids is not None:
             filtered_ids = [item_id for item_id in item_ids if item_id]
             if not filtered_ids:
                 return []

@@ -32,7 +32,13 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import AppConfig, write_config
-from ..services.library import EmbeddingMapPoint, LibraryService, ProgressUpdate, UnknownPersonaCluster
+from ..services.library import (
+    DEFAULT_SYNC_ITEM_LIMIT,
+    EmbeddingMapPoint,
+    LibraryService,
+    ProgressUpdate,
+    UnknownPersonaCluster,
+)
 from .dialogs import AlbumDialog, AssignPersonaDialog, CorrectionsDialog
 from .theme import apply_app_theme, default_palette, normalize_theme, readable_text_color, valid_color
 from .widgets import MediaGridWidget
@@ -202,11 +208,19 @@ class BackgroundTaskWorker(QObject):
     completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, config: AppConfig, task_name: str, model_id: str = "") -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        task_name: str,
+        model_id: str = "",
+        *,
+        sync_item_limit: int | None = DEFAULT_SYNC_ITEM_LIMIT,
+    ) -> None:
         super().__init__()
         self.config = config
         self.task_name = task_name
         self.model_id = model_id
+        self.sync_item_limit = sync_item_limit
 
     def run(self) -> None:
         service = LibraryService(self.config)
@@ -219,7 +233,11 @@ class BackgroundTaskWorker(QObject):
                         service.download_recommended_models(progress_callback=self._emit_progress)
                     except Exception as exc:
                         download_error = str(exc)
-                summary = service.sync(progress_callback=self._emit_progress, include_pets=False)
+                summary = service.sync(
+                    progress_callback=self._emit_progress,
+                    include_pets=False,
+                    sync_item_limit=self.sync_item_limit,
+                )
                 self.completed.emit(
                     {
                         "task": self.task_name,
@@ -231,7 +249,11 @@ class BackgroundTaskWorker(QObject):
                 return
 
             if self.task_name == "sync":
-                summary = service.sync(progress_callback=self._emit_progress, include_pets=True)
+                summary = service.sync(
+                    progress_callback=self._emit_progress,
+                    include_pets=True,
+                    sync_item_limit=self.sync_item_limit,
+                )
                 self.completed.emit({"task": self.task_name, "summary": summary})
                 return
 
@@ -296,11 +318,19 @@ class UnknownClusterCacheWorker(QObject):
     completed = Signal(bool)
     failed = Signal(str)
 
-    def __init__(self, config: AppConfig, *, partial: bool, include_pets: bool = False) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        partial: bool,
+        include_pets: bool = False,
+        sync_item_limit: int | None = DEFAULT_SYNC_ITEM_LIMIT,
+    ) -> None:
         super().__init__()
         self.config = config
         self.partial = partial
         self.include_pets = include_pets
+        self.sync_item_limit = sync_item_limit
 
     def run(self) -> None:
         try:
@@ -309,6 +339,7 @@ class UnknownClusterCacheWorker(QObject):
                 partial=self.partial,
                 include_pets=self.include_pets,
                 progress_callback=self._emit_progress,
+                sync_item_limit=self.sync_item_limit,
             )
             self.completed.emit(self.partial)
         except Exception as exc:
@@ -1875,9 +1906,15 @@ class ModelsPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, service: LibraryService) -> None:
+    def __init__(
+        self,
+        service: LibraryService,
+        *,
+        sync_item_limit: int | None = DEFAULT_SYNC_ITEM_LIMIT,
+    ) -> None:
         super().__init__()
         self.service = service
+        self.sync_item_limit = sync_item_limit
         self._task_thread: QThread | None = None
         self._task_worker: BackgroundTaskWorker | None = None
         self._cluster_cache_thread: QThread | None = None
@@ -2096,7 +2133,12 @@ class MainWindow(QMainWindow):
         self._set_busy(True, self._task_start_message(task_name, model_id))
 
         thread = QThread(self)
-        worker = BackgroundTaskWorker(self.service.config, task_name, model_id)
+        worker = BackgroundTaskWorker(
+            self.service.config,
+            task_name,
+            model_id,
+            sync_item_limit=self.sync_item_limit,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._handle_task_progress)
@@ -2246,7 +2288,12 @@ class MainWindow(QMainWindow):
             return
 
         thread = QThread(self)
-        worker = UnknownClusterCacheWorker(self.service.config, partial=partial, include_pets=include_pets)
+        worker = UnknownClusterCacheWorker(
+            self.service.config,
+            partial=partial,
+            include_pets=include_pets,
+            sync_item_limit=self.sync_item_limit,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._handle_unknown_cluster_cache_progress)

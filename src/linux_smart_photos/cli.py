@@ -18,6 +18,9 @@ except Exception:  # pragma: no cover - exercised when tqdm is unavailable.
     tqdm = None
 
 
+DEFAULT_CLI_SYNC_ITEM_LIMIT = 1000
+
+
 def ensure_tqdm_available() -> bool:
     global tqdm
     if tqdm is not None:
@@ -69,6 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-progress",
         action="store_true",
         help="Print plain status lines instead of progress bars.",
+    )
+    sync_parser.add_argument(
+        "--limit",
+        default=str(DEFAULT_CLI_SYNC_ITEM_LIMIT),
+        help='Latest item count to examine, or "full". Default: 1000.',
+    )
+    sync_parser.add_argument(
+        "--full",
+        action="store_true",
+        help='Examine the full library. Equivalent to "--limit full".',
     )
 
     search_parser = subparsers.add_parser("search", help="Search the indexed library.")
@@ -147,8 +160,9 @@ def run_status(service: LibraryService, config_override: Path | None) -> int:
 
 
 def run_sync(service: LibraryService, args: argparse.Namespace) -> int:
+    sync_item_limit = parse_sync_item_limit(args)
     if bool(args.json):
-        summary = service.sync()
+        summary = service.sync(sync_item_limit=sync_item_limit)
         print("{")
         print(f'  "added": {summary.added},')
         print(f'  "updated": {summary.updated},')
@@ -181,6 +195,7 @@ def run_sync(service: LibraryService, args: argparse.Namespace) -> int:
         print("No sync stages selected.")
         return 0
 
+    print(f"Scope: {format_sync_scope(sync_item_limit)}")
     progress_factory = PlainProgressRenderer
     if not bool(args.no_progress) and ensure_tqdm_available():
         progress_factory = TqdmProgressRenderer
@@ -195,6 +210,7 @@ def run_sync(service: LibraryService, args: argparse.Namespace) -> int:
             detect_objects=False,
             detect_people=False,
             scan_only=True,
+            sync_item_limit=sync_item_limit,
         )
         renderer.close()
         stage_results.append(("scan", summary))
@@ -218,6 +234,7 @@ def run_sync(service: LibraryService, args: argparse.Namespace) -> int:
                 detect_objects=choices.detect_objects,
                 detect_people=choices.detect_people,
                 scan_only=False,
+                sync_item_limit=sync_item_limit,
             )
             renderer.close()
             stage_results.append(("ai", summary))
@@ -231,11 +248,13 @@ def run_sync(service: LibraryService, args: argparse.Namespace) -> int:
         assigned = service.assign_unclustered_detections_to_known_personas(
             include_pets=choices.detect_pets,
             progress_callback=renderer,
+            sync_item_limit=sync_item_limit,
         )
         service.rebuild_unknown_cluster_caches(
             partial=False,
             include_pets=choices.detect_pets,
             progress_callback=renderer,
+            sync_item_limit=sync_item_limit,
         )
         renderer.close()
         person_clusters = service.list_unknown_persona_clusters(kind="person")
@@ -260,6 +279,27 @@ def run_sync(service: LibraryService, args: argparse.Namespace) -> int:
         else:
             print(f"{stage_name}: {result}")
     return 0
+
+
+def parse_sync_item_limit(args: argparse.Namespace) -> int | None:
+    if bool(getattr(args, "full", False)):
+        return None
+    value = str(getattr(args, "limit", DEFAULT_CLI_SYNC_ITEM_LIMIT)).strip().lower()
+    if value in {"full", "all"}:
+        return None
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise SystemExit('sync --limit must be a positive integer or "full".') from exc
+    if limit < 1:
+        raise SystemExit('sync --limit must be a positive integer or "full".')
+    return limit
+
+
+def format_sync_scope(sync_item_limit: int | None) -> str:
+    if sync_item_limit is None:
+        return "full library"
+    return f"latest {sync_item_limit} media items"
 
 
 class SyncCliChoices:

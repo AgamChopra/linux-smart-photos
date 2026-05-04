@@ -33,7 +33,14 @@ except Exception:
     fuzz = None
 
 from ..config import AppConfig
-from ..media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaAssetSpec, build_asset_specs, stable_id
+from ..media import (
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    MediaAssetSpec,
+    build_asset_specs,
+    build_latest_asset_specs,
+    stable_id,
+)
 from ..models import Album, DetectionRecord, DetectionRegion, LibraryState, MediaItem, Memory, Persona, utc_now
 from ..store import SQLiteLibraryStore
 from .model_manager import ModelManager, ModelStatus
@@ -66,6 +73,7 @@ SEARCH_CANDIDATE_LIMIT = 600
 CLUSTER_DIRTY_CHUNK_SIZE = 512
 SYNC_PREPARED_QUEUE_DEPTH = 2
 SYNC_ANALYZED_QUEUE_DEPTH = 2
+DEFAULT_SYNC_ITEM_LIMIT = 1000
 _SYNC_PIPELINE_STOP = object()
 SYNC_ANALYSIS_MODES = (
     "metadata_only",
@@ -260,6 +268,7 @@ class LibraryService:
         detect_objects: bool | None = None,
         detect_people: bool | None = None,
         scan_only: bool = False,
+        sync_item_limit: int | None = DEFAULT_SYNC_ITEM_LIMIT,
     ) -> SyncSummary:
         self._ensure_state_loaded()
         requested_objects = bool(self.config.object_detection_enabled if detect_objects is None else detect_objects)
@@ -306,12 +315,18 @@ class LibraryService:
                 ),
             )
             raise NotADirectoryError(message)
+        normalized_limit = self._normalize_sync_item_limit(sync_item_limit)
+        full_discovery = normalized_limit is None
         self._emit_progress(
             progress_callback,
             self._make_progress_update(
                 phase="sync",
-                message="Discovering media files",
-                detail=str(media_root),
+                message="Discovering media files" if full_discovery else "Discovering latest media files",
+                detail=(
+                    str(media_root)
+                    if full_discovery
+                    else f"{media_root} | latest folder scan limited to {normalized_limit} item(s)"
+                ),
                 indeterminate=True,
                 overall_started_at=sync_started_at,
                 step_started_at=discovery_started_at,
@@ -330,7 +345,7 @@ class LibraryService:
                 progress_callback,
                 self._make_progress_update(
                     phase="sync",
-                    message="Discovering media files",
+                    message="Discovering media files" if full_discovery else "Discovering latest media files",
                     detail=f"{discovered_media} candidate files found after scanning {scanned_entries} paths — {path_text}",
                     indeterminate=True,
                     overall_started_at=sync_started_at,
@@ -338,18 +353,37 @@ class LibraryService:
                 ),
             )
 
-        assets = build_asset_specs(
-            media_root,
-            progress_callback=emit_discovery_progress,
-            progress_interval=128,
-        )
+        if full_discovery:
+            assets = build_asset_specs(
+                media_root,
+                progress_callback=emit_discovery_progress,
+                progress_interval=128,
+            )
+        else:
+            assets = build_latest_asset_specs(
+                media_root,
+                limit=normalized_limit,
+                progress_callback=emit_discovery_progress,
+                progress_interval=128,
+            )
         sorted_assets = self._sorted_asset_entries(assets)
+        examined_assets = (
+            sorted_assets
+            if normalized_limit is None
+            else sorted_assets[:normalized_limit]
+        )
+        scope_detail = self._sync_scope_detail(
+            discovered_count=len(sorted_assets),
+            examined_count=len(examined_assets),
+            sync_item_limit=normalized_limit,
+            full_discovery=full_discovery,
+        )
         existing_ids = set(self.state.items)
         current_ids = set(assets)
-        removed_ids = existing_ids - current_ids
+        removed_ids = existing_ids - current_ids if full_discovery else set()
         added = 0
         updated = 0
-        total_work = len(removed_ids) + len(sorted_assets) + 2
+        total_work = len(removed_ids) + len(examined_assets) + 2
         completed = 0
         changed_entries: list[tuple[str, MediaAssetSpec, MediaItem | None, str]] = []
 
@@ -360,7 +394,7 @@ class LibraryService:
                 message="Checking library for changes",
                 current=completed,
                 total=total_work,
-                detail=f"{len(sorted_assets)} media items discovered in {self.config.media_root_path}",
+                detail=f"{scope_detail} in {self.config.media_root_path}",
                 overall_started_at=sync_started_at,
                 step_started_at=discovery_started_at,
             ),
@@ -386,6 +420,7 @@ class LibraryService:
 
         last_check_emit_at = monotonic()
         queued_entries = 0
+        checked_entries = 0
 
         def emit_check_status(spec: MediaAssetSpec, status: str, *, force: bool = False) -> None:
             nonlocal last_check_emit_at
@@ -402,14 +437,14 @@ class LibraryService:
                     total=total_work,
                     detail=(
                         f"{status}: {spec.relative_key} | "
-                        f"known {completed}/{len(sorted_assets)} | queued {queued_entries}"
+                        f"checked {checked_entries}/{len(examined_assets)} | queued {queued_entries}"
                     ),
                     overall_started_at=sync_started_at,
                     step_started_at=discovery_started_at,
                 ),
             )
 
-        for item_id, spec in sorted_assets:
+        for item_id, spec in examined_assets:
             existing = self.state.items.get(item_id)
             analysis_mode = self._analysis_mode_for_sync_item(
                 existing,
@@ -424,18 +459,20 @@ class LibraryService:
                 and analysis_mode == "none"
             ):
                 completed += 1
+                checked_entries += 1
                 emit_check_status(spec, "already indexed")
                 continue
 
             if analysis_mode == "none":
                 analysis_mode = "metadata_only"
             queued_entries += 1
+            checked_entries += 1
             status = "adding to catalog" if existing is None else "changed; updating catalog"
             emit_check_status(spec, status)
             changed_entries.append((item_id, spec, existing, analysis_mode))
 
-        if sorted_assets:
-            emit_check_status(sorted_assets[-1][1], "change scan complete", force=True)
+        if examined_assets:
+            emit_check_status(examined_assets[-1][1], "change scan complete", force=True)
 
         if changed_entries:
             batch_added, batch_updated, completed = self._run_sync_analysis_pipeline(
@@ -1379,6 +1416,7 @@ class LibraryService:
         allow_stale_cache: bool = False,
         build_if_missing: bool = True,
         include_pets: bool = False,
+        sync_item_limit: int | None = DEFAULT_SYNC_ITEM_LIMIT,
     ) -> list[UnknownPersonaCluster]:
         del allow_stale_cache
         requested_kinds = (
@@ -1402,9 +1440,11 @@ class LibraryService:
                 continue
             if not build_if_missing:
                 continue
+            scoped_item_ids = self._latest_item_ids_for_scope(sync_item_limit)
             self._refresh_unknown_clusters_kind(
                 requested_kind,
                 partial=False,
+                item_ids=scoped_item_ids,
                 progress_callback=None,
                 overall_started_at=monotonic(),
                 overall_current=0,
@@ -1580,16 +1620,19 @@ class LibraryService:
         partial: bool,
         include_pets: bool = False,
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
+        sync_item_limit: int | None = DEFAULT_SYNC_ITEM_LIMIT,
     ) -> None:
         self._ensure_state_loaded()
         revision = self.state.updated_at
         started_at = monotonic()
         kinds = ("person", "pet") if include_pets else ("person",)
+        scoped_item_ids = self._latest_item_ids_for_scope(sync_item_limit)
         total_kinds = len(kinds)
         for index, kind in enumerate(kinds, start=1):
             self._refresh_unknown_clusters_kind(
                 kind,
                 partial=partial,
+                item_ids=scoped_item_ids,
                 progress_callback=progress_callback,
                 overall_started_at=started_at,
                 overall_current=index - 1,
@@ -1601,14 +1644,20 @@ class LibraryService:
         *,
         include_pets: bool = False,
         progress_callback: Callable[[ProgressUpdate], None] | None = None,
+        sync_item_limit: int | None = DEFAULT_SYNC_ITEM_LIMIT,
     ) -> int:
         self._ensure_state_loaded()
         started_at = monotonic()
         kinds = ("person", "pet") if include_pets else ("person",)
+        scoped_item_ids = self._latest_item_ids_for_scope(sync_item_limit)
         records = [
             record
             for kind in kinds
-            for record in self.store.query_detections(cluster_kind=kind, dirty_only=False)
+            for record in self.store.query_detections(
+                cluster_kind=kind,
+                dirty_only=False,
+                item_ids=scoped_item_ids,
+            )
             if not record.persona_id
         ]
         total = len(records)
@@ -2992,6 +3041,7 @@ class LibraryService:
         kind: str,
         *,
         partial: bool,
+        item_ids: list[str] | None = None,
         progress_callback: Callable[[ProgressUpdate], None] | None,
         overall_started_at: float,
         overall_current: int,
@@ -2999,25 +3049,35 @@ class LibraryService:
     ) -> list[UnknownPersonaCluster]:
         revision = self.state.updated_at
         kind_started_at = monotonic()
+        effective_partial = partial or item_ids is not None
         self._emit_progress(
             progress_callback,
             self._make_progress_update(
                 phase="unknown_clusters",
-                message=f"Rebuilding {'partial' if partial else 'final'} {kind} clusters",
+                message=f"Rebuilding {'partial' if effective_partial else 'final'} {kind} clusters",
                 current=overall_current,
                 total=overall_total,
-                detail=f"revision {revision}",
+                detail=(
+                    f"revision {revision}"
+                    if item_ids is None
+                    else f"revision {revision} | scoped latest {len(item_ids)} indexed item(s)"
+                ),
                 indeterminate=True,
                 overall_started_at=overall_started_at,
                 step_started_at=kind_started_at,
             ),
         )
-        dirty_count = self.store.count_detections(kind, dirty_only=True)
+        dirty_count = (
+            self.store.count_detections(kind, dirty_only=True)
+            if item_ids is None
+            else len(self.store.query_detections(cluster_kind=kind, dirty_only=True, item_ids=item_ids))
+        )
         existing_cluster_payloads = self.store.list_unknown_clusters(kind)
-        if partial:
+        if effective_partial:
             built_clusters = self._rebuild_unknown_clusters_incremental(
                 kind,
                 revision=revision,
+                item_ids=item_ids,
                 progress_callback=progress_callback,
                 overall_started_at=overall_started_at,
                 step_started_at=kind_started_at,
@@ -3026,6 +3086,7 @@ class LibraryService:
             built_clusters = self._rebuild_unknown_clusters_incremental(
                 kind,
                 revision=revision,
+                item_ids=None,
                 progress_callback=progress_callback,
                 overall_started_at=overall_started_at,
                 step_started_at=kind_started_at,
@@ -3039,6 +3100,7 @@ class LibraryService:
             built_clusters = self._rebuild_unknown_clusters_full(
                 kind,
                 revision=revision,
+                item_ids=None,
                 progress_callback=progress_callback,
                 overall_started_at=overall_started_at,
                 step_started_at=kind_started_at,
@@ -3047,7 +3109,7 @@ class LibraryService:
             progress_callback,
             self._make_progress_update(
                 phase="unknown_clusters",
-                message=f"Updated {'partial' if partial else 'final'} {kind} clusters",
+                message=f"Updated {'partial' if effective_partial else 'final'} {kind} clusters",
                 current=overall_current + 1,
                 total=overall_total,
                 detail=f"{len(built_clusters)} cluster(s)",
@@ -3062,11 +3124,12 @@ class LibraryService:
         kind: str,
         *,
         revision: str,
+        item_ids: list[str] | None,
         progress_callback: Callable[[ProgressUpdate], None] | None,
         overall_started_at: float,
         step_started_at: float,
     ) -> list[UnknownPersonaCluster]:
-        records = self.store.query_detections(cluster_kind=kind, dirty_only=False)
+        records = self.store.query_detections(cluster_kind=kind, dirty_only=False, item_ids=item_ids)
         cluster_states = self._build_unknown_cluster_states_from_detection_records(
             kind,
             records,
@@ -3105,11 +3168,12 @@ class LibraryService:
         kind: str,
         *,
         revision: str,
+        item_ids: list[str] | None,
         progress_callback: Callable[[ProgressUpdate], None] | None,
         overall_started_at: float,
         step_started_at: float,
     ) -> list[UnknownPersonaCluster]:
-        dirty_records = self.store.query_detections(cluster_kind=kind, dirty_only=True)
+        dirty_records = self.store.query_detections(cluster_kind=kind, dirty_only=True, item_ids=item_ids)
         if not dirty_records:
             return [
                 self._deserialize_unknown_cluster(entry)
@@ -4314,6 +4378,32 @@ class LibraryService:
         configured = max(1, int(self.config.scan_batch_size))
         analysis_batch = max(1, int(self.config.analysis_batch_size))
         return max(configured, min(analysis_batch, 32))
+
+    def _normalize_sync_item_limit(self, sync_item_limit: int | None) -> int | None:
+        if sync_item_limit is None:
+            return None
+        return max(1, int(sync_item_limit))
+
+    def _sync_scope_detail(
+        self,
+        *,
+        discovered_count: int,
+        examined_count: int,
+        sync_item_limit: int | None,
+        full_discovery: bool,
+    ) -> str:
+        if sync_item_limit is None:
+            return f"{discovered_count} media items discovered; examining full library"
+        if not full_discovery:
+            return f"{discovered_count} latest media items discovered; examining latest {examined_count}"
+        return f"{discovered_count} media items discovered; examining latest {examined_count}"
+
+    def _latest_item_ids_for_scope(self, sync_item_limit: int | None) -> list[str] | None:
+        normalized_limit = self._normalize_sync_item_limit(sync_item_limit)
+        if normalized_limit is None:
+            return None
+        items = self.list_items()
+        return [item.id for item in items[:normalized_limit]]
 
     def _prefetch_workers(self) -> int:
         configured = max(1, int(self.config.prefetch_workers))
